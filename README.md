@@ -315,6 +315,7 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 | `RETENTION_ENABLED` | Default for scheduled background pruning of aged unattributed telemetry, dismissed/stale embeddings, and terminal operational rows (`AFTERWORD_RETENTION_ENABLED` for local engine runs); defaults conservatively to `false` and can be toggled per profile in Settings. |
 | `EVIDENCE_ROTATION_ENABLED` | Default for rotating unreferenced scoring batches and oldest unattributed replay snapshots when the 512 MiB evidence budget crosses 80% (`AFTERWORD_EVIDENCE_ROTATION_ENABLED` for local engine runs); defaults conservatively to `false` and can be toggled per profile in Settings. |
 | `LIBRARR_ALLOWED_HOSTS` | Comma-separated private hostnames allowed to receive the Librarr API key. |
+| `LLM_RERANK_ALLOWED_HOSTS` | Optional comma-separated local runtime hostnames explicitly opted in for LLM reranking (`AFTERWORD_LLM_RERANK_ALLOWED_HOSTS` for local engine runs; empty by default). If an API key is configured for an allowlisted `http://` host, the key is sent unencrypted over HTTP. |
 
 The engine also persists source cadence and application settings in SQLite, so changes made in the UI survive restarts.
 
@@ -398,6 +399,10 @@ Goodreads CSV, StoryGraph CSV, and manual historical imports contribute time-bas
 ### Librarr works in Docker but not locally (or vice versa)
 
 The URL must be reachable from the engine process, not just from your browser. Use `http://librarr:5050` between containers and `http://127.0.0.1:5050` when both services run on the host.
+
+### The models.dev selector fails behind an outbound proxy
+
+The optional `models.dev` catalog picker in **Settings** (`GET /api/llm/models`) fetches `https://models.dev/api.json` directly with `trust_env=False` and `follow_redirects=False`, matching Bookward's public source and catalog clients so ambient `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `SSL_CERT_*` environment variables are ignored. In deployments that can reach the public internet only through an outbound HTTP proxy, loading the `models.dev` catalog returns `502`; enter the LLM reranker API URL and model ID directly in **Settings** instead.
 
 ## Automation and releases
 

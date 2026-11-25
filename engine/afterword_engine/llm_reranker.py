@@ -21,6 +21,12 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from .config import settings
+from .http_bounds import (
+    ERROR_BODY_MAX_BYTES,
+    JSON_CONTENT_TYPES,
+    read_bounded_bytes_sync,
+    read_bounded_json_sync,
+)
 from .identity import ReadIdentityIndex, book_identity, book_row_identity_match_keys
 from .security import (
     resolve_public_target,
@@ -30,6 +36,8 @@ from .security import (
 from .tenancy import current_profile_id, profile_database_path
 
 LOGGER = logging.getLogger(__name__)
+
+LLM_RERANK_MODES: tuple[str, ...] = ("cloud", "ollama", "openai-compatible")
 
 MAX_LLM_TIMEOUT_SECONDS = 25.0
 MIN_LLM_TIMEOUT_SECONDS = 0.001
@@ -88,13 +96,35 @@ def _profile_cache_scope(profile_id: str | None = None) -> str:
     return f"db:{profile_database_path()}"
 
 
-def llm_allowed_hosts(raw: str | None = None) -> set[str]:
+def normalize_llm_rerank_mode(
+    value: str | None,
+    *,
+    allow_blank: bool = True,
+) -> str:
+    """Validate and normalize an LLM reranker mode against ``LLM_RERANK_MODES``."""
+    if value is None:
+        return "" if allow_blank else "cloud"
+    cleaned = str(value).strip().lower()
+    if not cleaned:
+        return "" if allow_blank else "cloud"
+    if cleaned not in LLM_RERANK_MODES:
+        allowed = ", ".join(LLM_RERANK_MODES)
+        raise ValueError(
+            f"Unsupported LLM reranker mode {cleaned!r}; expected one of: {allowed}"
+        )
+    return cleaned
+
+
+def llm_rerank_allowed_hosts(raw: str | None = None) -> set[str]:
     source = settings.llm_rerank_allowed_hosts if raw is None else raw
     return {
         host.strip().lower().strip("[]").rstrip(".")
         for host in str(source or "").split(",")
         if host.strip()
     }
+
+
+llm_allowed_hosts = llm_rerank_allowed_hosts
 
 
 def _normalize_chat_url(url: str) -> str:
@@ -197,7 +227,7 @@ def validate_llm_api_url(
     requested_host = (parsed.hostname or "").lower().rstrip(".")
     if not requested_host:
         raise ValueError("LLM API URL must include a hostname")
-    hosts = llm_allowed_hosts() if allowed_hosts is None else allowed_hosts
+    hosts = llm_rerank_allowed_hosts() if allowed_hosts is None else allowed_hosts
     if parsed.scheme == "http" and has_api_key and requested_host not in hosts:
         raise ValueError(
             "LLM API URL must use HTTPS when an API key is configured unless the host is allowlisted"
@@ -246,7 +276,7 @@ def _prepare_llm_request_target(
     if not requested_host:
         raise ValueError("LLM API URL must include a hostname")
 
-    hosts = llm_allowed_hosts() if allowed_hosts is None else allowed_hosts
+    hosts = llm_rerank_allowed_hosts() if allowed_hosts is None else allowed_hosts
     matched_allowed: str | None = None
     for allowed_host in hosts:
         if allowed_host and requested_host == allowed_host:
@@ -321,9 +351,13 @@ def _config_fingerprint(
     max_delta: float,
     mode: str = "",
 ) -> str:
+    try:
+        normalized_mode = normalize_llm_rerank_mode(mode, allow_blank=True)
+    except ValueError:
+        normalized_mode = ""
     non_secret_payload = json.dumps(
         {
-            "mode": mode.strip().lower(),
+            "mode": normalized_mode,
             "url": canonical_llm_url(api_url) or _normalize_chat_url(api_url),
             "model": model.strip(),
             "top_k": int(top_k),
@@ -1071,7 +1105,10 @@ def _build_cache_key(
         "reads": reads_fp,
         "feedback": active_fp,
     }
-    cleaned_mode = mode.strip().lower()
+    try:
+        cleaned_mode = normalize_llm_rerank_mode(mode, allow_blank=True)
+    except ValueError:
+        cleaned_mode = ""
     if cleaned_mode:
         material["mode"] = cleaned_mode
     encoded = json.dumps(
@@ -1201,13 +1238,21 @@ def _extract_response_content(response: Any) -> dict[str, Any]:
     if status_code >= 400:
         detail = ""
         try:
-            err_body = response.json()
-            if isinstance(err_body, Mapping):
-                raw_err = err_body.get("error")
-                if isinstance(raw_err, Mapping):
-                    detail = str(raw_err.get("message") or "").strip()
-                elif isinstance(raw_err, str):
-                    detail = raw_err.strip()
+            error_cap = min(settings.llm_rerank_max_bytes, ERROR_BODY_MAX_BYTES)
+            if error_cap > 0:
+                err_raw = read_bounded_bytes_sync(
+                    response,
+                    max_bytes=error_cap,
+                    allowed_content_types=JSON_CONTENT_TYPES,
+                    allow_missing_content_type=True,
+                )
+                err_body = json.loads(err_raw) if err_raw.strip() else None
+                if isinstance(err_body, Mapping):
+                    raw_err = err_body.get("error")
+                    if isinstance(raw_err, Mapping):
+                        detail = str(raw_err.get("message") or "").strip()
+                    elif isinstance(raw_err, str):
+                        detail = raw_err.strip()
         except Exception:
             detail = ""
         if detail:
@@ -1216,7 +1261,11 @@ def _extract_response_content(response: Any) -> dict[str, Any]:
     else:
         response.raise_for_status()
 
-    payload = response.json()
+    payload = read_bounded_json_sync(
+        response,
+        max_bytes=settings.llm_rerank_max_bytes,
+        size_error="LLM reranker response is too large",
+    )
     if not isinstance(payload, Mapping):
         raise ValueError("LLM endpoint returned a non-JSON-object response")
     choices = payload.get("choices")
@@ -1299,28 +1348,36 @@ def probe_llm_reranker(
             follow_redirects=False,
             trust_env=False,
         ) as client:
+            request_kwargs: dict[str, Any] = {
+                "headers": request_headers,
+                "json": request_json,
+            }
             if extensions:
                 try:
-                    response = client.post(
+                    request = client.build_request(
+                        "POST",
                         target_url,
-                        headers=request_headers,
-                        json=request_json,
                         extensions=extensions,
+                        **request_kwargs,
                     )
                 except TypeError:
-                    response = client.post(
+                    request = client.build_request(
+                        "POST",
                         target_url,
-                        headers=request_headers,
-                        json=request_json,
+                        **request_kwargs,
                     )
             else:
-                response = client.post(
+                request = client.build_request(
+                    "POST",
                     target_url,
-                    headers=request_headers,
-                    json=request_json,
+                    **request_kwargs,
                 )
-            parsed = _extract_response_content(response)
-            _extract_response_payload(parsed)
+            response = client.send(request, stream=True)
+            try:
+                parsed = _extract_response_content(response)
+                _extract_response_payload(parsed)
+            finally:
+                response.close()
     except Exception as exc:
         raise RuntimeError(sanitize_llm_error(exc, api_key=key)) from exc
     return {"ok": True, "checked": True, "model": chosen_model}
@@ -1503,23 +1560,32 @@ def rerank_with_llm_sync(
 
         current_url = url
         with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-            response = None
+            parsed: dict[str, Any] | None = None
             for _hop in range(MAX_SAME_ORIGIN_REDIRECTS + 1):
-                response = client.post(current_url, headers=headers, json=request_body)
-                if 300 <= int(getattr(response, "status_code", 200)) < 400:
-                    current_url = _validate_redirect_target(
-                        url,
-                        int(response.status_code),
-                        response.headers.get("location", "").strip(),
-                        allowed_hosts=allowed_hosts,
-                        has_api_key=bool(key),
-                    )
-                    continue
-                break
+                request = client.build_request(
+                    "POST",
+                    current_url,
+                    headers=headers,
+                    json=request_body,
+                )
+                response = client.send(request, stream=True)
+                try:
+                    if 300 <= int(getattr(response, "status_code", 200)) < 400:
+                        current_url = _validate_redirect_target(
+                            url,
+                            int(response.status_code),
+                            response.headers.get("location", "").strip(),
+                            allowed_hosts=allowed_hosts,
+                            has_api_key=bool(key),
+                        )
+                        continue
+                    parsed = _extract_response_content(response)
+                    break
+                finally:
+                    response.close()
             else:
                 raise ValueError("Too many redirects from LLM endpoint")
-            assert response is not None
-            parsed = _extract_response_content(response)
+            assert parsed is not None
             kind, payload_items = _extract_response_payload(parsed)
             reranked, diag = _apply_parsed_payload(
                 safe_candidates,

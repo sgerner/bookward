@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     embedding_api_key: str = ""
     source_timeout_seconds: float = 15.0
     source_max_bytes: int = 2_000_000
+    librarr_max_bytes: int = 2_000_000
+    librarr_stream_max_bytes: int = 16_000_000
+    models_dev_max_bytes: int = 10_000_000
+    embedding_max_bytes: int = 16_000_000
+    llm_rerank_max_bytes: int = 2_000_000
+    discord_max_bytes: int = 1_000_000
     source_max_items: int = 250
     source_sync_interval_hours: int = 24
     enable_background_loops: bool = True

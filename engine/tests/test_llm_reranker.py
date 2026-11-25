@@ -157,23 +157,33 @@ def test_llm_models_catalog_fetches_and_caches(monkeypatch) -> None:
     import afterword_engine.main as main_module
 
     calls = 0
+    closed = 0
+    client_kwargs: dict[str, object] = {}
 
     class FakeResponse:
+        headers = {"content-type": "application/json"}
+
         def raise_for_status(self) -> None:
             return None
 
-        def json(self) -> dict:
-            return {
-                "openai": {
-                    "name": "OpenAI",
-                    "api": "https://api.openai.com/v1",
-                    "models": {"gpt-4o-mini": {"id": "gpt-4o-mini", "name": "GPT-4o mini"}},
+        async def aiter_bytes(self):
+            yield json.dumps(
+                {
+                    "openai": {
+                        "name": "OpenAI",
+                        "api": "https://api.openai.com/v1",
+                        "models": {"gpt-4o-mini": {"id": "gpt-4o-mini", "name": "GPT-4o mini"}},
+                    }
                 }
-            }
+            ).encode("utf-8")
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed += 1
 
     class FakeClient:
         def __init__(self, *args, **kwargs) -> None:
-            pass
+            client_kwargs.update(kwargs)
 
         async def __aenter__(self):
             return self
@@ -181,18 +191,26 @@ def test_llm_models_catalog_fetches_and_caches(monkeypatch) -> None:
         async def __aexit__(self, *args) -> None:
             return None
 
-        async def get(self, url: str):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        async def send(self, request, *, stream: bool = False, **kwargs):
             nonlocal calls
+            assert stream is True
+            assert request["url"] == "https://models.dev/api.json"
             calls += 1
             return FakeResponse()
 
-    main_module._MODELS_DEV_CACHE["providers"] = []
-    main_module._MODELS_DEV_CACHE["expires_at"] = 0.0
+    monkeypatch.setitem(main_module._MODELS_DEV_CACHE, "providers", [])
+    monkeypatch.setitem(main_module._MODELS_DEV_CACHE, "expires_at", 0.0)
     monkeypatch.setattr(main_module.httpx, "AsyncClient", FakeClient)
 
     first = asyncio.run(main_module.llm_models_catalog())
     second = asyncio.run(main_module.llm_models_catalog())
     assert calls == 1
+    assert closed == 1
+    assert client_kwargs.get("follow_redirects") is False
+    assert client_kwargs.get("trust_env") is False
     assert first["cached"] is False
     assert second["cached"] is True
     assert first["providers"][0]["id"] == "openai"
@@ -659,7 +677,14 @@ def test_serving_releases_db_lock_before_network_io_and_caches_per_profile(
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, *, headers: dict, json: dict, **kwargs):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            url = request["url"]
+            headers = request.get("headers") or {}
+            payload = request["json"]
             # Verify _LockedConnection and _ProfileDatabaseLock are NOT held during outbound HTTP!
             active_db = profile_database_path()
             lock = database_lock(active_db)
@@ -668,23 +693,27 @@ def test_serving_releases_db_lock_before_network_io_and_caches_per_profile(
             with lock:
                 pass
 
-            payload = json
             user_content = globals()["json"].loads(payload["messages"][1]["content"])
             cands = user_content["candidates"]
             if not cands:
                 class ProbeResp:
                     status_code = 200
-                    headers: dict[str, str] = {}
+                    headers = {"content-type": "application/json"}
 
                     def raise_for_status(self) -> None:
                         return None
 
-                    def json(self) -> dict:
-                        return {
-                            "choices": [
-                                {"message": {"content": '{"adjustments": []}'}}
-                            ]
-                        }
+                    def iter_bytes(self):
+                        yield globals()["json"].dumps(
+                            {
+                                "choices": [
+                                    {"message": {"content": '{"adjustments": []}'}}
+                                ]
+                            }
+                        ).encode("utf-8")
+
+                    def close(self) -> None:
+                        return None
 
                 return ProbeResp()
 
@@ -700,36 +729,41 @@ def test_serving_releases_db_lock_before_network_io_and_caches_per_profile(
 
             class Resp:
                 status_code = 200
-                headers: dict[str, str] = {}
+                headers = {"content-type": "application/json"}
 
                 def raise_for_status(self) -> None:
                     return None
 
-                def json(self) -> dict:
-                    return {
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": globals()["json"].dumps(
-                                        {
-                                            "adjustments": [
-                                                {
-                                                    "id": cands[1]["id"],
-                                                    "delta": 1.1,
-                                                    "reason": "Grounded profile match",
-                                                },
-                                                {
-                                                    "id": cands[0]["id"],
-                                                    "delta": 0.0,
-                                                    "reason": "Unchanged",
-                                                },
-                                            ]
-                                        }
-                                    )
+                def iter_bytes(self):
+                    yield globals()["json"].dumps(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": globals()["json"].dumps(
+                                            {
+                                                "adjustments": [
+                                                    {
+                                                        "id": cands[1]["id"],
+                                                        "delta": 1.1,
+                                                        "reason": "Grounded profile match",
+                                                    },
+                                                    {
+                                                        "id": cands[0]["id"],
+                                                        "delta": 0.0,
+                                                        "reason": "Unchanged",
+                                                    },
+                                                ]
+                                            }
+                                        )
+                                    }
                                 }
-                            }
-                        ]
-                    }
+                            ]
+                        }
+                    ).encode("utf-8")
+
+                def close(self) -> None:
+                    return None
 
             return Resp()
 
@@ -862,18 +896,24 @@ def test_ssrf_validation_redirect_rejection_and_host_credential_isolation(
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, **kwargs):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+
             class ProbeResp:
                 status_code = 200
-                headers: dict[str, str] = {}
+                headers = {"content-type": "application/json"}
 
                 def raise_for_status(self) -> None:
                     return None
 
-                def json(self) -> dict:
-                    return {
-                        "choices": [{"message": {"content": '{"adjustments": []}'}}]
-                    }
+                def iter_bytes(self):
+                    yield b'{"choices":[{"message":{"content":"{\\"adjustments\\": []}"}}]}'
+
+                def close(self) -> None:
+                    return None
 
             return ProbeResp()
 
@@ -991,14 +1031,22 @@ def test_ssrf_validation_redirect_rejection_and_host_credential_isolation(
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, *, headers: dict, json: dict):
-            seen_requests.append((url, headers.get("Authorization", "")))
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            headers = request.get("headers") or {}
+            seen_requests.append((request["url"], headers.get("Authorization", "")))
 
             class RedirectResp:
                 status_code = 307
                 headers = {"location": "https://evil.example.org/steal"}
 
                 def raise_for_status(self) -> None:
+                    return None
+
+                def close(self) -> None:
                     return None
 
             return RedirectResp()
@@ -1080,26 +1128,36 @@ def test_prompt_injection_guardrail_and_hostile_description_delta_clamp(monkeypa
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, *, headers: dict, json: dict):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+
             class Resp:
                 status_code = 200
-                headers: dict[str, str] = {}
+                headers = {"content-type": "application/json"}
 
                 def raise_for_status(self) -> None:
                     return None
 
-                def json(self) -> dict:
-                    return {
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": globals()["json"].dumps(
-                                        {"adjustments": hostile_adjustments}
-                                    )
+                def iter_bytes(self):
+                    yield globals()["json"].dumps(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": globals()["json"].dumps(
+                                            {"adjustments": hostile_adjustments}
+                                        )
+                                    }
                                 }
-                            }
-                        ]
-                    }
+                            ]
+                        }
+                    ).encode("utf-8")
+
+                def close(self) -> None:
+                    return None
 
             return Resp()
 
@@ -1322,10 +1380,14 @@ def test_rerank_with_llm_sync_caches_clamps_timeout_and_disables_redirects(monke
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, *, headers: dict, json: dict):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
             calls.append(
                 {
-                    "url": url,
+                    "url": request["url"],
                     "timeout": self.timeout,
                     "follow_redirects": self.follow_redirects,
                     "kwargs": self.kwargs,
@@ -1334,28 +1396,33 @@ def test_rerank_with_llm_sync_caches_clamps_timeout_and_disables_redirects(monke
 
             class Resp:
                 status_code = 200
-                headers: dict[str, str] = {}
+                headers = {"content-type": "application/json"}
 
                 def raise_for_status(self) -> None:
                     return None
 
-                def json(self) -> dict:
-                    return {
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": globals()["json"].dumps(
-                                        {
-                                            "adjustments": [
-                                                {"id": 2, "delta": 0.85, "reason": "Sync match"},
-                                                {"id": 1, "delta": 0.0, "reason": "No op"},
-                                            ]
-                                        }
-                                    )
+                def iter_bytes(self):
+                    yield globals()["json"].dumps(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": globals()["json"].dumps(
+                                            {
+                                                "adjustments": [
+                                                    {"id": 2, "delta": 0.85, "reason": "Sync match"},
+                                                    {"id": 1, "delta": 0.0, "reason": "No op"},
+                                                ]
+                                            }
+                                        )
+                                    }
                                 }
-                            }
-                        ]
-                    }
+                            ]
+                        }
+                    ).encode("utf-8")
+
+                def close(self) -> None:
+                    return None
 
             return Resp()
 
@@ -1613,34 +1680,44 @@ def test_serving_runs_llm_rerank_before_diversify_discovery_slate(
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, *, headers: dict, json: dict):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+
             class Resp:
                 status_code = 200
-                headers: dict[str, str] = {}
+                headers = {"content-type": "application/json"}
 
                 def raise_for_status(self) -> None:
                     return None
 
-                def json(self) -> dict:
-                    return {
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": globals()["json"].dumps(
-                                        {
-                                            "adjustments": [
-                                                {
-                                                    "id": book_ids["Prolific Book 3"],
-                                                    "delta": 1.0,
-                                                    "reason": "Strong reader match",
-                                                }
-                                            ]
-                                        }
-                                    )
+                def iter_bytes(self):
+                    yield globals()["json"].dumps(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": globals()["json"].dumps(
+                                            {
+                                                "adjustments": [
+                                                    {
+                                                        "id": book_ids["Prolific Book 3"],
+                                                        "delta": 1.0,
+                                                        "reason": "Strong reader match",
+                                                    }
+                                                ]
+                                            }
+                                        )
+                                    }
                                 }
-                            }
-                        ]
-                    }
+                            ]
+                        }
+                    ).encode("utf-8")
+
+                def close(self) -> None:
+                    return None
 
             return Resp()
 
@@ -1787,7 +1864,12 @@ def test_default_timeout_and_ssrf_guards_block_untrusted_urls(monkeypatch) -> No
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, **kwargs):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            url = request["url"]
             return httpx.Response(
                 302,
                 headers={"location": "http://169.254.169.254/latest/meta-data/"},
@@ -1901,7 +1983,12 @@ def test_overview_and_recommendations_release_db_lock_during_llm_and_allow_backu
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, **kwargs):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            url = request["url"]
             lock = database_lock(profile_database_path())
             observed_lock_connections.append(lock._connections)
             in_flight.set()
@@ -2007,7 +2094,12 @@ def test_slate_cache_reused_across_views_and_skips_offset_past_top_k(
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, **kwargs):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            url = request["url"]
             nonlocal llm_calls
             llm_calls += 1
             body = {
@@ -2117,7 +2209,12 @@ def test_circuit_breaker_persists_redacted_errors_and_serves_base_rankings_per_p
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, **kwargs):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            url = request["url"]
             nonlocal llm_calls
             llm_calls += 1
             return httpx.Response(
@@ -2196,10 +2293,17 @@ def test_llm_settings_save_and_test_endpoints_verify_live_responses_and_skip_unc
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, **kwargs):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            url = request["url"]
             nonlocal probe_calls
             probe_calls += 1
-            captured_auth_headers.append(kwargs.get("headers", {}).get("Authorization", ""))
+            captured_auth_headers.append(
+                (request.get("headers") or {}).get("Authorization", "")
+            )
             if should_fail:
                 return httpx.Response(
                     401,
@@ -2363,8 +2467,15 @@ def test_changed_url_or_provider_with_blank_key_never_sends_stored_or_env_key(
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, **kwargs):
-            sent_requests.append({"url": url, "headers": dict(kwargs.get("headers") or {})})
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            url = request["url"]
+            sent_requests.append(
+                {"url": url, "headers": dict(request.get("headers") or {})}
+            )
             return httpx.Response(
                 200,
                 json={"choices": [{"message": {"content": '{"adjustments": []}'}}]},
@@ -2535,7 +2646,12 @@ def test_empty_payload_trips_circuit_breaker_while_empty_adjustments_list_succee
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, **kwargs):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            url = request["url"]
             nonlocal llm_calls
             llm_calls += 1
             return httpx.Response(
@@ -2604,8 +2720,13 @@ def test_request_target_pins_resolved_ip_and_hmac_isolates_api_keys_and_modes(
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, **kwargs):
-            captured.append({"url": url, **kwargs})
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            url = request["url"]
+            captured.append(request)
             return httpx.Response(
                 200,
                 json={"choices": [{"message": {"content": '{"adjustments": []}'}}]},
@@ -2734,9 +2855,14 @@ def test_mode_persistence_and_blank_url_credential_hygiene(
         def __exit__(self, *args) -> None:
             return None
 
-        def post(self, url: str, **kwargs):
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            url = request["url"]
             sent_requests.append(
-                {"url": url, "headers": dict(kwargs.get("headers") or {})}
+                {"url": url, "headers": dict(request.get("headers") or {})}
             )
             return httpx.Response(
                 200,
@@ -2859,3 +2985,94 @@ def test_mode_persistence_and_blank_url_credential_hygiene(
     assert disabled_blank_url.status_code == 200
     assert disabled_blank_url.json()["llm_rerank"]["api_key_set"] is False
     assert row("SELECT value FROM settings WHERE key='llm_rerank_api_key'")["value"] == ""
+
+    # 5. Mode allowlist (`LLM_RERANK_MODES`), `llm_rerank_allowed_hosts` ownership, and bounded probe streams:
+    assert reranker_module.LLM_RERANK_MODES == ("cloud", "ollama", "openai-compatible")
+    assert reranker_module.llm_rerank_allowed_hosts("") == set()
+    for allowed_mode in ("cloud", "ollama", "openai-compatible", "  CLOUD  "):
+        assert (
+            reranker_module.normalize_llm_rerank_mode(allowed_mode)
+            in reranker_module.LLM_RERANK_MODES
+        )
+    assert reranker_module.normalize_llm_rerank_mode("") == ""
+    assert reranker_module.normalize_llm_rerank_mode(None) == ""
+
+    for invalid_mode in ("free-text-mode", "custom", "bedrock"):
+        bad_save = client.put(
+            "/api/settings/llm-rerank",
+            json={
+                "enabled": False,
+                "mode": invalid_mode,
+                "provider": "openai",
+                "api_url": "https://llm.example/v1/chat/completions",
+                "model": "gpt-4o-mini",
+            },
+        )
+        assert bad_save.status_code == 400
+        assert "Unsupported LLM reranker mode" in bad_save.json()["detail"]
+
+        bad_test = client.post(
+            "/api/settings/llm-rerank/test",
+            json={
+                "mode": invalid_mode,
+                "provider": "openai",
+                "api_url": "https://llm.example/v1/chat/completions",
+                "model": "gpt-4o-mini",
+                "api_key": "sk-test",
+            },
+        )
+        assert bad_test.status_code == 400
+        assert "Unsupported LLM reranker mode" in bad_test.json()["detail"]
+
+    # Probe streams enforce `settings.llm_rerank_max_bytes` and close the response stream immediately.
+    from afterword_engine.config import settings
+    import pytest
+
+    monkeypatch.setattr(settings, "llm_rerank_max_bytes", 1_024)
+    closed_probe_streams = 0
+    yielded_probe_chunks = 0
+
+    class OversizedProbeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+
+            class OversizedResp:
+                status_code = 200
+                headers = {"content-type": "application/json"}
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def iter_bytes(self):
+                    nonlocal yielded_probe_chunks
+                    for _ in range(10):
+                        yielded_probe_chunks += 1
+                        yield b"x" * 600
+
+                def close(self) -> None:
+                    nonlocal closed_probe_streams
+                    closed_probe_streams += 1
+
+            return OversizedResp()
+
+    monkeypatch.setattr(reranker_module.httpx, "Client", OversizedProbeClient)
+    with pytest.raises(RuntimeError, match="LLM reranker response is too large"):
+        reranker_module.probe_llm_reranker(
+            api_url="https://llm.example/v1",
+            api_key="sk-probe",
+            model="gpt-4o-mini",
+        )
+    assert yielded_probe_chunks == 2
+    assert closed_probe_streams == 1
