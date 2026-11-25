@@ -776,6 +776,265 @@ def test_purge_orphan_sweep_is_scoped_to_purged_runs(database):
         )
 
 
+def test_purge_read_ids_matches_all_four_key_patterns_batching_and_preserve_runs(
+    database,
+):
+    vec = np.asarray([0.4, 0.3, -0.5], dtype=np.float32)
+    with transaction() as con:
+        cand_two = _candidate(con, "Four Key Two-Part", "A. Author")
+        cand_three = _candidate(con, "Four Key Three-Part", "B. Author")
+        cand_manual = _candidate(con, "Four Key Manual", "C. Author")
+        cand_attr = _candidate(con, "Four Key Attribution", "D. Author")
+        cand_keep = _candidate(con, "Four Key Keep Read", "E. Author")
+        cand_fb = _candidate(con, "Four Key Keep Feedback", "F. Author")
+        cand_full_two = _candidate(con, "Full Purge Two-Part", "G. Author")
+        cand_full_three = _candidate(con, "Full Purge Three-Part", "H. Author")
+        cand_full_manual = _candidate(con, "Full Purge Manual", "I. Author")
+        cand_full_attr = _candidate(con, "Full Purge Attribution", "J. Author")
+
+        shared_cands = [cand_two, cand_three, cand_manual, cand_attr, cand_keep, cand_fb]
+        full_cands = [cand_full_two, cand_full_three, cand_full_manual, cand_full_attr]
+        all_cands = [*shared_cands, *full_cands]
+        vec_map = {item["id"]: vec for item in all_cands}
+        _set_embeddings(con, all_cands, vec_map)
+
+        ev_shared = _build(con, shared_cands, [], {item["id"]: vec for item in shared_cands})
+        ev_full_two = _build(con, [cand_full_two], [], {cand_full_two["id"]: vec})
+        ev_full_three = _build(con, [cand_full_three], [], {cand_full_three["id"]: vec})
+        ev_full_manual = _build(con, [cand_full_manual], [], {cand_full_manual["id"]: vec})
+        ev_full_attr = _build(con, [cand_full_attr], [], {cand_full_attr["id"]: vec})
+
+        target_read_id = int(
+            con.execute(
+                "INSERT INTO reads(title,author,rating,read_at,source) "
+                "VALUES('Target Purge Book','A. Author',5,'2025-06-01','demo')"
+            ).lastrowid
+        )
+        full_read_id = int(
+            con.execute(
+                "INSERT INTO reads(title,author,rating,read_at,source) "
+                "VALUES('Full Purge Book','G. Author',5,'2025-06-01','goodreads_csv')"
+            ).lastrowid
+        )
+        keep_read_id = int(
+            con.execute(
+                "INSERT INTO reads(title,author,rating,read_at,source) "
+                "VALUES('Keep Real Book','E. Author',4,'2025-06-01','goodreads_csv')"
+            ).lastrowid
+        )
+        padding_read_ids = [
+            int(
+                con.execute(
+                    "INSERT INTO reads(title,author,rating,read_at,source) "
+                    "VALUES(?,?,4,'2025-06-01','demo')",
+                    (f"Batch Padding {idx}", "P. Author"),
+                ).lastrowid
+            )
+            for idx in range(120)
+        ]
+
+    run_shared = create_recommendation_run(shared_cands, decision_evidence=ev_shared)
+    run_full_two = create_recommendation_run([cand_full_two], decision_evidence=ev_full_two)
+    run_full_three = create_recommendation_run([cand_full_three], decision_evidence=ev_full_three)
+    run_full_manual = create_recommendation_run([cand_full_manual], decision_evidence=ev_full_manual)
+    run_full_attr = create_recommendation_run([cand_full_attr], decision_evidence=ev_full_attr)
+
+    shared_keys = (
+        f"read:{target_read_id:08d}",
+        f"read:{target_read_id:08d}:{cand_three['id']}",
+        f"manual-read:{cand_manual['id']}:{target_read_id:08d}",
+        f"attribution:read:{target_read_id:08d}:{cand_attr['id']}",
+    )
+    keep_read_key = f"read:{keep_read_id:08d}"
+    keep_feedback_key = f"feedback:keep-{cand_fb['id']}"
+
+    full_keys = (
+        f"read:{full_read_id:08d}",
+        f"read:{full_read_id:08d}:{cand_full_three['id']}",
+        f"manual-read:{cand_full_manual['id']}:{full_read_id:08d}",
+        f"attribution:read:{full_read_id:08d}:{cand_full_attr['id']}",
+    )
+
+    with transaction() as con:
+        for key, cand in zip(
+            shared_keys,
+            (cand_two, cand_three, cand_manual, cand_attr),
+            strict=True,
+        ):
+            record_event_in_connection(
+                con,
+                event_key=key,
+                candidate_id=cand["id"],
+                event_type="read",
+                run_id=run_shared,
+                value=5.0,
+                source="read_import",
+                label=1.0,
+                label_kind="rating_positive",
+                confidence=1.0,
+                read_id=target_read_id,
+            )
+        # Also append an unlinked retraction revision on one of the target read keys.
+        record_event_in_connection(
+            con,
+            event_key=shared_keys[0],
+            candidate_id=cand_two["id"],
+            event_type="read",
+            run_id=None,
+            value=5.0,
+            source="read_import",
+            clear_read_outcome=True,
+        )
+        record_event_in_connection(
+            con,
+            event_key=keep_read_key,
+            candidate_id=cand_keep["id"],
+            event_type="read",
+            run_id=run_shared,
+            value=4.0,
+            source="read_import",
+            label=1.0,
+            label_kind="rating_positive",
+            confidence=1.0,
+            read_id=keep_read_id,
+        )
+        record_event_in_connection(
+            con,
+            event_key=keep_feedback_key,
+            candidate_id=cand_fb["id"],
+            event_type="save",
+            run_id=run_shared,
+            value=1.0,
+            source="ui_feedback",
+            label=0.8,
+            label_kind="explicit_feedback",
+            confidence=0.9,
+        )
+
+        for key, cand, run in zip(
+            full_keys,
+            (cand_full_two, cand_full_three, cand_full_manual, cand_full_attr),
+            (run_full_two, run_full_three, run_full_manual, run_full_attr),
+            strict=True,
+        ):
+            record_event_in_connection(
+                con,
+                event_key=key,
+                candidate_id=cand["id"],
+                event_type="read",
+                run_id=run,
+                value=5.0,
+                source="read_import",
+                label=1.0,
+                label_kind="rating_positive",
+                confidence=1.0,
+                read_id=full_read_id,
+            )
+        record_event_in_connection(
+            con,
+            event_key=full_keys[3],
+            candidate_id=cand_full_attr["id"],
+            event_type="read",
+            run_id=None,
+            value=5.0,
+            source="read_import",
+            clear_read_outcome=True,
+        )
+
+        # 1. preserve_runs=True across >100 batched read IDs removes all 4 read key forms
+        # (including unlinked revisions) and replay snapshot while keeping run_shared + kept rows.
+        preserved_result = purge_recommendation_evidence(
+            con,
+            read_ids=[target_read_id, *padding_read_ids],
+            preserve_runs=True,
+        )
+        assert preserved_result["runs_removed"] == 1
+        assert (
+            con.execute(
+                "SELECT 1 FROM recommendation_runs WHERE id=?", (run_shared,)
+            ).fetchone()
+            is not None
+        )
+        assert (
+            con.execute(
+                "SELECT 1 FROM recommendation_run_evidence WHERE run_id=?",
+                (run_shared,),
+            ).fetchone()
+            is None
+        )
+        assert (
+            con.execute(
+                "SELECT COUNT(*) FROM recommendation_impressions WHERE run_id=?",
+                (run_shared,),
+            ).fetchone()[0]
+            == len(shared_cands)
+        )
+        assert (
+            con.execute(
+                "SELECT COUNT(*) FROM recommendation_evidence_exposures WHERE run_id=?",
+                (run_shared,),
+            ).fetchone()[0]
+            == len(shared_cands)
+        )
+        for key in shared_keys:
+            for table in (
+                "recommendation_events",
+                "recommendation_evidence_events",
+                "recommendation_evidence_outcomes",
+            ):
+                assert (
+                    con.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE event_key=?",
+                        (key,),
+                    ).fetchone()[0]
+                    == 0
+                )
+        assert (
+            con.execute(
+                "SELECT COUNT(*) FROM recommendation_outcomes WHERE read_id=?",
+                (target_read_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        for kept_key in (keep_read_key, keep_feedback_key):
+            for table in (
+                "recommendation_events",
+                "recommendation_evidence_events",
+                "recommendation_evidence_outcomes",
+            ):
+                assert (
+                    con.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE event_key=?",
+                        (kept_key,),
+                    ).fetchone()[0]
+                    == 1
+                )
+
+        # 2. preserve_runs=False removes all 4 runs, all 4 key forms, and unlinked revisions.
+        full_result = purge_recommendation_evidence(con, read_ids=[full_read_id])
+        assert full_result["runs_removed"] == 4
+        for purged_run in (run_full_two, run_full_three, run_full_manual, run_full_attr):
+            assert (
+                con.execute(
+                    "SELECT 1 FROM recommendation_runs WHERE id=?", (purged_run,)
+                ).fetchone()
+                is None
+            )
+        for key in full_keys:
+            for table in (
+                "recommendation_events",
+                "recommendation_evidence_events",
+                "recommendation_evidence_outcomes",
+            ):
+                assert (
+                    con.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE event_key=?",
+                        (key,),
+                    ).fetchone()[0]
+                    == 0
+                )
+
+
 def test_era_profile_fields_replay_reproduces_observed_books_and_era_adjustments(database):
     previous_exploration = settings.exploration_enabled
     settings.exploration_enabled = False

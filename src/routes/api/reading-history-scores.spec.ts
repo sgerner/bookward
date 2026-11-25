@@ -7,6 +7,7 @@ vi.mock("#lib/server/engine.js", async (importOriginal) => ({
   engine: engineMock,
 }));
 
+import { EngineError } from "#lib/server/engine.js";
 import { GET } from "./reading-history/scores/+server";
 
 afterEach(() => vi.clearAllMocks());
@@ -70,7 +71,7 @@ describe("reading-history scores endpoint", () => {
 
   it("forwards upstream engine errors cleanly so failed batches can be retried", async () => {
     engineMock.mockRejectedValueOnce(
-      Object.assign(new Error("Upstream score batch failed."), { status: 502 }),
+      new EngineError("Upstream score batch failed.", 502),
     );
 
     const response = await GET({

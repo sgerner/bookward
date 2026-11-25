@@ -60,7 +60,8 @@ describe('admin page SSR', () => {
 							status: 'active'
 						}
 					],
-					identityBackup: null
+					identityBackup: null,
+					password_enabled: true
 				},
 				form: null
 			}
@@ -76,5 +77,7 @@ describe('admin page SSR', () => {
 		expect(body).toContain('aria-label="Reset password for Alice Local"');
 		expect(body).toContain('aria-label="Reset password for Legacy OIDC Name"');
 		expect(body).toContain('aria-label="Reset password unavailable for Casey SSO"');
+		expect(body).toContain('Type Casey SSO to confirm.');
+		expect(body).toContain('Type oidc:legacy-reader to confirm.');
 	});
 });

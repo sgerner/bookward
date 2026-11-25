@@ -1,4 +1,5 @@
 import hashlib
+import ipaddress
 import json
 import asyncio
 import logging
@@ -35,7 +36,10 @@ from .database import (
     fenced_async,
     initialize,
     normalize_key,
+    private_setting,
+    purge_demo_reads,
     recompute_candidate_sources,
+    reset_profile_history,
     row,
     rows,
     scheduler_fenced,
@@ -49,10 +53,12 @@ from .backups import (
     clear_interrupted_restore_journal,
     compact_database,
     create_backup,
+    has_pending_auth_backup_scrubs,
     has_restore_journal,
     identity_backup_status,
     recover_interrupted_restore,
     restore_backup,
+    retry_pending_auth_backup_scrubs,
 )
 from .decision_evidence import EVIDENCE_SCHEMA_VERSION, set_evidence_rotation_enabled
 from .maintenance import set_storage_retention_enabled
@@ -137,10 +143,14 @@ from .association_sources.openlibrary import OpenLibraryListProvider
 from .association_sources.librarything import LibraryThingProvider
 from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import (
+    CATALOG_QUARANTINE_RETRY_DAYS,
     QUALITY_AUDIT_BATCH_SIZE,
+    QUALITY_SWEEP_ACTIVE_KEY,
+    _utc_audit_timestamp,
     audit_candidates,
     configure_candidate_quality_sweep,
     finish_candidate_quality_batch,
+    get_candidate_quality_sweep_status,
     has_candidate_quality_audit_candidates,
     prepare_candidate_quality_batch,
     quality_summary,
@@ -164,7 +174,7 @@ from .identity import (
 )
 from .isbn import isbn_parts
 from . import profiles as identity_store
-from .tenancy import current_profile_id, profile_database_path, profile_scope
+from .tenancy import ProfileDeletedError, current_profile_id, profile_database_path, profile_scope
 import jwt
 
 SOURCE_SYNC_MIN_HOURS = 0
@@ -174,8 +184,13 @@ GOODREADS_RSS_MAX_ATTEMPTS = 3
 SCHEDULER_INITIAL_DELAY_SECONDS = 5
 SCHEDULER_POLL_SECONDS = 60
 ENRICHMENT_RETRY_POLL_SECONDS = 300
+QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS = 120.0
+QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY = "candidate_quality_recovery_chain_started_at"
+QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY = "candidate_quality_recovery_deferred_until"
+QUALITY_RETRY_QUARANTINED_BEFORE_KEY = "candidate_quality_retry_quarantined_before"
 GOODREADS_RSS_SYNC_HOUR_UTC = 2
 LOGGER = logging.getLogger(__name__)
+_recovery_clock = time.time
 
 
 class LocalLoginIn(BaseModel):
@@ -204,9 +219,29 @@ class AccountPasswordIn(BaseModel):
     password: str = Field(min_length=12, max_length=1024)
 
 
+class AccountDeleteIn(BaseModel):
+    current_password: str = Field(default="", max_length=1024)
+    confirm: str | None = Field(default=None, max_length=32)
+
+
+class HistoryResetIn(BaseModel):
+    current_password: str = Field(default="", max_length=1024)
+    confirm: str | None = Field(default=None, max_length=32)
+
+
+class AdminAccountDeleteIn(BaseModel):
+    current_password: str = Field(default="", max_length=1024)
+    confirm_username: str | None = Field(default=None, max_length=160)
+
+
 class CandidateAuditIn(BaseModel):
     mode: Literal["incremental", "full"] | None = None
+    dry_run: bool = False
+    count_only: bool = False
+    only_pending: bool | None = None
     retry: bool = False
+    retry_quarantined: bool = False
+    limit: int | None = Field(default=None, ge=1, le=500)
 
 
 def _ensure_profile_database(profile_id: str):
@@ -222,6 +257,57 @@ def _principal(request):
     return account
 
 
+def _normalize_ip(value: str | None) -> str | None:
+    candidate = (value or "").strip()
+    if not candidate or len(candidate) > 80:
+        return None
+    if candidate.startswith("[") and "]" in candidate:
+        host_part, _, remainder = candidate[1:].partition("]")
+        if remainder and not (remainder.startswith(":") and remainder[1:].isdigit()):
+            return None
+        candidate = host_part
+    elif candidate.count(":") == 1:
+        host_part, port_part = candidate.split(":", 1)
+        if port_part.isdigit():
+            candidate = host_part
+    zone_stripped = candidate.split("%", 1)[0]
+    try:
+        parsed = ipaddress.ip_address(zone_stripped)
+    except ValueError:
+        return None
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        parsed = parsed.ipv4_mapped
+    return str(parsed)
+
+
+def _verified_client_ip(request: Request, *, service_authenticated: bool = False) -> str:
+    peer_host = request.client.host if request.client and request.client.host else ""
+    if service_authenticated:
+        forwarded = _normalize_ip(request.headers.get("x-bookward-client-ip"))
+        if forwarded:
+            return forwarded
+    normalized_peer = _normalize_ip(peer_host)
+    if normalized_peer:
+        return normalized_peer
+    return peer_host[:80] if peer_host else "unknown"
+
+
+def _warn_if_shared_rate_limit_bucket() -> None:
+    if not settings.service_secret.strip():
+        LOGGER.warning(
+            "AFTERWORD_SERVICE_SECRET is not set; x-bookward-client-ip headers are ignored "
+            "and sign-in rate limiting shares the caller peer IP bucket. Set ENGINE_SERVICE_SECRET "
+            "(and ADDRESS_HEADER behind a reverse proxy) for per-client IP isolation."
+        )
+
+
+def _request_client_ip(request: Request) -> str:
+    resolved = getattr(request.state, "client_ip", None)
+    if resolved:
+        return resolved
+    return _verified_client_ip(request)
+
+
 def _require_admin(request):
     account = _principal(request)
     if account["role"] != "admin":
@@ -229,13 +315,50 @@ def _require_admin(request):
     return account
 
 
-def _require_recent_authentication(account):
+def _require_recent_authentication(
+    account, message: str = "Sign in again before adding a login method"
+):
     try:
         authenticated_at = datetime.fromisoformat(account.get("session_created_at", ""))
     except (TypeError, ValueError):
         raise HTTPException(401, "Sign in again to confirm this change")
     if datetime.now(timezone.utc) - authenticated_at > timedelta(minutes=10):
-        raise HTTPException(401, "Sign in again before adding a login method")
+        raise HTTPException(401, message)
+
+
+def _verify_account_confirmation(account: dict, current_password: str, request: Request) -> None:
+    methods = identity_store.auth_methods(account["id"])
+    local_username = bool(
+        methods.get(
+            "has_local_username",
+            account.get(
+                "has_local_username",
+                identity_store.has_local_username(account.get("username")),
+            ),
+        )
+    )
+    if methods["password_enabled"] and local_username:
+        session_hash = account.get("session_token_hash") or hashlib.sha256(
+            (request.headers.get("x-bookward-session") or "").encode()
+        ).hexdigest()
+        try:
+            verified = identity_store.authenticate_local(
+                account["username"],
+                current_password,
+                f"session:{session_hash}",
+                scope="session",
+                client_address=_request_client_ip(request),
+            )
+        except identity_store.LoginRateLimitError as exc:
+            raise HTTPException(
+                429,
+                str(exc),
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
+        if not verified or verified["id"] != account["id"]:
+            raise HTTPException(401, "Current password is incorrect")
+    else:
+        _require_recent_authentication(account, "Sign in again to confirm this change")
 
 
 def _require_enrollment_verification(account):
@@ -362,8 +485,48 @@ def enqueue_followup_job(kind: str):
         return job_id
 
 
+def _get_quality_recovery_setting_float(key: str) -> float | None:
+    raw = private_setting(key, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _set_quality_recovery_settings(**values: str) -> None:
+    if not values:
+        return
+    with transaction() as con:
+        for key, value in values.items():
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                (key, value),
+            )
+
+
+def _is_quality_recovery_deferred(now: float | None = None) -> bool:
+    deferred_until = _get_quality_recovery_setting_float(QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY)
+    if deferred_until is None:
+        return False
+    current = _recovery_clock() if now is None else now
+    return current < deferred_until and (deferred_until - current) <= (ENRICHMENT_RETRY_POLL_SECONDS * 2)
+
+
+def _has_due_quality_recovery() -> bool:
+    retry_cutoff = private_setting(QUALITY_RETRY_QUARANTINED_BEFORE_KEY, "").strip()
+    if retry_cutoff:
+        return has_candidate_quality_audit_candidates(
+            include_quarantined=True,
+            quarantine_before=retry_cutoff,
+        )
+    return has_candidate_quality_audit_candidates()
+
+
 def _enqueue_candidate_quality_followup():
-    if has_candidate_quality_audit_candidates():
+    if not _is_quality_recovery_deferred() and _has_due_quality_recovery():
         return enqueue_followup_job("candidate_quality_recovery")
     return None
 
@@ -373,11 +536,20 @@ def _queue_due_enrichment_retries():
     """Schedule bounded retry jobs without performing provider requests here."""
 
     queued = {}
+    now_ts = _recovery_clock()
     if (
         not active_job("candidate_quality")
         and not active_job("candidate_quality_recovery")
-        and has_candidate_quality_audit_candidates()
+        and not _is_quality_recovery_deferred(now_ts)
+        and _has_due_quality_recovery()
     ):
+        started = _get_quality_recovery_setting_float(QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY)
+        updates: dict[str, str] = {QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: ""}
+        if started is not None and (
+            started > now_ts or (now_ts - started) >= QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS
+        ):
+            updates[QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY] = ""
+        _set_quality_recovery_settings(**updates)
         queued["candidate_quality_recovery"] = enqueue_job("candidate_quality_recovery", dedupe=True)
     if not active_job("metadata") and candidate_metadata_refresh_remaining():
         queued["metadata"] = enqueue_job("metadata", dedupe=True)
@@ -431,7 +603,7 @@ async def source_scheduler_loop(stop):
                         enqueue_job("sync_due", dedupe=True)
                     if check_enrichment_retries:
                         _queue_due_enrichment_retries()
-            except RestoreEpochError:
+            except (ProfileDeletedError, RestoreEpochError):
                 continue
             except Exception:
                 # A transient profile database error must not stop schedules
@@ -458,7 +630,7 @@ async def digest_scheduler_loop(stop):
                         continue
                     if digest_is_due(private_settings()) and not active_job("digest"):
                         enqueue_job("digest", dedupe=True)
-            except RestoreEpochError:
+            except (ProfileDeletedError, RestoreEpochError):
                 continue
             except Exception:
                 LOGGER.exception("Digest scheduler failed for profile %s", profile_id)
@@ -531,7 +703,7 @@ async def goodreads_rss_scheduler_loop(stop):
             try:
                 with profile_scope(profile_id):
                     queue_goodreads_rss_if_due()
-            except RestoreEpochError:
+            except (ProfileDeletedError, RestoreEpochError):
                 continue
             except Exception:
                 LOGGER.exception("Goodreads RSS scheduler failed for profile %s", profile_id)
@@ -685,8 +857,54 @@ async def handle_job(kind: str):
             "score_job_id": score_job_id,
         }
     if kind == "candidate_quality_recovery":
-        quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
-        _enqueue_candidate_quality_followup()
+        profile_key = current_profile_id()
+        now_ts = _recovery_clock()
+        started = _get_quality_recovery_setting_float(QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY)
+        max_chain_age = QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS + ENRICHMENT_RETRY_POLL_SECONDS
+        if started is None or started > now_ts or (now_ts - started) > max_chain_age:
+            started = now_ts
+            _set_quality_recovery_settings(
+                **{
+                    QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: f"{started:.6f}",
+                    QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+                }
+            )
+        retry_cutoff = private_setting(QUALITY_RETRY_QUARANTINED_BEFORE_KEY, "").strip()
+        if retry_cutoff:
+            quality = await audit_candidates(
+                only_pending=True,
+                limit=QUALITY_AUDIT_BATCH_SIZE,
+                retry_quarantined=True,
+                quarantine_before=retry_cutoff,
+            )
+        else:
+            quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
+        after_ts = _recovery_clock()
+        followup_deferred = False
+        if _has_due_quality_recovery():
+            if (after_ts - started) < QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS:
+                _enqueue_candidate_quality_followup()
+            else:
+                _set_quality_recovery_settings(
+                    **{
+                        QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
+                        QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: f"{after_ts + ENRICHMENT_RETRY_POLL_SECONDS:.6f}",
+                    }
+                )
+                followup_deferred = True
+                LOGGER.info(
+                    "Deferring remaining candidate quality recovery for profile %s after %.1fs continuous window",
+                    profile_key,
+                    QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS,
+                )
+        else:
+            _set_quality_recovery_settings(
+                **{
+                    QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
+                    QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+                    QUALITY_RETRY_QUARANTINED_BEFORE_KEY: "",
+                }
+            )
         enqueue_job("read_work_identities", dedupe=True)
         scored = await score_all(
             config.get("embedding_backend"),
@@ -694,7 +912,7 @@ async def handle_job(kind: str):
             config.get("embedding_url"),
             config.get("embedding_api_key"),
         )
-        return {**quality, "scored": scored}
+        return {**quality, "scored": scored, "followup_deferred": followup_deferred}
     if kind.startswith("source:"):
         try:
             source_id = int(kind.partition(":")[2])
@@ -859,19 +1077,31 @@ async def handle_job(kind: str):
 
 @asynccontextmanager
 async def lifespan(app):
+    _warn_if_shared_rate_limit_bucket()
     identity_store.initialize_auth()
-    ready_profiles: set[str] = set()
     try:
-        with profile_scope("legacy"):
-            recover_interrupted_restore()
-            initialize()
-            legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
-        identity_store.migrate_legacy_api_tokens(legacy_tokens)
-        ready_profiles.add("legacy")
+        identity_store.recover_incomplete_account_erasures()
     except Exception:
-        LOGGER.exception("Could not initialize profile legacy during startup")
+        LOGGER.warning("Could not complete interrupted account erasures during startup")
     if not has_restore_journal("legacy") or installation_key_path().is_file():
         auth_registry_key()
+    ready_profiles: set[str] = set()
+    legacy_active = "legacy" in identity_store.profile_ids()
+    if has_pending_auth_backup_scrubs():
+        try:
+            retry_pending_auth_backup_scrubs()
+        except Exception:
+            LOGGER.warning("Could not complete pending auth-backup scrubs during startup")
+    if legacy_active:
+        try:
+            with profile_scope("legacy"):
+                recover_interrupted_restore()
+                initialize(seed_demo=True)
+                legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
+            identity_store.migrate_legacy_api_tokens(legacy_tokens)
+            ready_profiles.add("legacy")
+        except Exception:
+            LOGGER.exception("Could not initialize profile legacy during startup")
     for profile_id in identity_store.profile_ids():
         if profile_id != "legacy":
             try:
@@ -898,7 +1128,11 @@ async def lifespan(app):
         try:
             with profile_scope(profile_id):
                 enqueue_job("metadata", dedupe=True)
-                if not active_job("candidate_quality") and has_candidate_quality_audit_candidates():
+                if (
+                    not active_job("candidate_quality")
+                    and not _is_quality_recovery_deferred()
+                    and _has_due_quality_recovery()
+                ):
                     enqueue_job("candidate_quality_recovery", dedupe=True)
                 enqueue_job("read_work_identities", dedupe=True)
                 enqueue_job("read_metadata", dedupe=True)
@@ -983,7 +1217,8 @@ async def authenticate_engine_request(request: Request, call_next):
     path = request.url.path
     if request.method == "OPTIONS" or path == "/api/health":
         return await call_next(request)
-    if settings.service_secret:
+    service_authenticated = False
+    if settings.service_secret.strip():
         supplied = request.headers.get("x-bookward-service", "")
         if not hmac.compare_digest(supplied, settings.service_secret):
             return JSONResponse(
@@ -991,6 +1226,10 @@ async def authenticate_engine_request(request: Request, call_next):
                 status_code=401,
                 headers={"cache-control": "no-store"},
             )
+        service_authenticated = True
+    request.state.client_ip = _verified_client_ip(
+        request, service_authenticated=service_authenticated
+    )
 
     if path == "/api/v1" or path.startswith("/api/v1/"):
         authorization = request.headers.get("authorization", "")
@@ -1047,6 +1286,12 @@ async def authenticate_engine_request(request: Request, call_next):
         if has_restore_journal(token["profile_id"]):
             try:
                 await asyncio.to_thread(_recover_profile_for_request, token["profile_id"])
+            except ProfileDeletedError:
+                return JSONResponse(
+                    {"detail": "A valid API token is required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+                )
             except Exception:
                 LOGGER.exception(
                     "Authenticated profile is unavailable during API request recovery"
@@ -1056,15 +1301,21 @@ async def authenticate_engine_request(request: Request, call_next):
                     status_code=503,
                     headers={"cache-control": "private, no-store"},
                 )
-        with profile_scope(token["profile_id"]), bind_request_restore_epoch():
-            try:
+        try:
+            with profile_scope(token["profile_id"]), bind_request_restore_epoch():
                 response = await call_next(request)
-            except RestoreEpochError:
-                return JSONResponse(
-                    {"detail": "Profile database was restored during this request; retry the action."},
-                    status_code=409,
-                    headers={"cache-control": "private, no-store"},
-                )
+        except ProfileDeletedError:
+            return JSONResponse(
+                {"detail": "A valid API token is required"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+            )
+        except RestoreEpochError:
+            return JSONResponse(
+                {"detail": "Profile database was restored during this request; retry the action."},
+                status_code=409,
+                headers={"cache-control": "private, no-store"},
+            )
         _mark_private_no_store(response)
         return response
 
@@ -1097,6 +1348,12 @@ async def authenticate_engine_request(request: Request, call_next):
     ):
         try:
             await asyncio.to_thread(_recover_profile_for_request, account["profile_id"])
+        except ProfileDeletedError:
+            return JSONResponse(
+                {"detail": "Authentication required"},
+                status_code=401,
+                headers={"cache-control": "private, no-store"},
+            )
         except Exception:
             if not (request.method == "GET" and path == "/api/backups"):
                 LOGGER.exception(
@@ -1108,15 +1365,21 @@ async def authenticate_engine_request(request: Request, call_next):
                     status_code=503,
                     headers={"cache-control": "private, no-store"},
                 )
-    with profile_scope(account["profile_id"]), bind_request_restore_epoch():
-        try:
+    try:
+        with profile_scope(account["profile_id"]), bind_request_restore_epoch():
             response = await call_next(request)
-        except RestoreEpochError:
-            return JSONResponse(
-                {"detail": "Profile database was restored during this request; retry the action."},
-                status_code=409,
-                headers={"cache-control": "private, no-store"},
-            )
+    except ProfileDeletedError:
+        return JSONResponse(
+            {"detail": "Authentication required"},
+            status_code=401,
+            headers={"cache-control": "private, no-store"},
+        )
+    except RestoreEpochError:
+        return JSONResponse(
+            {"detail": "Profile database was restored during this request; retry the action."},
+            status_code=409,
+            headers={"cache-control": "private, no-store"},
+        )
     _mark_private_no_store(response)
     return response
 
@@ -1133,10 +1396,18 @@ def auth_config():
 
 @app.post("/auth/login")
 def local_login(payload: LocalLoginIn, request: Request):
-    account = identity_store.authenticate_local(
-        payload.username, payload.password,
-        request.client.host if request.client else "unknown",
-    )
+    try:
+        account = identity_store.authenticate_local(
+            payload.username,
+            payload.password,
+            _request_client_ip(request),
+        )
+    except identity_store.LoginRateLimitError as exc:
+        raise HTTPException(
+            429,
+            str(exc),
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
     if not account:
         raise HTTPException(401, "Username or password is incorrect")
     raw, account = identity_store.create_session(account["id"])
@@ -1185,10 +1456,23 @@ def change_password(payload: PasswordChangeIn, request: Request):
     methods = identity_store.auth_methods(account["id"])
     local_username = bool(methods["has_local_username"])
     if methods["password_enabled"] and local_username:
-        verified = identity_store.authenticate_local(
-            account["username"], payload.current_password,
-            request.client.host if request.client else "unknown",
-        )
+        session_hash = account.get("session_token_hash") or hashlib.sha256(
+            (request.headers.get("x-bookward-session") or "").encode()
+        ).hexdigest()
+        try:
+            verified = identity_store.authenticate_local(
+                account["username"],
+                payload.current_password,
+                f"session:{session_hash}",
+                scope="session",
+                client_address=_request_client_ip(request),
+            )
+        except identity_store.LoginRateLimitError as exc:
+            raise HTTPException(
+                429,
+                str(exc),
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
         if not verified or verified["id"] != account["id"]:
             raise HTTPException(401, "Current password is incorrect")
     else:
@@ -1232,6 +1516,49 @@ def auth_unlink_identity(identity_id: int, request: Request):
     return {"unlinked": True, "identity_id": identity_id}
 
 
+@app.post("/auth/account/reset-history")
+def auth_reset_history(
+    request: Request,
+    payload: HistoryResetIn | None = Body(default=None),
+):
+    account = _principal(request)
+    if payload is None or payload.confirm != "RESET":
+        raise HTTPException(400, "Type RESET to confirm resetting your reading history")
+    _verify_account_confirmation(account, payload.current_password, request)
+    if has_restore_journal(account["profile_id"]):
+        try:
+            _recover_profile_for_request(account["profile_id"])
+        except Exception as exc:
+            raise HTTPException(503, RESTORE_FENCE_DETAIL) from exc
+    return reset_profile_history(account["profile_id"])
+
+
+@app.delete("/auth/account")
+def auth_delete_account(
+    request: Request,
+    payload: AccountDeleteIn | None = Body(default=None),
+):
+    account = _principal(request)
+    if payload is None or payload.confirm != "DELETE":
+        raise HTTPException(400, "Type DELETE to confirm deleting your account")
+    _verify_account_confirmation(account, payload.current_password, request)
+    try:
+        return identity_store.delete_account(
+            account["id"], actor_account_id=account["id"]
+        )
+    except PermissionError as exc:
+        raise HTTPException(401, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (OSError, sqlite3.Error, BackupError) as exc:
+        raise HTTPException(
+            503,
+            "Account access was revoked; remaining profile cleanup will finish automatically.",
+        ) from exc
+
+
 @app.get("/admin/accounts")
 def admin_accounts(request: Request):
     _require_admin(request)
@@ -1273,6 +1600,15 @@ def admin_reset_password(account_id: str, payload: AccountPasswordIn, request: R
     return {"changed": True, "account_id": account_id}
 
 
+@app.post("/admin/accounts/{account_id}/unlock")
+def admin_unlock_account(account_id: str, request: Request):
+    admin = _require_admin(request)
+    try:
+        return identity_store.unlock_account(account_id, admin_id=admin["id"])
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 @app.put("/admin/accounts/{account_id}/status")
 def admin_set_account_status(account_id: str, payload: dict, request: Request):
     admin = _require_admin(request)
@@ -1289,12 +1625,81 @@ def admin_set_account_status(account_id: str, payload: dict, request: Request):
         # Disabled profiles are excluded from startup/background work. Apply
         # any migrations accumulated while this account was disabled before
         # making its data available to a new session.
-        _ensure_profile_database(found["profile_id"])
+        try:
+            _ensure_profile_database(found["profile_id"])
+        except ProfileDeletedError as exc:
+            raise HTTPException(
+                400, "Account deletion is incomplete; retry deleting this account"
+            ) from exc
+        except BackupError as exc:
+            raise HTTPException(503, RESTORE_FENCE_DETAIL) from exc
     try:
         identity_store.set_account_status(account_id, status)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"updated": True, "account_id": account_id, "status": status}
+
+
+@app.delete("/admin/accounts/{account_id}")
+def admin_delete_account(
+    account_id: str,
+    request: Request,
+    payload: AdminAccountDeleteIn | None = Body(default=None),
+):
+    admin = _require_admin(request)
+    target = identity_store.account_by_id(account_id)
+    if not target:
+        raise HTTPException(404, "Account not found")
+    if target["role"] == "admin":
+        remaining_active_admins = [
+            item
+            for item in identity_store.accounts_list()
+            if item["role"] == "admin" and item["status"] == "active" and item["id"] != account_id
+        ]
+        if not remaining_active_admins:
+            raise HTTPException(400, "The installation must retain an active administrator")
+    if admin["id"] == account_id:
+        raise HTTPException(400, "Use Account settings to delete your own account")
+    target_has_local = (
+        bool(target["has_local_username"])
+        if "has_local_username" in target
+        else identity_store.has_local_username(target.get("username"))
+    )
+    expected_confirm = (
+        target["username"]
+        if target_has_local
+        else (str(target.get("display_name") or "").strip() or "DELETE")
+    )
+    submitted_confirm = (
+        payload.confirm_username.strip()
+        if payload is not None and payload.confirm_username is not None
+        else ""
+    )
+    accepted_confirms = {expected_confirm}
+    if not target_has_local:
+        accepted_confirms.add(target["username"])
+    if not submitted_confirm or submitted_confirm not in accepted_confirms:
+        raise HTTPException(
+            400, f"Type {expected_confirm} to confirm deleting this account"
+        )
+    _verify_account_confirmation(admin, payload.current_password, request)
+    try:
+        return identity_store.delete_account(
+            account_id,
+            actor_account_id=admin["id"],
+            require_active_admin_actor=True,
+        )
+    except PermissionError as exc:
+        raise HTTPException(401, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (OSError, sqlite3.Error, BackupError) as exc:
+        raise HTTPException(
+            503,
+            "Account access was revoked, but profile cleanup could not complete immediately. Retry deleting this account or wait for background cleanup.",
+        ) from exc
 
 
 @app.delete("/admin/profiles/{profile_id}/restore-journal")
@@ -1305,8 +1710,13 @@ def admin_delete_restore_journal(profile_id: str, request: Request):
         and profile_id not in identity_store.profile_ids(active_only=False)
     ):
         raise HTTPException(404, "Profile not found")
-    with profile_scope(profile_id):
-        cleared = clear_interrupted_restore_journal()
+    try:
+        with profile_scope(profile_id):
+            cleared = clear_interrupted_restore_journal()
+    except ProfileDeletedError as exc:
+        raise HTTPException(
+            400, "Account deletion is incomplete; retry deleting this account"
+        ) from exc
     return {"cleared": cleared, "profile_id": profile_id}
 
 
@@ -3095,7 +3505,10 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         "SELECT id,rating,read_at,source FROM reads WHERE title=? AND author=?",
         (candidate["title"], candidate["author"]),
     ).fetchone()
-    saved_rating = rating if rating is not None else existing["rating"] if existing else None
+    already_present = existing is not None
+    existing_is_real = bool(existing and existing["source"] != "demo")
+    saved_rating = rating if rating is not None else existing["rating"] if existing_is_real else None
+    purge_demo_reads(con)
     read_at = datetime.now(timezone.utc).isoformat()
     openlibrary_work_id = book_openlibrary_work_id(candidate)
     isbn13, _isbn10 = isbn_parts(
@@ -3196,7 +3609,7 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return read, existing is not None
+    return read, already_present
 
 
 def _clear_explicit_feedback_outcomes(
@@ -3880,8 +4293,13 @@ def add_source(payload: SourceIn):
     return {"id":cursor.lastrowid, "filters": payload.filters.model_dump(), "job_id":job_id}
 
 
-def _toggle_source_row(con, source_id: int, source) -> bool:
+def _is_builtin_demo_source(source) -> bool:
+    return source["url"] == "builtin://upcoming" or source["kind"] == "builtin"
+
+
+def _toggle_source_row(con, source_id: int, source) -> tuple[bool, int]:
     became_enabled = not source["enabled"]
+    purged_demo = 0
     con.execute(
         "UPDATE sources SET enabled=1-enabled, "
         "last_scanned_at=CASE WHEN enabled=0 AND lifecycle='one_time' THEN NULL ELSE last_scanned_at END, "
@@ -3892,36 +4310,46 @@ def _toggle_source_row(con, source_id: int, source) -> bool:
     recompute_candidate_sources(con, source_id=source_id)
     if not became_enabled:
         demote_orphaned_recommended_candidates(con, source_id=source_id)
-    return became_enabled
+        if _is_builtin_demo_source(source):
+            purged_demo = purge_demo_reads(con)
+    return became_enabled, purged_demo
+
+
+def _source_toggle_job_id(
+    source_id: int, source, became_enabled: bool, purged_demo: int
+) -> int | None:
+    if became_enabled and source["kind"] not in {"builtin", "association"}:
+        return enqueue_job(f"source:{source_id}", dedupe=True)
+    if _is_builtin_demo_source(source) and (purged_demo > 0 or became_enabled):
+        return enqueue_job("score", dedupe=True)
+    return None
 
 
 @app.put("/api/sources/default/toggle")
 def toggle_default_source():
     with transaction() as con:
         source = con.execute(
-            "SELECT id,enabled,kind,lifecycle FROM sources WHERE is_default=1 ORDER BY name,id LIMIT 1"
+            "SELECT id,url,enabled,kind,lifecycle FROM sources WHERE is_default=1 ORDER BY name,id LIMIT 1"
         ).fetchone()
         if not source:
             raise HTTPException(404, "Default source not found.")
         source_id = source["id"]
-        became_enabled = _toggle_source_row(con, source_id, source)
-    job_id = (
-        enqueue_job(f"source:{source_id}", dedupe=True)
-        if became_enabled and source["kind"] not in {"builtin", "association"}
-        else None
-    )
+        became_enabled, purged_demo = _toggle_source_row(con, source_id, source)
+    job_id = _source_toggle_job_id(source_id, source, became_enabled, purged_demo)
     return {"id": source_id, "enabled": int(became_enabled), "job_id": job_id}
 
 
 @app.put("/api/sources/{source_id}/toggle")
 def toggle_source(source_id:int):
     with transaction() as con:
-        source = con.execute("SELECT enabled,kind,lifecycle FROM sources WHERE id=?", (source_id,)).fetchone()
+        source = con.execute("SELECT url,enabled,kind,lifecycle FROM sources WHERE id=?", (source_id,)).fetchone()
         if not source: raise HTTPException(404,"Source not found")
-        became_enabled = _toggle_source_row(con, source_id, source)
+        became_enabled, purged_demo = _toggle_source_row(con, source_id, source)
     if became_enabled and source["kind"] not in {"builtin", "association"}:
         _bump_source_scan_generation(source_id)
         job_id = enqueue_followup_job(f"source:{source_id}")
+    elif _is_builtin_demo_source(source) and (purged_demo > 0 or became_enabled):
+        job_id = enqueue_job("score", dedupe=True)
     else:
         job_id = None
     return {"id":source_id, "job_id":job_id}
@@ -4600,13 +5028,75 @@ async def sync():
 async def score():
     return {"job_id":enqueue_job("score", dedupe=True)}
 
-@app.post("/api/candidates/audit")
-async def candidate_audit(payload: CandidateAuditIn | None = Body(default=None)):
-    """Queue a bounded incremental or full catalog identity and quality audit."""
+def _has_resumable_manual_sweep() -> bool:
+    if private_setting(QUALITY_SWEEP_ACTIVE_KEY, "") == "1":
+        return True
+    if active_job("candidate_quality"):
+        return True
+    return bool(get_candidate_quality_sweep_status().get("can_retry"))
 
-    mode = payload.mode if isinstance(payload, CandidateAuditIn) else None
-    retry = bool(payload.retry) if isinstance(payload, CandidateAuditIn) else False
-    return configure_candidate_quality_sweep(mode=mode, retry=retry)
+
+@app.post("/api/candidates/audit")
+@fenced_async
+async def candidate_audit(
+    payload: Annotated[CandidateAuditIn | None, Body()] = None,
+    mode: Annotated[Literal["incremental", "full"] | None, Query()] = None,
+    dry_run: Annotated[bool, Query()] = False,
+    count_only: Annotated[bool, Query()] = False,
+    only_pending: Annotated[bool | None, Query()] = None,
+    retry: Annotated[bool, Query()] = False,
+    retry_quarantined: Annotated[bool, Query()] = False,
+    limit: Annotated[int | None, Query(ge=1, le=500)] = None,
+):
+    """Queue a bounded incremental/full catalog audit, retry quarantined rows, or preview scope."""
+
+    has_payload = isinstance(payload, CandidateAuditIn)
+    effective_mode = mode if mode is not None else (payload.mode if has_payload else None)
+    effective_dry_run = bool(dry_run or (has_payload and payload.dry_run))
+    effective_count_only = bool(count_only or (has_payload and payload.count_only))
+    effective_retry = bool(retry or (has_payload and payload.retry))
+    effective_retry_quarantined = bool(
+        retry_quarantined or (has_payload and payload.retry_quarantined)
+    )
+    if effective_dry_run or effective_count_only:
+        payload_only_pending = payload.only_pending if has_payload else None
+        effective_only_pending = (
+            only_pending
+            if only_pending is not None
+            else (
+                payload_only_pending
+                if payload_only_pending is not None
+                else (effective_mode != "full")
+            )
+        )
+        effective_limit = (
+            limit if limit is not None else (payload.limit if has_payload else None)
+        )
+        return await audit_candidates(
+            only_pending=effective_only_pending,
+            limit=effective_limit,
+            dry_run=effective_dry_run,
+            count_only=effective_count_only,
+            retry_quarantined=bool(effective_retry or effective_retry_quarantined),
+        )
+    if effective_retry_quarantined or (
+        effective_retry and effective_mode is None and not _has_resumable_manual_sweep()
+    ):
+        cutoff = _utc_audit_timestamp()
+        settings_updates = {
+            QUALITY_RETRY_QUARANTINED_BEFORE_KEY: cutoff,
+            QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+        }
+        if not active_job("candidate_quality_recovery"):
+            settings_updates[QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY] = ""
+        _set_quality_recovery_settings(**settings_updates)
+        return {
+            "job_id": enqueue_job("candidate_quality_recovery", dedupe=True),
+            "mode": "incremental",
+            "retry_quarantined": True,
+            "quarantine_retry_days": CATALOG_QUARANTINE_RETRY_DAYS,
+        }
+    return configure_candidate_quality_sweep(mode=effective_mode, retry=effective_retry)
 
 @app.get("/api/candidates/quality")
 def candidate_quality():

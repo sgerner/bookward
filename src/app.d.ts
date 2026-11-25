@@ -10,6 +10,7 @@ declare global {
 		// interface Error {}
 		interface Locals {
 			user?: { id: string; profile_id: string; username: string; has_local_username?: boolean; display_name: string; role: 'admin' | 'user'; must_change_password: boolean };
+			engineUnavailable?: boolean;
 		}
 		// interface PageData {}
 		// interface PageState {}

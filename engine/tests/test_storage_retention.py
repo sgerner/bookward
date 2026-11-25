@@ -938,6 +938,7 @@ def test_bounded_multi_transaction_maintenance_resumes_across_passes(
 def test_migration_28_has_no_startup_deletes_and_maintenance_batches_orphan_cleanup(
     database, monkeypatch
 ):
+    assert MIGRATIONS[-1][0] >= 28
     assert 28 in dict(MIGRATIONS)
     migration_28_sql = dict(MIGRATIONS)[28]
     sql_without_triggers = re.sub(

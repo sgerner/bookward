@@ -1,15 +1,25 @@
 const env = process.env;
-import { fail, redirect } from '@sveltejs/kit';
+import { error as httpError, fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { SESSION_COOKIE, sessionCookieOptions } from '#lib/server/cookies.js';
 import { EngineError, engine } from '#lib/server/engine.js';
+import { formatWaitDuration } from '#lib/lockout-ui.js';
+import { currentClientIp, resolveClientAddress, withRequestContext } from '#lib/server/request-context.js';
 import { safeNext } from '#lib/server/safe-next.js';
 
 type AuthConfig = { setup_required: boolean; local_login_enabled: boolean; oidc_enabled: boolean };
 type SessionResult = { session_token: string; max_age: number };
 
-export const load: PageServerLoad = async ({ url }) => {
-	const config = await engine<AuthConfig>('/auth/config');
+export const load: PageServerLoad = async ({ url, locals }) => {
+	if (locals?.engineUnavailable) {
+		throw httpError(503, "Bookward's recommendation engine is unavailable.");
+	}
+	let config: AuthConfig;
+	try {
+		config = await engine<AuthConfig>('/auth/config');
+	} catch {
+		throw httpError(503, "Bookward's recommendation engine is unavailable.");
+	}
 	const next = safeNext(url.searchParams.get('next'));
 	const errorCode = url.searchParams.get('error');
 	const error = errorCode === 'unlinked' ? 'This SSO identity is not linked yet. Sign in with your local account and link it from Account settings.' : errorCode === 'sso' ? 'Single sign-on could not be completed. Try again or use your username and password.' : '';
@@ -41,7 +51,8 @@ const hasControlCharacters = (value: string) =>
 	[...value].some((character) => character.charCodeAt(0) < 32);
 
 export const actions: Actions = {
-	login: async ({ request, cookies, url }) => {
+	login: async (event) => {
+		const { request, cookies, url, setHeaders } = event;
 		const form = await request.formData();
 		const username = String(form.get('username') || '');
 		const cleanUsername = username.trim();
@@ -56,12 +67,15 @@ export const actions: Actions = {
 					: (fieldErrors.username ?? fieldErrors.password!);
 			return formFail(400, 'login', summary, fieldErrors, { username: cleanUsername });
 		}
+		const clientIp = currentClientIp() ?? resolveClientAddress(event);
 		let result: SessionResult;
 		try {
-			result = await engine<SessionResult>('/auth/login', {
-				method: 'POST',
-				body: JSON.stringify({ username, password })
-			});
+			result = await withRequestContext({ clientIp }, () =>
+				engine<SessionResult>('/auth/login', {
+					method: 'POST',
+					body: JSON.stringify({ username, password })
+				})
+			);
 		} catch (error) {
 			if (error instanceof EngineError && error.status === 401) {
 				return fail(401, {
@@ -69,6 +83,19 @@ export const actions: Actions = {
 					error: true as const,
 					credentialError: true as const,
 					message: 'Username or password is incorrect.',
+					fieldErrors: {} as Record<string, string>,
+					values: { username: cleanUsername }
+				});
+			}
+			if (error instanceof EngineError && error.status === 429) {
+				const retryAfterSeconds = error.retryAfterSeconds ?? 900;
+				setHeaders?.({ 'retry-after': String(retryAfterSeconds) });
+				return fail(429, {
+					formId: 'login' as const,
+					error: true as const,
+					rateLimited: true as const,
+					retryAfterSeconds,
+					message: `Too many sign-in attempts from this address. Wait ${formatWaitDuration(retryAfterSeconds)} before trying again.`,
 					fieldErrors: {} as Record<string, string>,
 					values: { username: cleanUsername }
 				});

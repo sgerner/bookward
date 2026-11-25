@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 import os
 from pathlib import Path
+import secrets
 import socket
 import subprocess
 import sys
@@ -19,6 +20,12 @@ import time
 from urllib.parse import urlsplit
 
 import httpx
+
+# Throwaway credentials for the isolated smoke instance, generated per run.
+SMOKE_PASSWORD = f"Smoke-{secrets.token_hex(8)}"
+TEMP_READER_PASSWORD = f"Temp-{secrets.token_hex(8)}"
+PERSONAL_READER_PASSWORD = f"Personal-{secrets.token_hex(8)}"
+WRONG_PASSWORD = f"Wrong-{secrets.token_hex(8)}"
 
 MAX_LOG_LINES = 200
 
@@ -113,12 +120,18 @@ def run_smoke_checks(
     services: tuple[_ServiceRun, ...] | list[_ServiceRun] = (),
     ready_attempts: int = 100,
     ready_interval: float = 0.1,
+    full_stack: bool = False,
+    engine_port: int | None = None,
+    open_files: list | None = None,
 ):
     is_https = urlsplit(origin).scheme == "https"
+    client_headers = {"accept": "text/html"}
+    if full_stack:
+        client_headers["x-forwarded-for"] = "198.51.100.42"
     with httpx.Client(
         base_url=base_url,
         timeout=15,
-        headers={"accept": "text/html"},
+        headers=client_headers,
     ) as client:
         for _ in range(ready_attempts):
             exited = [
@@ -138,10 +151,13 @@ def run_smoke_checks(
             time.sleep(ready_interval)
         else:
             raise RuntimeError("Smoke-test services did not become ready")
+        # Local requests without proxy headers must not crash adapter-node.
+        with httpx.Client(base_url=base_url, timeout=15, headers={"accept": "text/html"}) as direct_client:
+            assert direct_client.get("/login").status_code == 200
         assert client.get("/").status_code == 303
         blocked = client.post(
             "/login?/setup",
-            data={"username": "smoke-reader", "password": "Disposable-smoke-password-17"},
+            data={"username": "smoke-reader", "password": SMOKE_PASSWORD},
             headers={"origin": "https://attacker.example", "accept": "application/json"},
         )
         assert blocked.status_code == 403, (blocked.status_code, blocked.text[:200])
@@ -152,7 +168,7 @@ def run_smoke_checks(
             setup_headers["x-forwarded-host"] = "evil.example"
         response = client.post(
             "/login?/setup",
-            data={"username": "smoke-reader", "password": "Disposable-smoke-password-17"},
+            data={"username": "smoke-reader", "password": SMOKE_PASSWORD},
             headers=setup_headers,
         )
         assert response.status_code == 303, (response.status_code, response.text[:200])
@@ -196,7 +212,7 @@ def run_smoke_checks(
         assert client.get("/").status_code == 303
         response = client.post(
             "/login?/login",
-            data={"username": "smoke-reader", "password": "Disposable-smoke-password-17"},
+            data={"username": "smoke-reader", "password": SMOKE_PASSWORD},
             headers={"origin": origin},
         )
         assert response.status_code == 303
@@ -276,9 +292,211 @@ def run_smoke_checks(
         assert "text/html" in over_body_html.headers.get("content-type", "")
         assert "10 MB" in over_body_html.text
 
+        if not full_stack:
+            print(
+                "PASS: setup, sign-in/out, authenticated views, SSR form bindings, "
+                "stale-profile guard, CSV uploads, API authentication"
+            )
+            return
+
+        assert engine_port is not None
+        # Provision a second reader who must change their temporary password on first sign-in.
+        created = client.post(
+            "/admin?/create",
+            data={
+                "__profile_id": profile_id,
+                "username": "temp-reader",
+                "display_name": "Temp Reader",
+                "password": TEMP_READER_PASSWORD,
+                "role": "user",
+            },
+            headers={"origin": origin},
+        )
+        assert created.status_code == 200, (created.status_code, created.text[:200])
+
+        assert (
+            client.post("/auth/logout", data={"__profile_id": profile_id}, headers={"origin": origin}).status_code
+            == 303
+        )
+        assert client.get("/").status_code == 303
+
+        # Ten failed logins across 203.0.113.1..203.0.113.10 allow valid sign-in from 198.51.100.42.
+        with httpx.Client(
+            base_url=base_url,
+            timeout=15,
+            headers={"accept": "text/html"},
+        ) as scanner:
+            for octet in range(1, 11):
+                bad = scanner.post(
+                    "/login?/login",
+                    data={
+                        "username": "smoke-reader",
+                        "password": WRONG_PASSWORD,
+                    },
+                    headers={"origin": origin, "x-forwarded-for": f"203.0.113.{octet}"},
+                )
+                assert bad.status_code == 401, (octet, bad.status_code)
+
+            # Ten failed logins from one noisy IP trigger HTTP 429 + Retry-After + wait guidance on the 11th attempt.
+            for _ in range(9):
+                bad = scanner.post(
+                    "/login?/login",
+                    data={
+                        "username": "smoke-reader",
+                        "password": WRONG_PASSWORD,
+                    },
+                    headers={"origin": origin, "x-forwarded-for": "203.0.113.1"},
+                )
+                assert bad.status_code == 401
+            rate_limited = scanner.post(
+                "/login?/login",
+                data={
+                    "username": "smoke-reader",
+                    "password": SMOKE_PASSWORD,
+                },
+                headers={"origin": origin, "x-forwarded-for": "203.0.113.1"},
+            )
+            assert rate_limited.status_code == 429, (rate_limited.status_code, rate_limited.text[:200])
+            assert int(rate_limited.headers.get("retry-after", "0")) > 0
+            assert "Too many sign-in attempts" in rate_limited.text
+            assert "Username or password is incorrect." not in rate_limited.text
+            # Prepending a spoofed IP ahead of proxy-appended 203.0.113.1 still resolves 203.0.113.1 under XFF_DEPTH=1.
+            spoofed_xff = scanner.post(
+                "/login?/login",
+                data={
+                    "username": "smoke-reader",
+                    "password": SMOKE_PASSWORD,
+                },
+                headers={"origin": origin, "x-forwarded-for": "192.0.2.250, 203.0.113.1"},
+            )
+            assert spoofed_xff.status_code == 429
+
+        # Trusted reader on 198.51.100.42 signs in cleanly with HTTP 303 despite external lockouts.
+        response = client.post(
+            "/login?/login",
+            data={"username": "smoke-reader", "password": SMOKE_PASSWORD},
+            headers={"origin": origin},
+        )
+        assert response.status_code == 303
+        assert client.get("/").status_code == 200
+
+        # Unlock 203.0.113.1 from /admin and verify sign-in from 203.0.113.1 recovers.
+        admin_page = client.get("/admin")
+        assert admin_page.status_code == 200
+        assert "Rate-limited" in admin_page.text
+        admin_accounts = httpx.get(
+            f"http://127.0.0.1:{engine_port}/admin/accounts",
+            headers={
+                "x-bookward-service": "isolated-smoke-service",
+                "x-bookward-session": client.cookies["bookward_session"],
+            },
+            timeout=10,
+        ).json()["accounts"]
+        smoke_account_id = next(item["id"] for item in admin_accounts if item["username"] == "smoke-reader")
+        unlocked = client.post(
+            "/admin?/unlock",
+            data={
+                "__profile_id": profile_id,
+                "account_id": smoke_account_id,
+            },
+            headers={"origin": origin},
+        )
+        assert unlocked.status_code == 200
+        with httpx.Client(
+            base_url=base_url,
+            timeout=15,
+            headers={"accept": "text/html", "x-forwarded-for": "203.0.113.1"},
+        ) as unlocked_client:
+            recovered = unlocked_client.post(
+                "/login?/login",
+                data={
+                    "username": "smoke-reader",
+                    "password": SMOKE_PASSWORD,
+                },
+                headers={"origin": origin},
+            )
+            assert recovered.status_code == 303
+
+        # Mandatory first-login password change succeeds on /account?force_password_change=1 during login lockout.
+        with httpx.Client(
+            base_url=base_url,
+            timeout=15,
+            headers={"accept": "text/html", "x-forwarded-for": "198.51.100.77"},
+        ) as reader_client:
+            first_login = reader_client.post(
+                "/login?/login",
+                data={
+                    "username": "temp-reader",
+                    "password": TEMP_READER_PASSWORD,
+                },
+                headers={"origin": origin},
+            )
+            assert first_login.status_code == 303
+            redirected = reader_client.get("/")
+            assert redirected.status_code == 303
+            assert redirected.headers["location"] == "/account?force_password_change=1"
+            account_page = reader_client.get("/account?force_password_change=1")
+            assert account_page.status_code == 200
+            reader_forms = FormBindings()
+            reader_forms.feed(account_page.text)
+            reader_profile_id = next(f["profile"] for f in reader_forms.forms if f["method"] == "post")
+
+            # Lock public /login for temp-reader from the exact same IP while session is open.
+            with httpx.Client(
+                base_url=base_url,
+                timeout=15,
+                headers={"accept": "text/html", "x-forwarded-for": "198.51.100.77"},
+            ) as noise_client:
+                for _ in range(10):
+                    assert (
+                        noise_client.post(
+                            "/login?/login",
+                            data={
+                                "username": "temp-reader",
+                                "password": WRONG_PASSWORD,
+                            },
+                            headers={"origin": origin},
+                        ).status_code
+                        == 401
+                    )
+                assert (
+                    noise_client.post(
+                        "/login?/login",
+                        data={
+                            "username": "temp-reader",
+                            "password": TEMP_READER_PASSWORD,
+                        },
+                        headers={"origin": origin},
+                    ).status_code
+                    == 429
+                )
+
+            pw_updated = reader_client.post(
+                "/account?/changePassword",
+                data={
+                    "__profile_id": reader_profile_id,
+                    "current_password": TEMP_READER_PASSWORD,
+                    "new_password": PERSONAL_READER_PASSWORD,
+                },
+                headers={"origin": origin},
+            )
+            assert pw_updated.status_code == 200
+            assert "Password updated." in pw_updated.text
+            assert reader_client.get("/").status_code == 200
+
+        for log_file in open_files or ():
+            log_file.flush()
+        engine_log = services[0].log_path.read_text(encoding="utf-8", errors="replace")
+        lockout_warnings = [
+            line
+            for line in engine_log.splitlines()
+            if "Rate-limited login password verification" in line
+        ]
+        assert len(lockout_warnings) == 2, lockout_warnings
         print(
-            "PASS: setup, sign-in/out, authenticated views, SSR form bindings, "
-            "stale-profile guard, CSV uploads, API authentication"
+            "PASS: setup, sign-in/out, multi-IP isolation, HTTP 429 alerts, "
+            "forced password rotation under lockout, admin unlock, SSR form bindings, "
+            "CSV uploads, API authentication"
         )
 
 
@@ -328,6 +546,8 @@ def main(
             HOST="127.0.0.1",
             PORT=str(web_port),
             OIDC_AUTO_LOGIN="false",
+            ADDRESS_HEADER="x-forwarded-for",
+            XFF_DEPTH="1",
             BODY_SIZE_LIMIT="12M",
             PYTHONUNBUFFERED="1",
         )
@@ -345,6 +565,7 @@ def main(
             "--port",
             str(engine_port),
         ]
+        full_stack = engine_cmd is None and web_cmd is None
         service_specs = (
             ("engine", engine_cmd, default_engine_cmd),
             ("web", web_cmd, ["node", str(root / "server.js")]),
@@ -369,6 +590,9 @@ def main(
                 services=services,
                 ready_attempts=ready_attempts,
                 ready_interval=ready_interval,
+                full_stack=full_stack,
+                engine_port=engine_port,
+                open_files=open_files,
             )
         except BaseException:
             failed = True

@@ -194,6 +194,9 @@ const distinctGenres = (items: Array<{ genres: string[] }>) => {
 };
 
 export const load: PageServerLoad = async ({ url, locals }) => {
+  if (locals?.engineUnavailable) {
+    throw httpError(503, "Bookward's recommendation engine is unavailable.");
+  }
   const fallbackBackupStatus: BackupStatus = {
     enabled: false,
     interval_hours: 0,
@@ -241,11 +244,8 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   let overview: Overview;
   try {
     overview = await overviewRequest;
-  } catch (cause) {
-    throw httpError(
-      503,
-      `Bookward's recommendation engine is unavailable. ${message(cause)}`,
-    );
+  } catch {
+    throw httpError(503, "Bookward's recommendation engine is unavailable.");
   }
   const [backupStatus, rawCatalogQuality] = await Promise.all([
     backupStatusRequest,
@@ -606,7 +606,7 @@ export const actions: Actions = {
           : {}),
       };
     } catch (error) {
-      return fail(502, { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   undoDecision: async ({ request }) => {

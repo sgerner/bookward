@@ -114,7 +114,9 @@ describe('auth form accessibility SSR markup', () => {
 		}).body;
 
 		expect(duplicateIds(html)).toEqual([]);
-		expect(html).not.toMatch(/<label[^>]*>[\s\S]*12 characters[\s\S]*<\/label>/);
+		for (const labelMatch of html.matchAll(/<label\b[^>]*>([\s\S]*?)<\/label>/g)) {
+			expect(labelMatch[1]).not.toContain('12 characters');
+		}
 		expect(html).toContain('aria-describedby="account-new-password-error account-new-password-hint"');
 		expect(html).not.toMatch(/id="account-current-password"[^>]*aria-invalid="true"/);
 
@@ -131,6 +133,37 @@ describe('auth form accessibility SSR markup', () => {
 		}).body;
 		expect(unlinkErrorHtml).toContain('Add a password before removing the last sign-in method.');
 		expect((unlinkErrorHtml.match(/role="alert"/g) ?? []).length).toBe(1);
+
+		const resetErrorHtml = render(AccountPage, {
+			props: {
+				data: baseAccountData,
+				form: {
+					formId: 'resetHistory',
+					error: true,
+					message: 'Type RESET to confirm resetting your reading history.',
+					fieldErrors: { confirm: 'Type RESET to confirm resetting your reading history.' }
+				}
+			} as never
+		}).body;
+		expect(duplicateIds(resetErrorHtml)).toEqual([]);
+		expect(resetErrorHtml).toContain(
+			'id="reset-history-confirm" aria-describedby="reset-history-confirm-error reset-history-confirm-hint" aria-invalid="true"'
+		);
+
+		const deleteErrorHtml = render(AccountPage, {
+			props: {
+				data: baseAccountData,
+				form: {
+					formId: 'deleteAccount',
+					error: true,
+					message: 'The installation must retain an active administrator',
+					fieldErrors: {}
+				}
+			} as never
+		}).body;
+		expect(duplicateIds(deleteErrorHtml)).toEqual([]);
+		expect(deleteErrorHtml).toContain('The installation must retain an active administrator');
+		expect((deleteErrorHtml.match(/role="alert"/g) ?? []).length).toBe(1);
 	});
 
 	it('scopes /admin resetPassword errors to the submitted account without duplicate IDs or unrelated alerts', () => {
