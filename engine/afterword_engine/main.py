@@ -54,7 +54,7 @@ from .backups import (
     recover_interrupted_restore,
     restore_backup,
 )
-from .decision_evidence import set_evidence_rotation_enabled
+from .decision_evidence import EVIDENCE_SCHEMA_VERSION, set_evidence_rotation_enabled
 from .maintenance import set_storage_retention_enabled
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url, validate_google_books_api_key
@@ -74,6 +74,14 @@ from .ingestion import (
     refresh_read_work_identities,
     refresh_missing_candidate_metadata,
     scan_source,
+)
+from .http_bounds import (
+    JSON_CONTENT_TYPES,
+    ResponseBoundsError,
+    ResponseTooLargeError,
+    iter_bounded_bytes_async,
+    stream_bytes_async,
+    stream_json_async,
 )
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
@@ -1908,9 +1916,17 @@ def _prepare_tracked_recommendations(
     recommendations = None
     interaction_events: list[dict[str, Any]] = []
     cached_vectors: dict[int, Any] = {}
+    visible_day_counts: dict[int, int] = {}
+    fatigue_settings = {
+        "enabled": bool(settings.impression_fatigue_enabled),
+        "window_days": int(settings.impression_fatigue_window_days),
+        "grace_days": int(settings.impression_fatigue_grace_days),
+        "penalty_per_day": float(settings.impression_fatigue_penalty_per_day),
+        "max_penalty": float(settings.impression_fatigue_max_penalty),
+    }
     read_rows: list[dict[str, Any]] = []
     llm_events: list[dict[str, Any]] = []
-    llm_cfg = {"enabled": False, "provider": "", "api_url": "", "api_key": "", "model": ""}
+    llm_cfg: dict[str, Any] = {}
     llm_active = False
     discovery_metadata = empty_discovery_slate_diagnostics("not_discovery_request")
     learning_metadata: dict[str, Any] = {
@@ -1985,8 +2001,12 @@ def _prepare_tracked_recommendations(
             has_recommended = any(item.get("status") == "recommended" for item in ranked)
             if not is_filtered and has_recommended:
                 try:
-                    llm_cfg = effective_llm_rerank_settings(connection, private)
-                    llm_active = bool(llm_cfg["enabled"] and llm_cfg["api_key"].strip())
+                    llm_cfg = {
+                        **effective_llm_rerank_settings(connection, private),
+                        "top_k": settings.llm_rerank_top_k,
+                        "max_delta": settings.llm_rerank_max_delta,
+                    }
+                    llm_active = bool(llm_cfg["enabled"] and str(llm_cfg["api_key"]).strip())
                     if llm_active:
                         read_rows, llm_events = _load_llm_rerank_inputs(
                             connection, interaction_events
@@ -2004,6 +2024,9 @@ def _prepare_tracked_recommendations(
             fallback_triggered = True
             base_pool = personalized_pool = None
             ranked = None
+            visible_day_counts = {}
+            llm_cfg = {}
+            llm_active = False
             if pool_summary is not None:
                 fallback_recommended = _recommendation_rows(
                     connection,
@@ -2071,6 +2094,8 @@ def _prepare_tracked_recommendations(
         "recommendations": recommendations,
         "interaction_events": interaction_events,
         "cached_vectors": cached_vectors,
+        "visible_day_counts": visible_day_counts,
+        "fatigue_settings": fatigue_settings,
         "learning_metadata": learning_metadata,
         "discovery_metadata": discovery_metadata,
         "llm_active": llm_active,
@@ -2102,8 +2127,12 @@ def _complete_tracked_recommendations(
     recommendations = prepared["recommendations"]
     interaction_events = prepared["interaction_events"]
     cached_vectors = prepared["cached_vectors"]
+    visible_day_counts = prepared["visible_day_counts"]
+    fatigue_settings = prepared["fatigue_settings"]
     learning_metadata = prepared["learning_metadata"]
     discovery_metadata = prepared["discovery_metadata"]
+    llm_cfg = prepared["llm_cfg"]
+    llm_rerank_output: dict[str, Any] | None = None
     final_pool = None
 
     if can_personalize and not prepared["fallback_triggered"] and ranked is not None:
@@ -2137,7 +2166,12 @@ def _complete_tracked_recommendations(
                         )
                         recommended = unreranked_recommended
                         llm_diag = {"applied": False, "reason": "fallback"}
-                    learning_metadata["llm_rerank"] = llm_diag
+                    llm_rerank_output = llm_diag
+                    learning_metadata["llm_rerank"] = {
+                        key: value
+                        for key, value in llm_diag.items()
+                        if key not in {"adjustments", "rankings"}
+                    }
                 # Apply bounded anti-redundancy swaps after LLM score adjustments.
                 diversified, discovery_metadata = diversify_discovery_slate(
                     recommended, cached_vectors
@@ -2185,6 +2219,7 @@ def _complete_tracked_recommendations(
                 "Post-personalization slate assembly failed; serving base ranking"
             )
             base_pool = personalized_pool = final_pool = None
+            llm_rerank_output = None
             if pool_summary is not None:
                 fallback_recommended = _recommendation_rows(
                     connection,
@@ -2235,7 +2270,7 @@ def _complete_tracked_recommendations(
         )
     if is_filtered:
         decision_evidence = {
-            "schema_version": 1,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
             "capture_status": "incomplete",
             "reason": "filtered_query",
             "captured_at": ranking_at.isoformat(),
@@ -2260,10 +2295,14 @@ def _complete_tracked_recommendations(
                 "exploration_epsilon": settings.exploration_epsilon,
                 "exploration_stable_top_k": settings.exploration_stable_top_k,
             },
+            visible_day_counts=visible_day_counts,
+            impression_fatigue_settings=fatigue_settings,
+            llm_rerank_settings=llm_cfg,
+            llm_rerank_output=llm_rerank_output,
         )
     else:
         decision_evidence = {
-            "schema_version": 1,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
             "capture_status": "incomplete",
             "reason": "base_ranker_fallback" if can_personalize else "non_ranking_request",
             "captured_at": ranking_at.isoformat(),
@@ -2346,27 +2385,20 @@ def overview_payload(
         }
         identity_context = _recommendation_identity_context(connection)
         private = private_settings(connection)
-        llm_cfg = effective_llm_rerank_settings(connection, private)
-        llm_active = bool(llm_cfg["enabled"] and llm_cfg["api_key"].strip())
-        if llm_active:
-            deferred_prepared = _prepare_tracked_recommendations(
-                connection=connection,
-                limit=recommendation_limit or 100,
-                recommended_limit=recommendation_limit,
-                identity_context=identity_context,
-                include_imported=True,
-                private=private,
-                pool_summary=pool_summary,
-            )
+        prepared = _prepare_tracked_recommendations(
+            connection=connection,
+            limit=recommendation_limit or 100,
+            recommended_limit=recommendation_limit,
+            identity_context=identity_context,
+            include_imported=True,
+            private=private,
+            pool_summary=pool_summary,
+        )
+        if prepared["llm_active"]:
+            deferred_prepared = prepared
         else:
-            recommendations, run_id = tracked_recommendations(
-                connection=connection,
-                limit=recommendation_limit or 100,
-                recommended_limit=recommendation_limit,
-                identity_context=identity_context,
-                include_imported=True,
-                private=private,
-                pool_summary=pool_summary,
+            recommendations, run_id = _complete_tracked_recommendations(
+                prepared, connection=connection
             )
         all_decision_rows = _recommendation_rows(
             connection,
@@ -3489,10 +3521,23 @@ async def import_librarr(candidate_id: int, payload: LibrarrImportIn | None = Bo
         validate_service_url(config["librarr_url"], allowed)
         async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
             media_type = normalize_media_type(config.get("librarr_media_type"))
-            response = await client.post(f"{config['librarr_url'].rstrip('/')}/api/wishlist", headers={"X-Api-Key":config["librarr_api_key"],"Idempotency-Key":key}, json={"title":candidate["title"],"author":candidate["author"],"media_type":media_type})
-            response.raise_for_status()
-            try: data = response.json()
-            except ValueError: data = {}
+            _response, body = await stream_bytes_async(
+                client,
+                "POST",
+                f"{config['librarr_url'].rstrip('/')}/api/wishlist",
+                headers={"X-Api-Key": config["librarr_api_key"], "Idempotency-Key": key},
+                json={"title": candidate["title"], "author": candidate["author"], "media_type": media_type},
+                max_bytes=settings.librarr_max_bytes,
+                allowed_content_types=JSON_CONTENT_TYPES,
+                allow_missing_content_type=True,
+                content_type_error="Librarr returned an unsupported wishlist content type",
+                size_error="Librarr wishlist response is too large",
+            )
+            try:
+                parsed_body = json.loads(body) if body.strip() else {}
+                data = parsed_body if isinstance(parsed_body, dict) else {}
+            except ValueError:
+                data = {}
         remote_id = str(data.get("id", "imported"))
         with transaction() as con:
             con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id, key, remote_id))
@@ -3515,10 +3560,10 @@ async def search_librarr(q: str = Query(min_length=2, max_length=200), media_typ
         media = normalize_media_type(media_type)
         config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         return await librarr_search(config, q, media)
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
 
 
 @app.get("/api/librarr/search/stream")
@@ -3534,18 +3579,30 @@ async def stream_librarr_search(
         client, upstream = await librarr_open_search_stream(config, q, media)
     except StreamingUnsupportedError as exc:
         raise HTTPException(501, safe_error_message(exc)) from exc
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
 
     assert client is not None and upstream is not None
 
     async def stream_bytes():
         try:
-            async for chunk in upstream.aiter_bytes():
-                if chunk:
-                    yield chunk
+            async for chunk in iter_bounded_bytes_async(
+                upstream,
+                max_bytes=settings.librarr_stream_max_bytes,
+                size_error="Librarr search stream is too large",
+            ):
+                yield chunk
+        except ResponseTooLargeError:
+            LOGGER.warning(
+                "Aborted Librarr SSE stream after exceeding %d bytes",
+                settings.librarr_stream_max_bytes,
+            )
+            error_payload = json.dumps(
+                {"message": "Librarr search stream exceeded the maximum response size."}
+            )
+            yield f"\n\nevent: error\ndata: {error_payload}\n\n".encode("utf-8")
         finally:
             await upstream.aclose()
             await client.aclose()
@@ -3605,10 +3662,10 @@ async def download_librarr(payload: LibrarrDownloadIn):
                     )
             response["candidate"] = {"id": candidate["id"], "status": status}
         return response
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
 
 @fenced_async
 async def _import_csv_upload(file: UploadFile):
@@ -4072,22 +4129,45 @@ def _normalize_models_dev_catalog(raw: dict) -> list[dict]:
 
 @app.get("/api/llm/models")
 async def llm_models_catalog():
+    """Return the cached models.dev provider catalog for the Settings picker.
+
+    Refreshes connect directly with ``follow_redirects=False`` and
+    ``trust_env=False`` (matching public source and catalog fetches so ambient
+    ``HTTP_PROXY``/``HTTPS_PROXY``/``ALL_PROXY`` and ``SSL_CERT_*`` variables
+    are ignored). Deployments that require an outbound HTTP proxy receive HTTP
+    502 here and should configure the LLM reranker endpoint URL and model ID
+    directly in Settings.
+    """
+
     now = time.monotonic()
     cached = _MODELS_DEV_CACHE.get("providers") or []
     if cached and now < float(_MODELS_DEV_CACHE.get("expires_at") or 0.0):
         return {"providers": cached, "cached": True}
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            resp = await client.get("https://models.dev/api.json")
-            resp.raise_for_status()
-            providers = _normalize_models_dev_catalog(resp.json())
+        async with httpx.AsyncClient(
+            timeout=12.0,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            _resp, raw_catalog = await stream_json_async(
+                client,
+                "GET",
+                "https://models.dev/api.json",
+                max_bytes=settings.models_dev_max_bytes,
+                size_error="models.dev catalog response is too large",
+            )
+        if not isinstance(raw_catalog, dict):
+            raise ValueError("models.dev catalog must be a JSON object")
+        providers = _normalize_models_dev_catalog(raw_catalog)
         _MODELS_DEV_CACHE["providers"] = providers
         _MODELS_DEV_CACHE["expires_at"] = now + 3600.0
         return {"providers": providers, "cached": False}
     except Exception as exc:
         if cached:
             return {"providers": cached, "cached": True, "stale": True}
-        raise HTTPException(502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}") from exc
+        raise HTTPException(
+            502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}"
+        ) from exc
 
 
 def _validate_source_update_guardrails(source: dict[str, Any] | sqlite3.Row, payload: SourceUpdateIn):
@@ -4565,7 +4645,7 @@ async def preview_google_book_associations():
     try:
         associations = await provider.collect(rows("SELECT * FROM reads ORDER BY id"))
     except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(502, f"Google Books preview failed: {exc}") from exc
+        raise HTTPException(502, f"Google Books preview failed: {safe_error_message(exc)}") from exc
     return {
         "provider": provider.provider,
         "count": len(associations),
