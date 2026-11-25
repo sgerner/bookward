@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from .database import rows, transaction, connect
+from .database import fenced_async, rows, transaction, connect
 from .embeddings import get_embedder, content_hash, vector_blob
 from .ranking import normalized_vector_matrix as _normalized_vectors, rank_candidates
 from .identity import ReadIdentityIndex
@@ -35,6 +35,7 @@ def document(item):
         if str(value or "").strip()
     )
 
+@fenced_async
 async def cached_vectors(
     embedder,
     entity_type,
@@ -201,6 +202,7 @@ def _max_cosine_similarities(vectors, references, default):
 
     return best
 
+@fenced_async
 async def score_all(backend=None, model=None, url=None, api_key=None, embedder=None):
     reads = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
     read_history = rows("SELECT * FROM reads ORDER BY id")
@@ -217,6 +219,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     candidates = rows(
         "SELECT c.*, s.name source_name, s.weight source_weight, "
         "q.work_id quality_work_id,q.provider quality_provider,"
+        "q.provider_id AS quality_provider_id,"
         "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
         "CASE WHEN q.quality_score>0 THEN q.quality_score "
         "WHEN q.quality_status='accepted' THEN 0.85 ELSE 0 END AS catalog_confidence "
@@ -381,6 +384,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
     return len(candidates)
 
 
+@fenced_async
 async def rebuild_all_embeddings(backend=None, model=None, url=None, api_key=None):
     """Generate a fresh embedding set for every stored read and candidate.
 

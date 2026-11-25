@@ -25,7 +25,7 @@ from urllib.parse import urlsplit
 import numpy as np
 
 from .config import settings
-from .database import connect
+from .database import connect, transaction
 from .embeddings import content_hash
 from .identity import book_identity
 from .scoring import document
@@ -49,6 +49,10 @@ MAX_VECTOR_DIMENSIONS = 8_192
 MAX_VECTOR_BYTES = 32 * 1024 * 1024
 MAX_EVIDENCE_JSON_BYTES = 8 * 1024 * 1024
 MAX_STORED_EVIDENCE_BYTES = 512 * 1024 * 1024
+EVIDENCE_HIGH_WATERMARK_RATIO = 0.80
+EVIDENCE_LOW_WATERMARK_RATIO = 0.65
+EVIDENCE_ROTATION_ENABLED_KEY = "evidence_rotation_enabled"
+STORAGE_RETENTION_ENABLED_KEY = "storage_retention_enabled"
 MAX_EXPOSURES_PER_RUN = 5_000
 MAX_ARCHIVED_EVENTS_PER_RUN = 2_000
 MAX_ARCHIVED_OUTCOMES_PER_RUN = 2_000
@@ -58,7 +62,7 @@ MAX_JSON_DEPTH = 8
 POOL_FIELDS = (
     "id", "title", "author", "description", "genres", "score", "explanation",
     "status", "source_id", "source_name", "source_weight", "catalog_confidence",
-    "quality_score", "quality_status", "quality_work_id", "quality_provider",
+    "quality_score", "quality_status", "quality_work_id", "quality_provider", "quality_provider_id",
     "quality_isbn13", "quality_isbn10", "score_batch_id", "metadata_confidence", "release_date",
     "date_kind", "propensity", "first_publication_year", "publication_work_id", "publication_era",
     "fatigue_penalty",
@@ -83,7 +87,7 @@ FATIGUE_DIAGNOSTIC_FIELDS = (
     "applied", "adjusted_candidates", "max_penalty",
 )
 LLM_RERANK_DIAGNOSTIC_FIELDS = (
-    "applied", "mode", "reason", "adjusted_count", "reranked_count", "top_k", "max_delta",
+    "applied", "mode", "reason", "cached", "adjusted_count", "reranked_count", "top_k", "max_delta",
 )
 SLATE_DIAGNOSTIC_FIELDS = (
     "policy_version", "scope", "applied", "reason", "slate_size",
@@ -553,11 +557,386 @@ def _identity_hash(title: Any, author: Any) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def _budget_allows(connection, additional_bytes: int) -> bool:
+def _evidence_used_bytes(connection) -> int:
     row = connection.execute(
         "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
     ).fetchone()
-    return int(row["used_bytes"] if row else 0) + max(0, int(additional_bytes)) <= MAX_STORED_EVIDENCE_BYTES
+    return int(row["used_bytes"] if row else 0)
+
+
+def evidence_high_watermark_bytes(max_bytes: int | None = None) -> int:
+    quota = MAX_STORED_EVIDENCE_BYTES if max_bytes is None else max(0, int(max_bytes))
+    return int(quota * EVIDENCE_HIGH_WATERMARK_RATIO)
+
+
+def evidence_low_watermark_bytes(max_bytes: int | None = None) -> int:
+    quota = MAX_STORED_EVIDENCE_BYTES if max_bytes is None else max(0, int(max_bytes))
+    return int(quota * EVIDENCE_LOW_WATERMARK_RATIO)
+
+
+def _read_bool_setting_fail_closed(
+    key: str,
+    *,
+    default: bool,
+    label: str,
+    connection=None,
+) -> bool:
+    def _read(con) -> bool:
+        row = con.execute(
+            "SELECT value FROM settings WHERE key=?",
+            (key,),
+        ).fetchone()
+        if not row or row["value"] is None or str(row["value"]).strip() == "":
+            return bool(default)
+        return str(row["value"]).strip().lower() in {"1", "true", "yes", "on"}
+
+    try:
+        if connection is not None:
+            return _read(connection)
+        with connect() as con:
+            return _read(con)
+    except Exception:
+        LOGGER.warning(
+            "Could not read %s setting; failing closed (%s disabled)",
+            key,
+            label,
+            exc_info=True,
+        )
+        return False
+
+
+def is_evidence_rotation_enabled(connection=None) -> bool:
+    """Return whether 512 MiB replay-evidence watermark rotation is enabled."""
+
+    return _read_bool_setting_fail_closed(
+        EVIDENCE_ROTATION_ENABLED_KEY,
+        default=bool(settings.evidence_rotation_enabled),
+        label="evidence rotation",
+        connection=connection,
+    )
+
+
+def set_evidence_rotation_enabled(enabled: bool, connection=None) -> bool:
+    """Persist the per-profile replay-evidence watermark rotation setting."""
+
+    normalized = bool(enabled)
+    stored = "1" if normalized else "0"
+
+    def _write(con) -> None:
+        con.execute(
+            "INSERT INTO settings(key, value, secret) VALUES(?, ?, 0) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, secret=0, "
+            "updated_at=CURRENT_TIMESTAMP",
+            (EVIDENCE_ROTATION_ENABLED_KEY, stored),
+        )
+
+    if connection is not None:
+        _write(connection)
+    else:
+        with transaction() as con:
+            _write(con)
+    return normalized
+
+
+def is_storage_retention_enabled(connection=None) -> bool:
+    """Return whether scheduled background storage retention is enabled."""
+
+    return _read_bool_setting_fail_closed(
+        STORAGE_RETENTION_ENABLED_KEY,
+        default=bool(settings.retention_enabled),
+        label="storage retention",
+        connection=connection,
+    )
+
+
+def _prune_unreferenced_evidence_vectors(connection) -> int:
+    cursor = connection.execute(
+        "DELETE FROM recommendation_evidence_vectors WHERE NOT EXISTS ("
+        "SELECT 1 FROM recommendation_run_evidence_vectors r "
+        "WHERE r.artifact_hash=recommendation_evidence_vectors.artifact_hash) "
+        "AND NOT EXISTS (SELECT 1 FROM scoring_batch_vectors s "
+        "WHERE s.artifact_hash=recommendation_evidence_vectors.artifact_hash)"
+    )
+    return max(0, int(cursor.rowcount or 0))
+
+
+def _unreferenced_scoring_batch_ids(connection, *, limit: int = 64) -> list[str]:
+    rows = connection.execute(
+        """
+        SELECT b.id
+        FROM scoring_batches b
+        WHERE NOT EXISTS (
+            SELECT 1 FROM candidates c
+            WHERE c.score_batch_id = b.id
+        )
+          AND NOT EXISTS (
+            SELECT 1 FROM recommendation_run_evidence_scoring_batches l
+            WHERE l.score_batch_id = b.id
+              AND (
+                  EXISTS (
+                      SELECT 1 FROM recommendation_run_evidence e
+                      WHERE e.run_id = l.run_id AND e.capture_status = 'complete'
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM recommendation_impressions i
+                      JOIN recommendation_outcomes o ON o.impression_id = i.id
+                      WHERE i.run_id = l.run_id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM recommendation_evidence_outcomes eo
+                      WHERE eo.run_id = l.run_id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM recommendation_evidence_events ee
+                      WHERE ee.run_id = l.run_id
+                        AND ee.event_type != 'visible'
+                  )
+              )
+        )
+        ORDER BY datetime(b.captured_at) ASC, b.captured_at ASC, b.rowid ASC
+        LIMIT ?
+        """,
+        (max(1, int(limit)),),
+    ).fetchall()
+    return [str(row["id"]) for row in rows if row["id"]]
+
+
+def rotate_recommendation_evidence_if_needed(
+    connection,
+    *,
+    incoming_bytes: int = 0,
+    max_bytes: int | None = None,
+    exclude_run_ids: Iterable[str] = (),
+) -> dict[str, int]:
+    """Rotate aged unattributed replay artifacts from 80% high watermark down to 65% of quota.
+
+    Never deletes `recommendation_events`, `feedback`, `recommendation_outcomes`,
+    `recommendation_evidence_outcomes`, outcome- or action-attributed runs,
+    `recommendation_runs`, `recommendation_impressions`, or `scoring_batches`
+    linked by active `candidates.score_batch_id` or retained runs.
+    """
+
+    used_before = _evidence_used_bytes(connection)
+    if not is_evidence_rotation_enabled(connection):
+        return {
+            "rotated_runs": 0,
+            "rotated_scoring_batches": 0,
+            "removed_vectors": 0,
+            "used_bytes_before": used_before,
+            "used_bytes_after": used_before,
+        }
+
+    quota = MAX_STORED_EVIDENCE_BYTES if max_bytes is None else max(0, int(max_bytes))
+    additional = max(0, int(incoming_bytes))
+    high_watermark = evidence_high_watermark_bytes(quota)
+    low_watermark = evidence_low_watermark_bytes(quota)
+    if used_before <= high_watermark and used_before + additional <= high_watermark:
+        return {
+            "rotated_runs": 0,
+            "rotated_scoring_batches": 0,
+            "removed_vectors": 0,
+            "used_bytes_before": used_before,
+            "used_bytes_after": used_before,
+        }
+
+    target_bytes = min(low_watermark, max(0, quota - additional))
+    excluded = sorted({str(item) for item in exclude_run_ids if item})
+    exclude_params: tuple[Any, ...] = tuple(excluded)
+    rotated_runs = 0
+    rotated_batches = 0
+    removed_vectors = 0
+
+    # Clean up dangling run->batch links only when the run has neither a complete
+    # capture nor any attributed outcomes/events.
+    link_where_clauses = [
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_run_evidence e
+            WHERE e.run_id = recommendation_run_evidence_scoring_batches.run_id
+              AND e.capture_status = 'complete'
+        )""",
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_impressions i
+            JOIN recommendation_outcomes o ON o.impression_id = i.id
+            WHERE i.run_id = recommendation_run_evidence_scoring_batches.run_id
+        )""",
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_evidence_outcomes eo
+            WHERE eo.run_id = recommendation_run_evidence_scoring_batches.run_id
+        )""",
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_evidence_events ee
+            WHERE ee.run_id = recommendation_run_evidence_scoring_batches.run_id
+              AND ee.event_type != 'visible'
+        )""",
+    ]
+    if excluded:
+        marks = ",".join("?" for _ in excluded)
+        link_where_clauses.append(
+            f"recommendation_run_evidence_scoring_batches.run_id NOT IN ({marks})"
+        )
+    connection.execute(
+        "DELETE FROM recommendation_run_evidence_scoring_batches WHERE "
+        + " AND ".join(link_where_clauses),
+        exclude_params,
+    )
+
+    while _evidence_used_bytes(connection) > target_bytes:
+        unreferenced_batches = _unreferenced_scoring_batch_ids(connection, limit=16)
+        if not unreferenced_batches:
+            break
+        for batch_id in unreferenced_batches:
+            if _evidence_used_bytes(connection) <= target_bytes:
+                break
+            deleted = connection.execute(
+                "DELETE FROM scoring_batches WHERE id=?", (batch_id,)
+            ).rowcount
+            if deleted:
+                rotated_batches += max(0, int(deleted))
+                removed_vectors += _prune_unreferenced_evidence_vectors(connection)
+
+    where_clauses = [
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_impressions i
+            JOIN recommendation_outcomes o ON o.impression_id = i.id
+            WHERE i.run_id = e.run_id
+        )""",
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_evidence_outcomes eo
+            WHERE eo.run_id = e.run_id
+        )""",
+        """NOT EXISTS (
+            SELECT 1 FROM recommendation_evidence_events ee
+            WHERE ee.run_id = e.run_id
+              AND ee.event_type != 'visible'
+        )""",
+    ]
+    if excluded:
+        marks = ",".join("?" for _ in excluded)
+        where_clauses.append(f"e.run_id NOT IN ({marks})")
+    where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    while _evidence_used_bytes(connection) > target_bytes:
+        candidates_to_evict = connection.execute(
+            f"""
+            SELECT e.run_id
+            FROM recommendation_run_evidence e
+            {where_sql}
+            ORDER BY
+                CASE WHEN e.capture_status = 'incomplete' THEN 0 ELSE 1 END ASC,
+                datetime(e.captured_at) ASC,
+                e.captured_at ASC,
+                e.rowid ASC
+            LIMIT 16
+            """,
+            exclude_params,
+        ).fetchall()
+        if not candidates_to_evict:
+            break
+        progressed = False
+        for row in candidates_to_evict:
+            if _evidence_used_bytes(connection) <= target_bytes:
+                break
+            evict_run_id = str(row["run_id"])
+            connection.execute(
+                "DELETE FROM recommendation_run_evidence_scoring_batches WHERE run_id=?",
+                (evict_run_id,),
+            )
+            connection.execute(
+                "DELETE FROM recommendation_evidence_exposures WHERE run_id=?",
+                (evict_run_id,),
+            )
+            connection.execute(
+                "DELETE FROM recommendation_evidence_events WHERE run_id=? AND event_type='visible'",
+                (evict_run_id,),
+            )
+            deleted_run = connection.execute(
+                "DELETE FROM recommendation_run_evidence WHERE run_id=?",
+                (evict_run_id,),
+            ).rowcount
+            if deleted_run:
+                rotated_runs += max(0, int(deleted_run))
+                progressed = True
+            for batch_id in _unreferenced_scoring_batch_ids(connection, limit=32):
+                deleted_batch = connection.execute(
+                    "DELETE FROM scoring_batches WHERE id=?", (batch_id,)
+                ).rowcount
+                if deleted_batch:
+                    rotated_batches += max(0, int(deleted_batch))
+                    progressed = True
+            removed_vectors += _prune_unreferenced_evidence_vectors(connection)
+        if not progressed:
+            break
+
+    if rotated_runs or rotated_batches:
+        removed_vectors += _prune_unreferenced_evidence_vectors(connection)
+
+    used_after = _evidence_used_bytes(connection)
+    return {
+        "rotated_runs": rotated_runs,
+        "rotated_scoring_batches": rotated_batches,
+        "removed_vectors": removed_vectors,
+        "used_bytes_before": used_before,
+        "used_bytes_after": used_after,
+    }
+
+
+def evidence_budget_summary(connection=None) -> dict[str, Any]:
+    """Return current profile replay evidence budget usage and health metrics."""
+
+    def _read(con) -> dict[str, Any]:
+        used_bytes = _evidence_used_bytes(con)
+        quota_bytes = int(MAX_STORED_EVIDENCE_BYTES)
+        high_bytes = evidence_high_watermark_bytes(quota_bytes)
+        low_bytes = evidence_low_watermark_bytes(quota_bytes)
+        counts = con.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN capture_status='complete' THEN 1 ELSE 0 END), 0) AS complete_runs,
+                COALESCE(SUM(CASE WHEN capture_status='incomplete' THEN 1 ELSE 0 END), 0) AS incomplete_runs
+            FROM recommendation_run_evidence
+            """
+        ).fetchone()
+        batch_count = int(
+            con.execute("SELECT COUNT(*) AS count FROM scoring_batches").fetchone()["count"]
+        )
+        ratio = round(min(1.0, used_bytes / quota_bytes), 4) if quota_bytes > 0 else 0.0
+        if used_bytes >= quota_bytes:
+            status = "exceeded"
+        elif used_bytes >= high_bytes:
+            status = "warning"
+        else:
+            status = "healthy"
+        return {
+            "used_bytes": used_bytes,
+            "quota_bytes": quota_bytes,
+            "high_watermark_bytes": high_bytes,
+            "low_watermark_bytes": low_bytes,
+            "usage_ratio": ratio,
+            "status": status,
+            "complete_runs": int(counts["complete_runs"] if counts else 0),
+            "incomplete_runs": int(counts["incomplete_runs"] if counts else 0),
+            "scoring_batches": batch_count,
+        }
+
+    if connection is not None:
+        return _read(connection)
+    with connect() as con:
+        return _read(con)
+
+
+def _budget_allows(
+    connection,
+    additional_bytes: int,
+    *,
+    exclude_run_ids: Iterable[str] = (),
+) -> bool:
+    additional = max(0, int(additional_bytes))
+    rotate_recommendation_evidence_if_needed(
+        connection,
+        incoming_bytes=additional,
+        exclude_run_ids=exclude_run_ids,
+    )
+    return _evidence_used_bytes(connection) + additional <= MAX_STORED_EVIDENCE_BYTES
 
 
 def _embedding_configuration(connection) -> tuple[str, str]:
@@ -1004,7 +1383,9 @@ def archive_served_exposures(
             payload, snapshot_status = _candidate_snapshot_json(item)
             identity_hash = _identity_hash(item.get("title"), item.get("author"))
             estimated_bytes = 160 + len(payload.encode("utf-8"))
-            if not _budget_allows(connection, estimated_bytes):
+            if not _budget_allows(
+                connection, estimated_bytes, exclude_run_ids=(run_id,)
+            ):
                 LOGGER.warning("Recommendation evidence storage quota reached for exposures")
                 break
             connection.execute(
@@ -1188,17 +1569,28 @@ def persist_run_evidence(connection, *, run_id: str, evidence: Mapping[str, Any]
         packed_json = zlib.compress(raw_json, level=1)
         if len(packed_json) > MAX_EVIDENCE_JSON_BYTES:
             raise _EvidenceLimitError("compressed_evidence_bytes_exceeded")
-        budget = connection.execute(
-            "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
-        ).fetchone()
-        used_bytes = int(budget["used_bytes"] if budget else 0)
-        if used_bytes + len(packed_json) + new_vector_bytes > MAX_STORED_EVIDENCE_BYTES:
-            raise _EvidenceLimitError("storage_quota_exceeded")
         reference_bytes = 96 * len(vector_records) + sum(
             72 + len(str(item.get("identity_hash") or "").encode("utf-8"))
             for item in identities
             if isinstance(item, Mapping)
         ) + 64 * len(score_batch_ids)
+        unique_vector_bytes: dict[str, int] = {}
+        for _descriptor, raw, artifact_hash in vector_records:
+            unique_vector_bytes.setdefault(artifact_hash, len(raw))
+        rotate_recommendation_evidence_if_needed(
+            connection,
+            incoming_bytes=len(packed_json) + sum(unique_vector_bytes.values()) + reference_bytes,
+            exclude_run_ids=(run_id,),
+        )
+        new_vector_bytes = 0
+        for artifact_hash, byte_len in unique_vector_bytes.items():
+            existing = connection.execute(
+                "SELECT 1 FROM recommendation_evidence_vectors WHERE artifact_hash=?",
+                (artifact_hash,),
+            ).fetchone()
+            if existing is None:
+                new_vector_bytes += byte_len
+        used_bytes = _evidence_used_bytes(connection)
         if used_bytes + len(packed_json) + new_vector_bytes + reference_bytes > MAX_STORED_EVIDENCE_BYTES:
             raise _EvidenceLimitError("storage_quota_exceeded")
     except _EvidenceLimitError as exc:
@@ -1507,6 +1899,25 @@ def replay_decision_evidence(record_or_decision: Mapping[str, Any]) -> dict[str,
     ]
     llm_diag: dict[str, Any] = {"applied": False, "mode": "none"}
     if recommended:
+        llm_stage = stage_inputs.get("llm_rerank")
+        if isinstance(llm_stage, Mapping) and llm_stage.get("mode") in {"adjustments", "listwise"}:
+            llm_cfg = llm_stage.get("settings") or {}
+            top_k = int(llm_cfg.get("top_k", settings.llm_rerank_top_k))
+            max_delta = float(llm_cfg.get("max_delta", settings.llm_rerank_max_delta))
+            if llm_stage.get("mode") == "adjustments":
+                recommended, llm_diag = apply_llm_rerank_adjustments(
+                    recommended,
+                    list(llm_stage.get("adjustments") or []),
+                    top_k=top_k,
+                    max_delta=max_delta,
+                )
+            elif llm_stage.get("mode") == "listwise":
+                recommended, llm_diag = apply_llm_rerank_order(
+                    recommended,
+                    list(llm_stage.get("rankings") or []),
+                    top_k=top_k,
+                    max_nudge=max_delta,
+                )
         configured_slate_size = (
             int(slate_policy["slate_size"])
             if "slate_size" in slate_policy and int(slate_policy["slate_size"]) > 0
@@ -1521,25 +1932,6 @@ def replay_decision_evidence(record_or_decision: Mapping[str, Any]) -> dict[str,
                 slate_policy.get("max_score_sacrifice", MAX_SCORE_SACRIFICE)
             ),
         )
-        llm_stage = stage_inputs.get("llm_rerank")
-        if isinstance(llm_stage, Mapping) and llm_stage.get("mode") in {"adjustments", "listwise"}:
-            llm_cfg = llm_stage.get("settings") or {}
-            top_k = int(llm_cfg.get("top_k", settings.llm_rerank_top_k))
-            max_delta = float(llm_cfg.get("max_delta", settings.llm_rerank_max_delta))
-            if llm_stage.get("mode") == "adjustments":
-                diversified, llm_diag = apply_llm_rerank_adjustments(
-                    diversified,
-                    list(llm_stage.get("adjustments") or []),
-                    top_k=top_k,
-                    max_delta=max_delta,
-                )
-            elif llm_stage.get("mode") == "listwise":
-                diversified, llm_diag = apply_llm_rerank_order(
-                    diversified,
-                    list(llm_stage.get("rankings") or []),
-                    top_k=top_k,
-                    max_nudge=max_delta,
-                )
         replayed_final = diversified + [
             item for item in replayed_personalized if item.get("status") != "recommended"
         ]
@@ -1675,7 +2067,7 @@ def archive_recommendation_event(
         + len(source.encode("utf-8"))
         + len(occurred_at.encode("utf-8"))
     )
-    if not _budget_allows(connection, estimated_bytes):
+    if not _budget_allows(connection, estimated_bytes, exclude_run_ids=(run_id,)):
         LOGGER.warning("Recommendation evidence storage quota reached for events")
         return None
     revision = int(
@@ -1744,6 +2136,7 @@ def archive_recommendation_outcome(
         if not _budget_allows(
             connection,
             192 + event_key_bytes + label_kind_bytes + presented_bytes + attributed_bytes + visible_bytes,
+            exclude_run_ids=(run_id,),
         ):
             LOGGER.warning("Recommendation evidence storage quota reached for outcomes")
             return False
@@ -1906,6 +2299,7 @@ def purge_recommendation_evidence(
             for crow in connection.execute(
                 "SELECT c.id, c.title, c.author, c.source_url, c.score_batch_id, "
                 "q.work_id AS quality_work_id, q.provider AS quality_provider, "
+                "q.provider_id AS quality_provider_id, "
                 "q.isbn13 AS quality_isbn13, q.isbn10 AS quality_isbn10 "
                 "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id"
             ).fetchall():
@@ -2017,7 +2411,8 @@ def purge_recommendation_evidence(
             purged_read_keys: set[tuple[str, ...]] = set()
             for rrow in connection.execute(
                 "SELECT r.title, r.author, r.isbn, r.openlibrary_work_id, "
-                "m.verified_work_id AS quality_work_id, m.identity_provider AS quality_provider "
+                "m.verified_work_id AS quality_work_id, m.identity_provider AS quality_provider, "
+                "m.identity_provider_id AS quality_provider_id "
                 f"FROM reads r LEFT JOIN read_metadata m ON m.read_id=r.id "
                 f"WHERE r.id IN ({read_marks})",
                 reads,

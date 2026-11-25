@@ -704,8 +704,11 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
     database, monkeypatch, rerank_mode
 ):
     import httpx
+    import socket
+    from afterword_engine.llm_reranker import clear_llm_rerank_cache
     from afterword_engine.secrets import seal
 
+    clear_llm_rerank_cache()
     monkeypatch.setattr(settings, "exploration_enabled", False)
     monkeypatch.setattr(settings, "impression_fatigue_enabled", True)
     monkeypatch.setattr(settings, "impression_fatigue_window_days", 21)
@@ -714,9 +717,20 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
     monkeypatch.setattr(settings, "impression_fatigue_max_penalty", 9.0)
     monkeypatch.setattr(settings, "llm_rerank_top_k", 24)
     monkeypatch.setattr(settings, "llm_rerank_max_delta", 2.0)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 8443))
+        ],
+    )
 
     with transaction() as con:
         con.execute("UPDATE candidates SET status='excluded'")
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
+            ("Grounded Favorite", "R. Reader", 5.0, "2026-09-15", "test"),
+        )
         first = _candidate(con, "Fatigued Front-Runner", "A. Writer", score=82.0)
         second = _candidate(con, "Fresh Challenger", "B. Writer", score=79.5)
         third = _candidate(con, "Steady Contender", "C. Writer", score=78.0)
@@ -757,7 +771,7 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
                 ("llm_rerank_provider", "openai", 0),
                 (
                     "llm_rerank_api_url",
-                    "https://user-cred:super-secret-pass@api.example.com:8443/v1/keys/path-key-token-444/chat/completions?token=query-secret-999#frag",
+                    "https://api.example.com:8443/v1/keys/path-key-token-444/chat/completions?token=query-secret-999#frag",
                     0,
                 ),
                 ("llm_rerank_api_key", seal("sk-live-super-secret-bearer-777"), 1),
@@ -768,6 +782,9 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
     llm_calls = 0
 
     class _FakeLLMResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+
         def raise_for_status(self) -> None:
             return None
 
@@ -866,6 +883,16 @@ def test_impression_fatigue_and_llm_reranker_replay_without_network_or_secret_le
     assert llm_stage["settings"]["configured"] is True
     assert llm_stage["settings"]["endpoint_url"] == "https://api.example.com:8443"
     assert llm_stage["settings"]["model"] == "gpt-4o-mini"
+    from afterword_engine.decision_evidence import _safe_endpoint_url
+
+    credentialed_url = (
+        "https://"
+        + "user-cred"
+        + ":"
+        + "super-secret-pass"
+        + "@api.example.com:8443/v1/chat?api_key=q#frag"
+    )
+    assert _safe_endpoint_url(credentialed_url) == "https://api.example.com:8443"
     assert llm_stage["mode"] == rerank_mode
     if rerank_mode == "adjustments":
         assert len(llm_stage["adjustments"]) == 2
@@ -1121,3 +1148,107 @@ def test_tracked_recommendations_skips_llm_settings_lookup_when_recommended_empt
     )
     assert [item["id"] for item in saved_items] == [saved["id"]]
     assert saved_run is not None
+
+
+def test_llm_rerank_precedes_discovery_slate_diversification_in_replay(
+    database, monkeypatch
+):
+    import socket
+
+    import httpx
+
+    from afterword_engine.llm_reranker import clear_llm_rerank_cache
+    from afterword_engine.secrets import seal
+
+    clear_llm_rerank_cache()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))
+        ],
+    )
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='excluded'")
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
+            ("Anchor Read", "Anchor Author", 5.0, "2026-09-15", "test"),
+        )
+        a1 = _candidate(con, "Repeat One", "Repeat Author", score=84.0)
+        a2 = _candidate(con, "Repeat Two", "Repeat Author", score=83.0)
+        diverse = _candidate(con, "Fresh Voice", "Fresh Author", score=80.5)
+        a3 = _candidate(con, "Repeat Three", "Repeat Author", score=80.0)
+        vectors = {
+            int(a1["id"]): np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            int(a2["id"]): np.asarray([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+            int(diverse["id"]): np.asarray([0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+            int(a3["id"]): np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+        }
+        _set_embeddings(con, [a1, a2, diverse, a3], vectors)
+        con.executemany(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret",
+            [
+                ("llm_rerank_enabled", "1", 0),
+                ("llm_rerank_provider", "openai", 0),
+                ("llm_rerank_api_url", "https://api.example.com/v1/chat/completions", 0),
+                ("llm_rerank_api_key", seal("sk-test-rerank-order"), 1),
+                ("llm_rerank_model", "gpt-4o-mini", 0),
+            ],
+        )
+
+    class _FakeLLMResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            body = {
+                "adjustments": [
+                    {"id": a3["id"], "delta": 1.0, "reason": "Strong reader match"},
+                ]
+            }
+            return {"choices": [{"message": {"content": json.dumps(body)}}]}
+
+    class _ServingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, url: str, *, headers: dict, json: dict):
+            return _FakeLLMResponse()
+
+    monkeypatch.setattr(httpx, "Client", _ServingClient)
+    with connect() as con:
+        served, run_id = tracked_recommendations(
+            status="recommended", limit=10, offset=0, connection=con
+        )
+        record = load_decision_evidence(con, run_id)
+
+    # LLM boosts a3 to 81.0 (ahead of diverse=80.5), then discovery_slate caps Repeat Author at 2
+    # by swapping diverse (80.5) into rank 3 ahead of higher-scored a3 (81.0).
+    assert [item["id"] for item in served] == [
+        a1["id"],
+        a2["id"],
+        diverse["id"],
+        a3["id"],
+    ]
+    assert served[2]["score"] == 80.5
+    assert served[3]["score"] == 81.0
+    assert record["decision"]["policy"]["discovery_slate"]["author_repeat_swaps"] == 1
+
+    replayed = replay_decision_evidence(record)
+    assert replayed["diagnostics"]["discovery_slate"]["author_repeat_swaps"] == 1
+    assert replayed["verification"]["matches_archived"] is True
+    assert replayed["verification"]["max_score_drift"] == 0.0
+    assert [item["id"] for item in replayed["pools"]["served"]] == [
+        item["id"] for item in served
+    ]

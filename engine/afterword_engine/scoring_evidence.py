@@ -23,6 +23,7 @@ from .decision_evidence import (
     _json_value,
     _runtime_source_lineage,
     _safe_identifier,
+    rotate_recommendation_evidence_if_needed,
 )
 from .embeddings import content_hash
 from .scoring import document
@@ -53,7 +54,7 @@ CANDIDATE_FIELDS = (
     "id", "title", "author", "description", "genres", "status", "score",
     "source_id", "source_name", "source_weight", "source_url", "isbn13", "isbn10",
     "quality_status", "quality_score", "catalog_confidence", "quality_work_id",
-    "quality_provider", "quality_isbn13", "quality_isbn10", "score_batch_id",
+    "quality_provider", "quality_provider_id", "quality_isbn13", "quality_isbn10", "score_batch_id",
     "first_publication_year", "publication_work_id",
 )
 
@@ -544,10 +545,6 @@ def persist_scoring_batch(connection, *, batch_id: str, evidence: Mapping[str, A
             ):
                 raise _LimitError("invalid_candidate_manifest")
             candidate_records.append((candidate_id, score, identity_hash, input_hash))
-        budget_row = connection.execute(
-            "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
-        ).fetchone()
-        used_bytes = int(budget_row["used_bytes"] if budget_row else 0)
         reference_bytes = 96 * len(vector_records) + sum(
             96 + len(identity_hash) + len(input_hash)
             for _, _, identity_hash, input_hash in candidate_records
@@ -571,8 +568,42 @@ def persist_scoring_batch(connection, *, batch_id: str, evidence: Mapping[str, A
         if (
             len(raw_json) > MAX_SCORING_JSON_BYTES
             or len(packed) > MAX_SCORING_JSON_BYTES
-            or used_bytes + header_bytes + len(packed) + new_vector_bytes
-                + reference_bytes + read_reference_bytes > MAX_STORED_EVIDENCE_BYTES
+        ):
+            raise _LimitError("storage_quota_exceeded")
+        unique_vector_bytes: dict[str, int] = {}
+        for _etype, _eid, _backend, _model, _dims, raw, artifact_hash in vector_records:
+            unique_vector_bytes.setdefault(artifact_hash, len(raw))
+        rotate_recommendation_evidence_if_needed(
+            connection,
+            incoming_bytes=(
+                header_bytes
+                + len(packed)
+                + sum(unique_vector_bytes.values())
+                + reference_bytes
+                + read_reference_bytes
+            ),
+            max_bytes=MAX_STORED_EVIDENCE_BYTES,
+        )
+        new_vector_bytes = 0
+        for artifact_hash, byte_len in unique_vector_bytes.items():
+            exists = connection.execute(
+                "SELECT 1 FROM recommendation_evidence_vectors WHERE artifact_hash=?",
+                (artifact_hash,),
+            ).fetchone()
+            if exists is None:
+                new_vector_bytes += byte_len
+        budget_row = connection.execute(
+            "SELECT used_bytes FROM recommendation_evidence_budget WHERE id=1"
+        ).fetchone()
+        used_bytes = int(budget_row["used_bytes"] if budget_row else 0)
+        if (
+            used_bytes
+            + header_bytes
+            + len(packed)
+            + new_vector_bytes
+            + reference_bytes
+            + read_reference_bytes
+            > MAX_STORED_EVIDENCE_BYTES
         ):
             raise _LimitError("storage_quota_exceeded")
     except _LimitError as exc:
