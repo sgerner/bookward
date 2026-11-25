@@ -249,10 +249,14 @@ describe("+page.svelte live region and alert wiring", () => {
     const { source, fragment } = readPageAst();
     const dialogs = collectNodes(
       fragment,
-      (node) => node.type === "RegularElement" && node.name === "dialog",
+      (node) =>
+        (node.type === "RegularElement" && node.name === "dialog") ||
+        (node.type === "Component" && node.name === "ModalDialog"),
     );
-    const librarrDialog = dialogs.find(({ node }) =>
-      getAttrRaw(source, node, "aria-labelledby").includes("librarr-search-title"),
+    const librarrDialog = dialogs.find(
+      ({ node }) =>
+        getAttrRaw(source, node, "aria-labelledby").includes("librarr-search-title") ||
+        getAttrRaw(source, node, "ariaLabelledby").includes("librarr-search-title"),
     );
     expect(librarrDialog).toBeDefined();
 
