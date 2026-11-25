@@ -28,12 +28,15 @@ from .backups import (
     backup_scheduler_loop,
     backup_status,
     clear_interrupted_restore_journal,
+    compact_database,
     create_backup,
     has_restore_journal,
     identity_backup_status,
     recover_interrupted_restore,
     restore_backup,
 )
+from .decision_evidence import set_evidence_rotation_enabled
+from .maintenance import set_storage_retention_enabled
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url, validate_google_books_api_key
 from . import ingestion
@@ -1214,6 +1217,40 @@ def make_backup():
     return {"backup": created, "status": backup_status()}
 
 
+class StorageRetentionIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/backups/compact")
+def compact_database_storage():
+    try:
+        return compact_database()
+    except BackupError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/backups/retention")
+def update_storage_retention(payload: StorageRetentionIn):
+    set_storage_retention_enabled(payload.enabled)
+    status = backup_status()
+    return {
+        "retention_enabled": bool(status.get("retention_enabled", payload.enabled)),
+        "status": status,
+    }
+
+
+@app.post("/api/backups/evidence-rotation")
+def update_evidence_rotation(payload: StorageRetentionIn):
+    set_evidence_rotation_enabled(payload.enabled)
+    status = backup_status()
+    return {
+        "evidence_rotation_enabled": bool(
+            status.get("evidence_rotation_enabled", payload.enabled)
+        ),
+        "status": status,
+    }
+
+
 @app.post("/api/backups/{backup_id}/restore")
 def restore_database_backup(backup_id: str):
     try:
@@ -2226,6 +2263,7 @@ async def reading_history_scores(
                 embedder,
                 "read_candidate",
                 virtual_candidates,
+                persist=False,
                 expected_dimensions=_vector_dimensions(read_vectors),
             )
             ranked = rank_candidates(
