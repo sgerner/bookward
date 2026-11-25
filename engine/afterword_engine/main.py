@@ -105,6 +105,7 @@ from .digest import (
     send_digest,
     validate_digest_config,
 )
+from .decision_evidence import retract_recommendation_outcome_evidence
 from .learning import (
     EVENT_TYPES,
     create_recommendation_run,
@@ -115,6 +116,7 @@ from .learning import (
     _impression_precedes,
     _read_label,
     _read_time,
+    _validate_identifier,
 )
 from .interaction_personalization import (
     load_interaction_events,
@@ -135,6 +137,16 @@ from .quality import (
     has_candidate_quality_audit_candidates,
     quality_summary,
 )
+from . import llm_reranker
+from .llm_reranker import (
+    _normalize_chat_url,
+    clear_llm_rerank_cache,
+    is_custom_llm_endpoint,
+    rerank_with_llm_sync as _default_rerank_with_llm_sync,
+    resolve_llm_rerank_credentials,
+)
+
+rerank_with_llm_sync = _default_rerank_with_llm_sync
 from .identity import (
     ReadIdentityIndex,
     book_identity,
@@ -1580,7 +1592,7 @@ class LLMRerankSettingsIn(BaseModel):
         mode = self.resolved_mode(fallback_mode)
         url = self.resolved_api_url(mode)
         if url:
-            validate_llm_rerank_url(url)
+            validate_llm_rerank_url(url, require_https=(mode == "cloud"))
         if self.enabled and (not url or not self.model.strip()):
             raise ValueError("LLM reranking requires both an API URL and a model")
         return mode, url
@@ -1662,7 +1674,77 @@ def _format_recommendation_item(
     return formatted
 
 
-def tracked_recommendations(
+def _load_llm_rerank_inputs(connection, interaction_events: list[dict[str, Any]]):
+    fetch = (
+        (lambda sql, values=(): [dict(item) for item in connection.execute(sql, values).fetchall()])
+        if connection is not None
+        else rows
+    )
+    raw_reads = fetch(
+        "SELECT * FROM reads ORDER BY COALESCE(read_at, created_at) DESC, id DESC"
+    )
+    try:
+        read_metadata_rows = fetch(
+            "SELECT read_id,verified_work_id,identity_provider,identity_provider_id,identity_hash "
+            "FROM read_metadata WHERE verified_work_id!=''"
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table: read_metadata" not in str(exc).casefold():
+            raise
+        read_metadata_rows = []
+    read_rows = read_identity_rows_with_current_verified_work_ids(
+        raw_reads, read_metadata_rows
+    )
+
+    event_cids = sorted(
+        {
+            int(ev["candidate_id"])
+            for ev in interaction_events
+            if ev.get("candidate_id") is not None
+        }
+    )
+    candidate_identities: dict[int, dict[str, Any]] = {}
+    for start in range(0, len(event_cids), 500):
+        batch = event_cids[start : start + 500]
+        if not batch:
+            continue
+        marks = ",".join("?" for _ in batch)
+        try:
+            found = fetch(
+                "SELECT c.id,c.source_url,c.isbn13,c.isbn10,"
+                "q.work_id quality_work_id,q.provider quality_provider,"
+                "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+                "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+                f"WHERE c.id IN ({marks})",
+                batch,
+            )
+            for item in found:
+                candidate_identities[int(item["id"])] = dict(item)
+        except sqlite3.OperationalError:
+            break
+
+    llm_events = [
+        {**candidate_identities.get(int(ev["candidate_id"]), {}), **ev}
+        if ev.get("candidate_id") is not None
+        else dict(ev)
+        for ev in interaction_events
+    ]
+    return read_rows, llm_events
+
+
+def _is_llm_rerank_active(llm_cfg: dict[str, Any]) -> bool:
+    return bool(
+        llm_cfg.get("enabled")
+        and str(llm_cfg.get("api_url") or "").strip()
+        and str(llm_cfg.get("model") or "").strip()
+        and (
+            llm_cfg.get("mode") in {"ollama", "openai-compatible"}
+            or str(llm_cfg.get("api_key") or "").strip()
+        )
+    )
+
+
+def _prepare_tracked_recommendations(
     *,
     status: str | None = None,
     limit: int = 100,
@@ -1675,14 +1757,27 @@ def tracked_recommendations(
     include_imported: bool = False,
     private: dict | None = None,
     pool_summary: dict[str, Any] | None = None,
-):
+) -> dict[str, Any]:
     ranking_at = datetime.now(timezone.utc)
     is_filtered = bool((search and search.strip()) or (genre and genre.strip()))
-    base_pool = personalized_pool = final_pool = None
-    interaction_events = []
-    cached_vectors = {}
+    base_pool = personalized_pool = None
+    ranked = None
+    recommendations = None
+    interaction_events: list[dict[str, Any]] = []
+    cached_vectors: dict[int, Any] = {}
+    read_rows: list[dict[str, Any]] = []
+    llm_events: list[dict[str, Any]] = []
+    llm_cfg = {
+        "enabled": False,
+        "mode": "cloud",
+        "provider": "",
+        "api_url": "",
+        "api_key": "",
+        "model": "",
+    }
+    llm_active = False
     discovery_metadata = empty_discovery_slate_diagnostics("not_discovery_request")
-    learning_metadata = {
+    learning_metadata: dict[str, Any] = {
         "mode": "confidence_gated_live",
         "scope": "installation",
         "applied": False,
@@ -1694,6 +1789,7 @@ def tracked_recommendations(
         "max_score_adjustment": 0.0,
     }
     can_personalize = status in (None, "", "all", "recommended")
+    fallback_triggered = False
     if can_personalize:
         try:
             # Score the full eligible recommendation pool before pagination so
@@ -1750,86 +1846,28 @@ def tracked_recommendations(
             if not is_filtered:
                 personalized_pool = [dict(item) for item in ranked]
             learning_metadata.update(diagnostics)
-            recommended = [
-                item for item in ranked if item.get("status") == "recommended"
-            ]
-            if recommended:
-                diversified, discovery_metadata = diversify_discovery_slate(
-                    recommended, cached_vectors
-                )
-                llm_cfg = effective_llm_rerank_settings(connection, private)
-                rerank_ready = bool(
-                    not is_filtered
-                    and llm_cfg["enabled"]
-                    and llm_cfg["api_url"].strip()
-                    and llm_cfg["model"].strip()
-                    and (
-                        llm_cfg["mode"] in {"ollama", "openai-compatible"}
-                        or llm_cfg["api_key"].strip()
+            has_recommended = any(item.get("status") == "recommended" for item in ranked)
+            if not is_filtered and has_recommended:
+                try:
+                    llm_cfg = effective_llm_rerank_settings(connection, private)
+                    llm_active = _is_llm_rerank_active(llm_cfg)
+                    if llm_active:
+                        read_rows, llm_events = _load_llm_rerank_inputs(
+                            connection, interaction_events
+                        )
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Failed to load LLM rerank inputs; serving personalized base slate: %s",
+                        safe_error_message(exc),
                     )
-                )
-                if rerank_ready:
-                    from .llm_reranker import rerank_with_llm_sync
-
-                    read_rows = (
-                        [
-                            dict(r)
-                            for r in connection.execute(
-                                "SELECT title, author, rating FROM reads ORDER BY id"
-                            ).fetchall()
-                        ]
-                        if connection is not None
-                        else rows("SELECT title, author, rating FROM reads ORDER BY id")
-                    )
-                    diversified, llm_diag = rerank_with_llm_sync(
-                        read_rows,
-                        diversified,
-                        interaction_events=interaction_events,
-                        mode=llm_cfg["mode"],
-                        api_url=llm_cfg["api_url"],
-                        api_key=llm_cfg["api_key"],
-                        model=llm_cfg["model"],
-                    )
-                    learning_metadata["llm_rerank"] = llm_diag
-                ranked = diversified + [
-                    item for item in ranked if item.get("status") != "recommended"
-                ]
-            else:
-                discovery_metadata = empty_discovery_slate_diagnostics(
-                    "no_recommended_candidates"
-                )
-            if pool_summary is not None:
-                all_recommended = [
-                    item for item in ranked if item.get("status") == "recommended"
-                ]
-                pool_summary["recommended_total"] = len(all_recommended)
-                pool_summary["recommendation_genres"] = _distinct_genres(all_recommended)
-            if not is_filtered:
-                final_pool = [dict(item) for item in ranked]
-            else:
-                ranked = [
-                    item
-                    for item in ranked
-                    if _matches_recommendation_filter(item, search=search, genre=genre)
-                ]
-            if recommended_limit is not None and status is None and offset == 0:
-                recommended = [item for item in ranked if item.get("status") == "recommended"]
-                remaining = [
-                    item for item in ranked
-                    if item.get("status") in {"saved", "imported", "new"}
-                ]
-                recommendations = recommended[:max(0, int(recommended_limit))] + remaining
-            else:
-                start = max(0, int(offset))
-                end = None if limit is None else start + max(0, int(limit))
-                recommendations = ranked[start:end]
-            _format_recommendation_urls(recommendations)
+                    llm_active = False
         except Exception:
-            # Personalization must never take the recommendation service down.
-            # On malformed legacy evidence, return the existing champion order.
             LOGGER.exception(
                 "Interaction personalization failed; serving the base ranking"
             )
+            fallback_triggered = True
+            base_pool = personalized_pool = None
+            ranked = None
             if pool_summary is not None:
                 fallback_recommended = _recommendation_rows(
                     connection,
@@ -1876,6 +1914,180 @@ def tracked_recommendations(
             identity_context=identity_context,
             include_imported=include_imported,
         )
+
+    return {
+        "status": status,
+        "limit": limit,
+        "offset": offset,
+        "search": search,
+        "genre": genre,
+        "is_filtered": is_filtered,
+        "pool_summary": pool_summary,
+        "recommended_limit": recommended_limit,
+        "identity_context": identity_context,
+        "include_imported": include_imported,
+        "ranking_at": ranking_at,
+        "can_personalize": can_personalize,
+        "fallback_triggered": fallback_triggered,
+        "base_pool": base_pool,
+        "personalized_pool": personalized_pool,
+        "ranked": ranked,
+        "recommendations": recommendations,
+        "interaction_events": interaction_events,
+        "cached_vectors": cached_vectors,
+        "learning_metadata": learning_metadata,
+        "discovery_metadata": discovery_metadata,
+        "llm_active": llm_active,
+        "llm_cfg": llm_cfg,
+        "read_rows": read_rows,
+        "llm_events": llm_events,
+        "profile_id": current_profile_id() or "legacy",
+    }
+
+
+def _complete_tracked_recommendations(
+    prepared: dict[str, Any],
+    *,
+    connection=None,
+):
+    status = prepared["status"]
+    limit = prepared["limit"]
+    offset = prepared["offset"]
+    search = prepared["search"]
+    genre = prepared["genre"]
+    is_filtered = prepared["is_filtered"]
+    pool_summary = prepared["pool_summary"]
+    recommended_limit = prepared["recommended_limit"]
+    ranking_at = prepared["ranking_at"]
+    can_personalize = prepared["can_personalize"]
+    base_pool = prepared["base_pool"]
+    personalized_pool = prepared["personalized_pool"]
+    ranked = prepared["ranked"]
+    recommendations = prepared["recommendations"]
+    interaction_events = prepared["interaction_events"]
+    cached_vectors = prepared["cached_vectors"]
+    learning_metadata = prepared["learning_metadata"]
+    discovery_metadata = prepared["discovery_metadata"]
+    final_pool = None
+
+    if can_personalize and not prepared["fallback_triggered"] and ranked is not None:
+        try:
+            recommended = [
+                item for item in ranked if item.get("status") == "recommended"
+            ]
+            if recommended:
+                if not is_filtered and prepared["llm_active"]:
+                    llm_cfg = prepared["llm_cfg"]
+                    unreranked_recommended = [dict(item) for item in recommended]
+                    rerank_fn = (
+                        rerank_with_llm_sync
+                        if rerank_with_llm_sync is not _default_rerank_with_llm_sync
+                        else llm_reranker.rerank_with_llm_sync
+                    )
+                    try:
+                        recommended, llm_diag = rerank_fn(
+                            prepared["read_rows"],
+                            recommended,
+                            interaction_events=prepared["llm_events"],
+                            profile_id=prepared["profile_id"],
+                            mode=llm_cfg.get("mode", "cloud"),
+                            api_url=llm_cfg["api_url"],
+                            api_key=llm_cfg["api_key"],
+                            model=llm_cfg["model"],
+                        )
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "LLM reranker failed; preserving personalized slate: %s",
+                            safe_error_message(exc),
+                        )
+                        recommended = unreranked_recommended
+                        llm_diag = {"applied": False, "reason": "fallback"}
+                    learning_metadata["llm_rerank"] = llm_diag
+                # Apply bounded anti-redundancy swaps after LLM score adjustments.
+                diversified, discovery_metadata = diversify_discovery_slate(
+                    recommended, cached_vectors
+                )
+                ranked = diversified + [
+                    item for item in ranked if item.get("status") != "recommended"
+                ]
+            else:
+                discovery_metadata = empty_discovery_slate_diagnostics(
+                    "no_recommended_candidates"
+                )
+            if pool_summary is not None:
+                all_recommended = [
+                    item for item in ranked if item.get("status") == "recommended"
+                ]
+                pool_summary["recommended_total"] = len(all_recommended)
+                pool_summary["recommendation_genres"] = _distinct_genres(all_recommended)
+            if not is_filtered:
+                final_pool = [dict(item) for item in ranked]
+            else:
+                ranked = [
+                    item
+                    for item in ranked
+                    if _matches_recommendation_filter(item, search=search, genre=genre)
+                ]
+            if recommended_limit is not None and status is None and offset == 0:
+                recommended_out = [
+                    item for item in ranked if item.get("status") == "recommended"
+                ]
+                remaining = [
+                    item
+                    for item in ranked
+                    if item.get("status") in {"saved", "imported", "new"}
+                ]
+                recommendations = (
+                    recommended_out[: max(0, int(recommended_limit))] + remaining
+                )
+            else:
+                start = max(0, int(offset))
+                end = None if limit is None else start + max(0, int(limit))
+                recommendations = ranked[start:end]
+            _format_recommendation_urls(recommendations)
+        except Exception:
+            LOGGER.exception(
+                "Post-personalization slate assembly failed; serving base ranking"
+            )
+            base_pool = personalized_pool = final_pool = None
+            if pool_summary is not None:
+                fallback_recommended = _recommendation_rows(
+                    connection,
+                    statuses=("recommended",),
+                    limit=None,
+                    identity_context=prepared["identity_context"],
+                )
+                pool_summary["recommended_total"] = len(fallback_recommended)
+                pool_summary["recommendation_genres"] = _distinct_genres(fallback_recommended)
+            recommendations = recommendation_list(
+                connection,
+                status=status,
+                limit=limit,
+                offset=offset,
+                search=search,
+                genre=genre,
+                recommended_limit=recommended_limit,
+                identity_context=prepared["identity_context"],
+                include_imported=prepared["include_imported"],
+            )
+            learning_metadata = {
+                "mode": "base_ranker_fallback",
+                "scope": "installation",
+                "applied": False,
+                "observed_books": 0,
+                "qualified_features": 0,
+                "semantic_evidence_books": 0,
+                "semantic_adjusted_candidates": 0,
+                "adjusted_candidates": 0,
+                "max_score_adjustment": 0.0,
+            }
+            discovery_metadata = empty_discovery_slate_diagnostics(
+                "base_ranker_fallback"
+            )
+
+    if not can_personalize:
+        # Non-ranking requests (shortlist, history, decisions) never create a
+        # recommendation run or explore the tail.
         return recommendations, ""
     # Keep exploration outside the scorer and behind an environment flag.  A
     # disabled deployment receives the same deterministic order and scores as
@@ -1932,6 +2144,56 @@ def tracked_recommendations(
     return recommendations, run_id
 
 
+def tracked_recommendations(
+    *,
+    status: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    search: str | None = None,
+    genre: str | None = None,
+    connection=None,
+    recommended_limit: int | None = None,
+    identity_context=None,
+    include_imported: bool = False,
+    private: dict | None = None,
+    pool_summary: dict[str, Any] | None = None,
+):
+    if connection is not None:
+        prepared = _prepare_tracked_recommendations(
+            status=status,
+            limit=limit,
+            offset=offset,
+            search=search,
+            genre=genre,
+            connection=connection,
+            recommended_limit=recommended_limit,
+            identity_context=identity_context,
+            include_imported=include_imported,
+            private=private,
+            pool_summary=pool_summary,
+        )
+        return _complete_tracked_recommendations(prepared, connection=connection)
+
+    with connect() as read_con:
+        prepared = _prepare_tracked_recommendations(
+            status=status,
+            limit=limit,
+            offset=offset,
+            search=search,
+            genre=genre,
+            connection=read_con,
+            recommended_limit=recommended_limit,
+            identity_context=identity_context,
+            include_imported=include_imported,
+            private=private,
+            pool_summary=pool_summary,
+        )
+        if not prepared["llm_active"]:
+            return _complete_tracked_recommendations(prepared, connection=read_con)
+    # Release _LockedConnection before executing outbound LLM network I/O.
+    return _complete_tracked_recommendations(prepared, connection=None)
+
+
 def overview_payload(
     *,
     include_api_tokens: bool = True,
@@ -1943,6 +2205,10 @@ def overview_payload(
         item["filters"] = normalize_source_filters(item.get("filters"))
         return item
 
+    deferred_prepared = None
+    recommendations = None
+    run_id = None
+    pool_summary: dict[str, Any] = {}
     with connect() as connection:
         counts = {
             name: connection.execute(f"SELECT COUNT(*) count FROM {name}").fetchone()["count"]
@@ -1950,24 +2216,28 @@ def overview_payload(
         }
         identity_context = _recommendation_identity_context(connection)
         private = private_settings(connection)
-        pool_summary: dict[str, Any] = {}
-        recommendations, run_id = tracked_recommendations(
-            connection=connection,
-            limit=recommendation_limit or 100,
-            recommended_limit=recommendation_limit,
-            identity_context=identity_context,
-            include_imported=True,
-            private=private,
-            pool_summary=pool_summary,
-        )
-        served_recommended = sum(
-            1 for item in recommendations if item.get("status") == "recommended"
-        )
-        recommendations_has_more = (
-            int(pool_summary.get("recommended_total", served_recommended))
-            > served_recommended
-        )
-        recommendation_genres = list(pool_summary.get("recommendation_genres") or [])
+        llm_cfg = effective_llm_rerank_settings(connection, private)
+        llm_active = _is_llm_rerank_active(llm_cfg)
+        if llm_active:
+            deferred_prepared = _prepare_tracked_recommendations(
+                connection=connection,
+                limit=recommendation_limit or 100,
+                recommended_limit=recommendation_limit,
+                identity_context=identity_context,
+                include_imported=True,
+                private=private,
+                pool_summary=pool_summary,
+            )
+        else:
+            recommendations, run_id = tracked_recommendations(
+                connection=connection,
+                limit=recommendation_limit or 100,
+                recommended_limit=recommendation_limit,
+                identity_context=identity_context,
+                include_imported=True,
+                private=private,
+                pool_summary=pool_summary,
+            )
         all_decision_rows = _recommendation_rows(
             connection,
             statuses=("rejected", "maybe_later"),
@@ -1980,27 +2250,49 @@ def overview_payload(
             _format_recommendation_item(item)
             for item in all_decision_rows[:decision_limit]
         ]
-        return {
-            "counts": counts,
-            "recommendations": recommendations,
-            "recommendations_has_more": recommendations_has_more,
-            "recommendation_genres": recommendation_genres,
-            "decisions": decisions,
-            "decisions_has_more": decisions_has_more,
-            "decision_genres": decision_genres,
-            "recommendation_run_id": run_id,
-            "sources": [source_payload(item) for item in connection.execute(
+        sources_list = [
+            source_payload(item)
+            for item in connection.execute(
                 "SELECT * FROM sources ORDER BY is_default DESC,name"
-            ).fetchall()],
-            "history": [dict(item) for item in connection.execute(
+            ).fetchall()
+        ]
+        history_list = [
+            dict(item)
+            for item in connection.execute(
                 "SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"
-            ).fetchall()],
-            "settings": safe_settings(
-                include_api_tokens=include_api_tokens,
-                connection=connection,
-                private=private,
-            ),
-        }
+            ).fetchall()
+        ]
+        settings_payload = safe_settings(
+            include_api_tokens=include_api_tokens,
+            connection=connection,
+            private=private,
+        )
+
+    if deferred_prepared is not None:
+        recommendations, run_id = _complete_tracked_recommendations(
+            deferred_prepared, connection=None
+        )
+    served_recommended = sum(
+        1 for item in recommendations if item.get("status") == "recommended"
+    )
+    recommendations_has_more = (
+        int(pool_summary.get("recommended_total", served_recommended))
+        > served_recommended
+    )
+    recommendation_genres = list(pool_summary.get("recommendation_genres") or [])
+    return {
+        "counts": counts,
+        "recommendations": recommendations,
+        "recommendations_has_more": recommendations_has_more,
+        "recommendation_genres": recommendation_genres,
+        "decisions": decisions,
+        "decisions_has_more": decisions_has_more,
+        "decision_genres": decision_genres,
+        "recommendation_run_id": run_id,
+        "sources": sources_list,
+        "history": history_list,
+        "settings": settings_payload,
+    }
 
 
 @app.get("/api/health")
@@ -2378,16 +2670,14 @@ def recommendations(
     search: Annotated[str | None, Query(max_length=200)] = None,
     genre: Annotated[str | None, Query(max_length=100)] = None,
 ):
-    with connect() as connection:
-        values, run_id = tracked_recommendations(
-            connection=connection,
-            status=status,
-            limit=limit,
-            offset=offset,
-            search=search,
-            genre=genre,
-            include_imported=status in {"saved", "imported", "all"},
-        )
+    values, run_id = tracked_recommendations(
+        status=status,
+        limit=limit,
+        offset=offset,
+        search=search,
+        genre=genre,
+        include_imported=status in {"saved", "imported", "all"},
+    )
     for item in values:
         item["recommendation_run_id"] = run_id
     if run_id:
@@ -2463,10 +2753,30 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         "read_source": str(read["source"] or "unknown")[:32],
         "time_precision": "day" if day_precision else "timestamp",
     }
+    read_event_key = f"read:{int(read['id']):08d}"
+    candidate_read_event_key = f"read:{int(read['id']):08d}:{int(candidate['id'])}"
+    existing_read_event = con.execute(
+        "SELECT event_key,candidate_id FROM recommendation_events "
+        "WHERE event_key IN (?,?) ORDER BY id",
+        (read_event_key, candidate_read_event_key),
+    ).fetchall()
+    matched_existing_key = next(
+        (
+            str(item["event_key"])
+            for item in existing_read_event
+            if int(item["candidate_id"]) == int(candidate["id"])
+        ),
+        None,
+    )
+    event_key = (
+        matched_existing_key
+        if matched_existing_key is not None
+        else f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}"
+    )
     try:
         record_event_in_connection(
             con,
-            event_key=f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}",
+            event_key=event_key,
             candidate_id=int(candidate["id"]),
             event_type="read",
             value=saved_rating,
@@ -2482,6 +2792,47 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return read, existing is not None
+
+
+def _clear_explicit_feedback_outcomes(
+    con,
+    candidate_id: int,
+    *,
+    event_type: str,
+    source: str = "ui",
+    event_key: str | None = None,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    if event_key is not None:
+        con.execute(
+            "DELETE FROM recommendation_outcomes "
+            "WHERE label_kind='explicit_feedback' AND event_id=("
+            "SELECT id FROM recommendation_events WHERE event_key=?)",
+            (event_key,),
+        )
+        retract_recommendation_outcome_evidence(
+            con,
+            candidate_id=candidate_id,
+            event_type=event_type,
+            source=source,
+            occurred_at=now,
+            event_key=event_key,
+        )
+        return
+    con.execute(
+        "DELETE FROM recommendation_outcomes "
+        "WHERE label_kind='explicit_feedback' AND ("
+        "event_id IN (SELECT id FROM recommendation_events WHERE candidate_id=?) "
+        "OR impression_id IN (SELECT id FROM recommendation_impressions WHERE candidate_id=?))",
+        (candidate_id, candidate_id),
+    )
+    retract_recommendation_outcome_evidence(
+        con,
+        candidate_id=candidate_id,
+        event_type=event_type,
+        source=source,
+        occurred_at=now,
+    )
 
 
 @app.post("/api/recommendations/{candidate_id}/feedback")
@@ -2504,6 +2855,13 @@ def feedback(candidate_id: int, payload: FeedbackIn):
             "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
             (candidate_id, payload.action, previous_status),
         ).lastrowid
+        if payload.action in {"restore", "maybe_later"}:
+            _clear_explicit_feedback_outcomes(
+                con,
+                candidate_id,
+                event_type=payload.action,
+                source="ui",
+            )
         label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
         try:
             record_event_in_connection(
@@ -2577,11 +2935,6 @@ def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
         "UPDATE feedback SET undone_at=CURRENT_TIMESTAMP WHERE id=?",
         (decision_id,),
     )
-    con.execute(
-        "DELETE FROM recommendation_outcomes WHERE event_id=("
-        "SELECT id FROM recommendation_events WHERE event_key=?)",
-        (f"feedback:{decision_id}",),
-    )
     compensation = (
         "librarr_import" if previous_status == "imported"
         else "save" if previous_status == "saved"
@@ -2589,6 +2942,20 @@ def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
         else "maybe_later" if previous_status == "maybe_later"
         else "restore"
     )
+    _clear_explicit_feedback_outcomes(
+        con,
+        candidate_id,
+        event_type=compensation,
+        source="ui_undo",
+        event_key=f"feedback:{decision_id}",
+    )
+    if compensation in {"restore", "maybe_later"}:
+        _clear_explicit_feedback_outcomes(
+            con,
+            candidate_id,
+            event_type=compensation,
+            source="ui_undo",
+        )
     try:
         record_event_in_connection(
             con,
@@ -2658,22 +3025,51 @@ def bulk_feedback(payload: BulkFeedbackIn):
     ids = list(dict.fromkeys(payload.ids))
     decisions = []
     with transaction() as con:
+        if payload.run_id is not None:
+            try:
+                _validate_identifier(payload.run_id, "recommendation run")
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
         placeholders = ",".join("?" for _ in ids)
-        found = {
+        candidate_rows = {
             int(item["id"]): str(item["status"])
             for item in con.execute(
-                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})", ids
+                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})",
+                ids,
             ).fetchall()
         }
-        for candidate_id in ids:
-            if candidate_id not in found:
-                continue
-            previous_status = found[candidate_id]
-            con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, candidate_id))
+        found = [candidate_id for candidate_id in ids if candidate_id in candidate_rows]
+        run_candidate_ids: set[int] = set()
+        if payload.run_id is not None and found:
+            run_placeholders = ",".join("?" for _ in found)
+            run_candidate_ids = {
+                int(item["candidate_id"])
+                for item in con.execute(
+                    f"SELECT candidate_id FROM recommendation_impressions "
+                    f"WHERE run_id=? AND candidate_id IN ({run_placeholders})",
+                    (payload.run_id, *found),
+                ).fetchall()
+            }
+        for candidate_id in found:
+            previous_status = candidate_rows[candidate_id]
+            con.execute(
+                "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, candidate_id),
+            )
             feedback_id = con.execute(
                 "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
                 (candidate_id, payload.action, previous_status),
             ).lastrowid
+            if payload.action == "restore":
+                _clear_explicit_feedback_outcomes(
+                    con,
+                    candidate_id,
+                    event_type="restore",
+                    source="ui",
+                )
+            candidate_run_id = (
+                payload.run_id if candidate_id in run_candidate_ids else None
+            )
             label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
             try:
                 record_event_in_connection(
@@ -2681,11 +3077,11 @@ def bulk_feedback(payload: BulkFeedbackIn):
                     event_key=f"feedback:{feedback_id}",
                     candidate_id=candidate_id,
                     event_type=payload.action,
-                    run_id=payload.run_id,
+                    run_id=candidate_run_id,
                     source="ui",
                     label=label,
                     label_kind="explicit_feedback" if label is not None else None,
-                    confidence=0.8 if payload.run_id and label is not None else 0.5,
+                    confidence=0.8 if candidate_run_id and label is not None else 0.5,
                 )
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
@@ -3286,35 +3682,69 @@ async def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
     supplied_key = (payload.api_key or "").strip()
-    existing_has_key = bool(existing_effective["api_key"].strip())
+    saved_profile_key = (current.get("llm_rerank_api_key") or "").strip()
     if payload.clear_api_key:
         api_key = ""
         persist_api_key = True
     elif supplied_key:
         api_key = supplied_key
         persist_api_key = True
-    elif existing_has_key:
+    elif saved_profile_key:
         if not can_reuse_saved_llm_key(
             existing_effective, mode=mode, api_url=resolved_url
         ):
             raise HTTPException(
                 400,
-                "Saved LLM API key can only be reused when the mode and endpoint origin match the saved settings; provide a new API key or clear the saved key",
+                "Saved profile API key can only be reused when the mode and endpoint origin match the saved settings; provide a new profile API key or clear the saved key",
             )
-        api_key = existing_effective["api_key"]
-        persist_api_key = "llm_rerank_api_key" in current
-    else:
+        api_key = saved_profile_key
+        persist_api_key = True
+    elif "llm_rerank_api_key" in current:
         api_key = ""
+        persist_api_key = True
+    else:
+        try:
+            env_mode = normalize_llm_rerank_mode(settings.llm_rerank_mode or "cloud")
+        except ValueError:
+            env_mode = "cloud"
+        env_url = (
+            DEFAULT_OLLAMA_URL
+            if env_mode == "ollama" and settings.llm_rerank_api_url == DEFAULT_CLOUD_LLM_URL
+            else settings.llm_rerank_api_url
+        )
+        if (
+            (settings.llm_rerank_api_key or "").strip()
+            and mode == env_mode
+            and canonical_llm_endpoint_key(resolved_url, mode) is not None
+            and canonical_llm_endpoint_key(resolved_url, mode)
+            == canonical_llm_endpoint_key(env_url, env_mode)
+        ):
+            api_key = (settings.llm_rerank_api_key or "").strip()
+        else:
+            api_key = ""
         persist_api_key = False
     if resolved_url:
         try:
-            validate_llm_rerank_url(resolved_url, has_api_key=bool(api_key.strip()))
+            validate_llm_rerank_url(
+                resolved_url,
+                has_api_key=bool(api_key.strip()),
+                require_https=(mode == "cloud"),
+            )
         except ValueError as exc:
             raise HTTPException(400, safe_error_message(exc)) from exc
     if payload.enabled and mode == "cloud" and not api_key.strip():
+        if is_custom_llm_endpoint(resolved_url):
+            raise HTTPException(
+                400, "A profile API key is required for custom LLM endpoint URLs"
+            )
         raise HTTPException(400, "An API key is required when cloud LLM reranking is enabled")
-    health: dict[str, Any] = {"ok": True, "checked": False, "mode": mode, "model": payload.model.strip()}
-    if payload.enabled:
+    health: dict[str, Any] = {
+        "ok": True,
+        "checked": False,
+        "mode": mode,
+        "model": payload.model.strip(),
+    }
+    if payload.enabled and mode in {"ollama", "openai-compatible"}:
         try:
             health = await verify_llm_reranker(
                 mode=mode,
@@ -3353,6 +3783,7 @@ async def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
                 (key, stored, 1 if secret else 0),
             )
+    clear_llm_rerank_cache(current_profile_id() or "legacy")
     return {"saved": True, "llm_rerank": safe_llm_rerank_settings(), "health": health}
 
 
@@ -4024,13 +4455,13 @@ def effective_llm_rerank_settings(connection=None, private=None) -> dict:
     if "llm_rerank_api_key" in private:
         api_key = private["llm_rerank_api_key"]
     elif (
-        settings.llm_rerank_api_key.strip()
+        (settings.llm_rerank_api_key or "").strip()
         and mode == env_mode
         and canonical_llm_endpoint_key(api_url, mode) is not None
         and canonical_llm_endpoint_key(api_url, mode)
         == canonical_llm_endpoint_key(env_url, env_mode)
     ):
-        api_key = settings.llm_rerank_api_key
+        api_key = (settings.llm_rerank_api_key or "").strip()
     else:
         api_key = ""
     return {
@@ -4044,6 +4475,8 @@ def effective_llm_rerank_settings(connection=None, private=None) -> dict:
 
 
 def safe_llm_rerank_settings(connection=None, private=None) -> dict:
+    if private is None:
+        private = private_settings(connection)
     effective = effective_llm_rerank_settings(connection, private)
     return {
         "enabled": effective["enabled"],
@@ -4051,7 +4484,7 @@ def safe_llm_rerank_settings(connection=None, private=None) -> dict:
         "provider": effective["provider"],
         "api_url": effective["api_url"],
         "model": effective["model"],
-        "api_key_set": bool(effective["api_key"].strip()),
+        "api_key_set": bool(effective["api_key"]),
     }
 
 
