@@ -21,7 +21,7 @@
     <span in:fly={{ x: -8, duration: motionDuration(180) }} class="badge preset-tonal-warning">{page.status}</span>
     <h1 class="h2">{page.status === 503 ? 'A short intermission' : page.status === 404 ? 'Page not found' : page.status === 413 ? 'File too large' : 'Something went wrong'}</h1>
     <p class="text-surface-700-300 leading-relaxed">{page.status === 503 ? 'We couldn’t reach your book library. Please try again in a moment.' : page.status === 404 ? 'That page doesn’t exist or may have moved. Return to your Bookward home to continue browsing.' : page.status === 413 ? 'Goodreads CSV exports must be 10 MB or smaller (up to 20,000 books). Choose a smaller CSV file and try again.' : page.error?.message ?? 'We couldn’t load this page.'}</p>
-    <a class="btn preset-filled-primary-500 min-h-11" href={page.status === 413 ? '/?view=settings' : '/'}>{page.status === 404 ? 'Go to Bookward' : page.status === 413 ? 'Back to Settings' : 'Try again'}<ArrowRight size={16} /></a>
+    <a class="btn btn-reflow preset-filled-primary-500 min-h-11" href={page.status === 413 ? '/?view=settings' : '/'}>{page.status === 404 ? 'Go to Bookward' : page.status === 413 ? 'Back to Settings' : 'Try again'}<ArrowRight size={16} /></a>
     {#if page.status === 503}<details class="text-sm text-surface-700-300"><summary class="cursor-pointer py-2">Server administrator?</summary><p class="pt-2">Check that the recommendation service is running and reachable from the web server.</p></details>{/if}
   </div>
 </main>

@@ -139,7 +139,7 @@
 			{#if formErrorBanner(form, 'create')}
 				<p class="rounded-xl p-3 text-sm preset-tonal-error sm:col-span-2" role="alert">{formErrorBanner(form, 'create')}</p>
 			{/if}
-			<button class="btn preset-filled-primary-500 justify-self-start sm:col-span-2" type="submit">Create profile</button>
+			<button class="btn btn-reflow preset-filled-primary-500 justify-self-start sm:col-span-2" type="submit">Create profile</button>
 		</form>
 	</section>
 	<section class="mt-8 grid gap-4">
@@ -223,7 +223,7 @@
 								/>
 							{/snippet}
 						</FormField>
-						<button class="btn btn-sm preset-tonal-surface sm:mt-7" type="submit" aria-label={`Reset password for ${account.display_name || account.username}`}>Reset password</button>
+						<button class="btn btn-sm btn-reflow preset-tonal-surface sm:mt-7" type="submit" aria-label={`Reset password for ${account.display_name || account.username}`}>Reset password</button>
 						{#if formErrorBanner(form, resetFormId)}
 							<p class="w-full rounded-xl p-3 text-sm preset-tonal-error" role="alert">{formErrorBanner(form, resetFormId)}</p>
 						{/if}
@@ -263,20 +263,29 @@
 			</p>
 			{#if backup.recovery_hold}
 				<div class="mt-4 space-y-4 border-l-2 border-warning-500 preset-tonal-warning p-4 text-sm leading-6" role="alert">
-					<div>
-						<p class="font-semibold">Recovery hold active — scheduled identity backups are paused</p>
-						<p class="mt-1">
-							Bookward initialized a new account registry while {backup.backups.length === 1 ? '1 surviving snapshot was' : `${backup.backups.length} surviving snapshots were`} found in <code class="break-words wrap-anywhere">auth-registry</code>. Stop Bookward and run the offline recovery command below to restore prior accounts, or confirm keeping this new registry.
-						</p>
-					</div>
-					<form method="POST" action="?/dismissIdentityHold" use:enhance={enhanceForm} class="space-y-3 border-t border-warning-500/30 pt-3">
-						<ProfileField profileId={data.user?.profile_id} />
-						<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs leading-5">
-							<input class="checkbox size-6 shrink-0" type="checkbox" name="confirm" value="KEEP" required />
-							<span>Keep this current account registry and resume scheduled identity backups.</span>
-						</label>
-						<button class="btn btn-sm min-h-10 preset-filled-warning-500" type="submit">Keep current account registry &amp; resume backups</button>
-					</form>
+					{#if backup.recovery_hold_at}
+						<div>
+							<p class="font-semibold">Recovery hold active — scheduled identity backups are paused</p>
+							<p class="mt-1">
+								Bookward initialized a new account registry while {backup.backups.length === 1 ? '1 surviving snapshot was' : `${backup.backups.length} surviving snapshots were`} found in <code class="break-words wrap-anywhere">auth-registry</code>. Stop Bookward and run the offline recovery command below to restore prior accounts, or confirm keeping this new registry.
+							</p>
+						</div>
+						<form method="POST" action="?/dismissIdentityHold" use:enhance={enhanceForm} class="space-y-3 border-t border-warning-500/30 pt-3">
+							<ProfileField profileId={data.user?.profile_id} />
+							<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs leading-5">
+								<input class="checkbox size-6 shrink-0" type="checkbox" name="confirm" value="KEEP" required />
+								<span>Keep this current account registry and resume scheduled identity backups.</span>
+							</label>
+							<button class="btn btn-sm btn-reflow min-h-10 preset-filled-warning-500" type="submit">Keep current account registry &amp; resume backups</button>
+						</form>
+					{:else}
+						<div>
+							<p class="font-semibold">Scheduled identity backups paused — recovery hold status could not be read</p>
+							<p class="mt-1">
+								Bookward could not read recovery-hold status from the account registry, so scheduled identity snapshots and retention pruning are paused to protect existing snapshots until registry access recovers.
+							</p>
+						</div>
+					{/if}
 				</div>
 			{/if}
 			{#if backup.last_success_at}

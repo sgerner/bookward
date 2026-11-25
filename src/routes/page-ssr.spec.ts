@@ -139,4 +139,62 @@ describe("+page.svelte URL state & Read history initial render", () => {
     expect(body).toContain("Your shortlist.");
     expect(body).toContain('aria-label="Search shortlist"');
   });
+
+  it("distinguishes persisted recovery hold banner copy from unreadable hold status in Settings", () => {
+    mockPage.url = new URL("http://bookward.test/?view=settings");
+    mockPage.shallow = null;
+
+    const persistedData = createPageData();
+    Object.assign(persistedData.backupStatus, {
+      enabled: true,
+      recovery_hold: true,
+      recovery_hold_at: "2026-11-21T20:00:00+00:00",
+      backups: [
+        {
+          id: "bookward-20261120T190000Z-aaaa1111",
+          created_at: "2026-11-20T19:00:00+00:00",
+          size_bytes: 65536,
+        },
+      ],
+    });
+    const persistedRender = render(Page, {
+      props: {
+        data: persistedData as never,
+        form: null,
+      },
+    });
+    expect(persistedRender.body).toContain("Recovery hold · backups paused");
+    expect(persistedRender.body).toContain("Bookward initialized a new profile database");
+    expect(persistedRender.body).toContain("?/dismissRecoveryHold");
+
+    const unreadableData = createPageData();
+    Object.assign(unreadableData.backupStatus, {
+      enabled: true,
+      recovery_hold: true,
+      recovery_hold_at: null,
+      last_error: "Backup status is temporarily unavailable.",
+      backups: [
+        {
+          id: "bookward-20261120T190000Z-aaaa1111",
+          created_at: "2026-11-20T19:00:00+00:00",
+          size_bytes: 65536,
+        },
+      ],
+    });
+    const unreadableRender = render(Page, {
+      props: {
+        data: unreadableData as never,
+        form: null,
+      },
+    });
+    expect(unreadableRender.body).toContain("Recovery hold · backups paused");
+    expect(unreadableRender.body).toContain(
+      "Scheduled backups paused — recovery hold status could not be read",
+    );
+    expect(unreadableRender.body).toContain(
+      "Bookward could not read recovery-hold status from the current profile database",
+    );
+    expect(unreadableRender.body).not.toContain("initialized a new profile database");
+    expect(unreadableRender.body).not.toContain("?/dismissRecoveryHold");
+  });
 });

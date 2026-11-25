@@ -112,6 +112,7 @@ describe('admin identity backup recovery hold', () => {
 			}
 		});
 		expect(rendered.body).toContain('Recovery hold · backups paused');
+		expect(rendered.body).toContain('Bookward initialized a new account registry');
 		expect(rendered.body).toContain(
 			'afterword_engine.auth_admin restore bookward-auth-20261120T190000Z-aaaa1111 --confirm'
 		);
@@ -119,6 +120,38 @@ describe('admin identity backup recovery hold', () => {
 			'value="bookward-auth-20261120T190000Z-aaaa1111" selected'
 		);
 		expect(rendered.body).toContain('?/dismissIdentityHold');
+
+		const unreadableRendered = render(AdminPage, {
+			props: {
+				data: {
+					...data,
+					identityBackup: {
+						...identityBackup,
+						recovery_hold: true,
+						recovery_hold_at: null,
+						last_error: 'Identity backup status is temporarily unavailable.'
+					},
+					user: {
+						id: 'admin-1',
+						profile_id: 'legacy',
+						username: 'owner',
+						display_name: 'Owner',
+						role: 'admin',
+						must_change_password: false
+					}
+				},
+				form: null
+			}
+		});
+		expect(unreadableRendered.body).toContain('Recovery hold · backups paused');
+		expect(unreadableRendered.body).toContain(
+			'Scheduled identity backups paused — recovery hold status could not be read'
+		);
+		expect(unreadableRendered.body).toContain(
+			'Bookward could not read recovery-hold status from the account registry'
+		);
+		expect(unreadableRendered.body).not.toContain('initialized a new account registry');
+		expect(unreadableRendered.body).not.toContain('?/dismissIdentityHold');
 
 		engine.mockReset();
 		const rejected = await actions.dismissIdentityHold!({

@@ -33,6 +33,7 @@ from .database import (
     normalize_key,
     persist_metadata_field_provenance,
     private_setting,
+    purge_demo_reads,
     recompute_candidate_sources,
     row,
     rows,
@@ -941,6 +942,8 @@ def import_csv(content: bytes) -> dict[str, int | str]:
         raise ValueError("CSV is malformed") from exc
     from .learning import attribute_read_outcomes
     with transaction() as con:
+        if count > 0:
+            purge_demo_reads(con)
         for kind, values in batches:
             if kind == "shelf":
                 con.executemany(
@@ -2433,6 +2436,8 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
             isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip('="')[:32] or None
             read_rows.append((title, author, rating, read_at, isbn))
             count += 1
+        if count > 0:
+            purge_demo_reads(con)
         # Shelf-to-read promotion intentionally preserves prior scoring batches and
         # serving runs so `attribute_read_outcomes()` can attach outcomes to earlier
         # exposures while the book remains in `reads`.
