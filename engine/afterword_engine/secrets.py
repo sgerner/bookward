@@ -1,9 +1,20 @@
 import os
 import re
+import threading
 from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from .config import settings
 from .tenancy import current_profile_id
+
+_AUTH_REGISTRY_KEY_LOCK = threading.Lock()
+_AUTH_REGISTRY_KEY_CACHE: tuple[tuple[str, int, int, int, int, int], bytes] | None = None
+
+
+def clear_auth_registry_key_cache() -> None:
+    """Drop the cached local registry signing secret."""
+    global _AUTH_REGISTRY_KEY_CACHE
+    with _AUTH_REGISTRY_KEY_LOCK:
+        _AUTH_REGISTRY_KEY_CACHE = None
 
 
 def installation_key_path() -> Path:
@@ -38,11 +49,40 @@ def installation_key():
     return _generated_key(installation_key_path())
 
 
+def _key_signature(path: Path) -> tuple[str, int, int, int, int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (
+        os.path.abspath(path),
+        st.st_dev,
+        st.st_ino,
+        st.st_mtime_ns,
+        st.st_ctime_ns,
+        st.st_size,
+    )
+
+
 def auth_registry_key():
     """Use a stable installation key for digests stored in the shared registry."""
+    global _AUTH_REGISTRY_KEY_CACHE
     configured = os.getenv("AFTERWORD_SECRET_KEY", "").encode()
-    if configured: return configured
-    return _generated_key(Path(settings.db).with_name("secret.key"))
+    if configured:
+        return configured
+    path = Path(settings.db).with_name("secret.key")
+    with _AUTH_REGISTRY_KEY_LOCK:
+        signature = _key_signature(path)
+        if (
+            signature is not None
+            and _AUTH_REGISTRY_KEY_CACHE is not None
+            and _AUTH_REGISTRY_KEY_CACHE[0] == signature
+        ):
+            return _AUTH_REGISTRY_KEY_CACHE[1]
+        key = _generated_key(path)
+        signature = _key_signature(path)
+        _AUTH_REGISTRY_KEY_CACHE = (signature, key) if signature is not None else None
+        return key
 
 def _fernet(): return Fernet(installation_key())
 
