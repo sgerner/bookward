@@ -30,6 +30,7 @@
 	let theme = $state<SkeletonThemeName>(DEFAULT_THEME);
 	let mode = $state<ThemeMode>(DEFAULT_MODE);
 	let appearanceOpen = $state(false);
+	let headerRowEl = $state<HTMLDivElement | null>(null);
 
 	async function chooseTheme(nextTheme: SkeletonThemeName) {
 		try {
@@ -53,6 +54,51 @@
 		return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : duration;
 	}
 
+	$effect(() => {
+		if (typeof window === 'undefined' || !headerRowEl) return;
+		const panelEl = headerRowEl.closest<HTMLElement>('[role="dialog"]');
+		if (!panelEl) return;
+		const clearInlineBounds = () => {
+			panelEl.style.removeProperty('top');
+			panelEl.style.removeProperty('max-height');
+		};
+		if (!compact || !appearanceOpen) {
+			clearInlineBounds();
+			return;
+		}
+		const siteHeaderEl =
+			headerRowEl.closest('header') ??
+			document.querySelector<HTMLElement>('[data-sticky-shell] > header');
+		if (!siteHeaderEl) {
+			clearInlineBounds();
+			return;
+		}
+
+		const syncBounds = () => {
+			const headerPosition = getComputedStyle(siteHeaderEl).position;
+			if (headerPosition !== 'sticky' && headerPosition !== 'fixed') {
+				clearInlineBounds();
+				return;
+			}
+			const headerRect = siteHeaderEl.getBoundingClientRect();
+			const topOffset = Math.max(80, Math.ceil(Math.max(0, headerRect.bottom) + 12));
+			const availableHeight = Math.max(160, Math.floor(window.innerHeight - topOffset - 16));
+			panelEl.style.top = `${topOffset}px`;
+			panelEl.style.maxHeight = `min(42rem, ${availableHeight}px)`;
+		};
+
+		syncBounds();
+		const observer =
+			typeof ResizeObserver !== 'undefined' ? new ResizeObserver(syncBounds) : null;
+		observer?.observe(siteHeaderEl);
+		window.addEventListener('resize', syncBounds);
+		return () => {
+			observer?.disconnect();
+			window.removeEventListener('resize', syncBounds);
+			clearInlineBounds();
+		};
+	});
+
 	onMount(() => {
 		const sync = async () => {
 			const stored = getStoredPreferences();
@@ -75,21 +121,22 @@
 
 <PopoverDialog
 	bind:open={appearanceOpen}
-	triggerClass={compact ? 'btn min-h-11 w-full justify-start gap-3 preset-tonal-surface px-3' : 'btn-icon min-h-11 min-w-11 preset-tonal-surface'}
+	topLayer={compact}
+	triggerClass={compact ? 'btn btn-reflow min-h-11 w-full justify-start gap-3 preset-tonal-surface px-3 text-left' : 'btn-icon min-h-11 min-w-11 preset-tonal-surface'}
 	triggerLabel="Choose appearance"
 	triggerTitle="Choose appearance"
 	dialogLabelledby={headingId}
-	panelClass={`${compact ? 'fixed right-4 top-20' : 'absolute right-0 top-[calc(100%+0.75rem)]'} z-50 max-h-[min(42rem,calc(100dvh-2rem))] w-[min(24rem,calc(100vw-2rem))] overflow-y-auto preset-filled-surface-50-950 p-4 shadow-xl sm:p-5`}
+	panelClass={`${compact ? 'fixed right-4 top-4 left-auto bottom-auto z-[55] m-0 space-y-4 rounded-container border border-surface-200-800 sm:top-20 sm:max-h-[min(42rem,calc(100dvh-6rem))]' : 'absolute right-0 top-[calc(100%+0.75rem)] z-50'} max-h-[min(42rem,calc(100dvh-2rem))] min-w-0 w-[min(24rem,calc(100vw-2rem))] overflow-x-hidden overflow-y-auto preset-filled-surface-50-950 p-4 shadow-xl sm:p-5`}
 >
 	{#snippet trigger()}
 		<Palette size={18} strokeWidth={1.8} aria-hidden="true" />
 		{#if compact}<span>Appearance</span>{/if}
 	{/snippet}
 	{#snippet children({ close })}
-		<div class="flex items-start justify-between gap-4">
-			<div>
+		<div bind:this={headerRowEl} class="flex items-start justify-between gap-4">
+			<div class="min-w-0">
 				<h2 id={headingId} class="text-lg font-semibold">Appearance</h2>
-				<p class="mt-1 text-sm text-surface-700-300">Make Bookward feel like yours.</p>
+				<p class="text-reflow mt-1 text-sm text-surface-700-300">Make Bookward feel like yours.</p>
 			</div>
 			<button type="button" class="btn-icon btn-icon-sm min-h-9 min-w-9 shrink-0 preset-tonal-surface" aria-label="Close appearance picker" title="Close" onclick={() => close()}><X size={15} strokeWidth={1.8} aria-hidden="true" /></button>
 		</div>
@@ -102,7 +149,7 @@
 				getValue={(entry) => entry.id}
 				labelledBy="appearance-color-mode-legend"
 				columns={3}
-				class="grid grid-cols-3 gap-1.5 rounded-container border border-[var(--control-border)] preset-tonal-surface p-1.5"
+				class="grid grid-cols-[repeat(auto-fit,minmax(min(100%,5.5em),1fr))] gap-1.5 rounded-container border border-[var(--control-border)] preset-tonal-surface p-1.5"
 				onSelect={(entry) => chooseMode(entry.id)}
 			>
 				{#snippet item(entry, radio)}
@@ -112,12 +159,12 @@
 						aria-checked={radio.checked}
 						tabindex={radio.tabIndex}
 						data-active={radio.checked ? 'true' : 'false'}
-						class={`theme-picker-option btn min-h-11 flex-col gap-1 ${radio.checked ? 'preset-filled-primary-500' : 'preset-tonal-surface'}`}
+						class={`theme-picker-option btn btn-reflow min-h-11 flex-col gap-1 px-2 ${radio.checked ? 'preset-filled-primary-500' : 'preset-tonal-surface'}`}
 						title={entry.description}
 						onclick={radio.select}
 					>
 						<entry.icon size={15} strokeWidth={1.8} aria-hidden="true" />
-						<span class="text-xs">{entry.label}</span>
+						<span class="text-reflow text-xs">{entry.label}</span>
 					</button>
 				{/snippet}
 			</RadioGroup>
@@ -134,7 +181,7 @@
 				getValue={(entry) => entry.id}
 				labelledBy="appearance-theme-legend"
 				columns={2}
-				class="-mx-1.5 grid max-h-[min(22rem,45vh)] grid-cols-2 gap-2 overflow-y-auto p-1.5"
+				class={compact ? 'grid grid-cols-[repeat(auto-fit,minmax(min(100%,10em),1fr))] gap-2' : '-mx-1.5 grid grid-cols-[repeat(auto-fit,minmax(min(100%,10em),1fr))] gap-2 p-1.5'}
 				onSelect={(entry) => void chooseTheme(entry.id)}
 			>
 				{#snippet item(entry, radio)}
@@ -153,7 +200,7 @@
 							<span class="size-3" style={`background-color: ${THEME_SWATCHES[entry.id].secondary}`}></span>
 							<span class="size-3" style={`background-color: ${THEME_SWATCHES[entry.id].tertiary}`}></span>
 						</span>
-						<span class="min-w-0 flex-1 truncate">{entry.label}</span>
+						<span class="text-reflow flex-1">{entry.label}</span>
 						{#if radio.checked}<span in:scale={{ duration: motionDuration(150) }} out:fade={{ duration: motionDuration(90) }} class="ms-auto shrink-0"><Check size={15} strokeWidth={2.2} aria-hidden="true" /></span>{/if}
 					</button>
 				{/snippet}

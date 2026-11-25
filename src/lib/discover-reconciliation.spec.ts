@@ -428,12 +428,15 @@ describe("+page.svelte UI form wiring & multi-click Discover session flow", () =
       const snippet = source.slice(form.start, form.end);
       const usesLocalOnly =
         snippet.includes("use:enhance={setPendingLocal(") ||
-        snippet.includes("use:enhance={setPendingDigestBulk(");
+        snippet.includes("use:enhance={setPendingDigestBulk(") ||
+        (form.action === "?/markRead" &&
+          snippet.includes("use:enhance={submitMarkRead("));
       expect(
         usesLocalOnly,
-        `Expected ${form.action} form to use setPendingLocal/setPendingDigestBulk so update() does not re-run load:\n${snippet.slice(0, 220)}`,
+        `Expected ${form.action} form to use setPendingLocal/setPendingDigestBulk/submitMarkRead so update() does not re-run load:\n${snippet.slice(0, 220)}`,
       ).toBe(true);
     }
+    expect(source).toMatch(/function submitMarkRead[\s\S]*?localOnly:\s*true/);
 
     const importForms = forms.filter((form) => form.action === "?/importLibrar");
     expect(importForms.length).toBe(1);

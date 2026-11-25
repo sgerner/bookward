@@ -69,6 +69,18 @@ export function extractActionBookId(
   return fallbackId;
 }
 
+export function extractActionReadId(
+  result: ActionResultLike | undefined,
+): number | undefined {
+  if (result && result.type === "success" && result.data && typeof result.data === "object") {
+    const readId = (result.data as Record<string, unknown>).read_id;
+    if (typeof readId === "number" && Number.isInteger(readId) && readId > 0) {
+      return readId;
+    }
+  }
+  return undefined;
+}
+
 export function extractActionRestoredItems(
   result: ActionResultLike | undefined,
   fallbackIds: number[] = [],
@@ -422,6 +434,7 @@ export function createPendingSubmit(deps: {
   clearOptimisticNotification: () => void;
   announceActionError: (message: string) => void;
   onResetReadingHistory?: () => void;
+  onResetClientPagination?: () => void;
   onReloadFilteredLists?: () => void;
   onRefreshDiscoverIfOffView?: () => Promise<void>;
 }): SubmitFunction {
@@ -434,6 +447,7 @@ export function createPendingSubmit(deps: {
     clearOptimisticNotification,
     announceActionError,
     onResetReadingHistory,
+    onResetClientPagination,
     onReloadFilteredLists,
     onRefreshDiscoverIfOffView,
   } = deps;
@@ -473,6 +487,9 @@ export function createPendingSubmit(deps: {
         } else {
           await update({ reset: succeeded, navigate: false });
         }
+        if (succeeded && key === "sync") {
+          onResetClientPagination?.();
+        }
         if (
           succeeded &&
           (key.startsWith("read-") ||
@@ -492,7 +509,8 @@ export function createPendingSubmit(deps: {
             key === "csv-import" ||
             key === "goodreads-csv" ||
             key === "source" ||
-            key.startsWith("source-")
+            key.startsWith("source-") ||
+            key.startsWith("refresh-source-")
           ) {
             onReloadFilteredLists?.();
           }

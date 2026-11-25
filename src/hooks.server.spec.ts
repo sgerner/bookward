@@ -2,10 +2,15 @@ import { once } from 'node:events';
 import http from 'node:http';
 import { registerHooks } from 'node:module';
 import type { AddressInfo } from 'node:net';
+import { forwardedAddress } from '@sveltejs/adapter-server/runtime';
 import { isRedirect } from '@sveltejs/kit';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
-import { handle, isPublicApiPath, withSecurityHeaders } from './hooks.server';
-import { currentSessionToken } from '#lib/server/request-context.js';
+import { handle, init, isPublicApiPath, withSecurityHeaders } from './hooks.server';
+import {
+	currentClientIp,
+	currentSessionToken,
+	resetClientAddressFallbackWarning
+} from '#lib/server/request-context.js';
 import { actions as loginActions } from './routes/login/+page.server';
 import { attachOriginGuard, prepareRuntimeEnv } from '../server.js';
 
@@ -54,8 +59,10 @@ const adapterRespond = vi.fn<AdapterResponder>();
 adapterBridge.__bookwardHooksSpecRespond = (request) => adapterRespond(request);
 
 afterEach(() => {
+	resetClientAddressFallbackWarning();
 	vi.unstubAllGlobals();
 	vi.unstubAllEnvs();
+	vi.restoreAllMocks();
 	adapterRespond.mockReset();
 });
 
@@ -429,6 +436,308 @@ describe('authentication boundary', () => {
 		expect(sessionInRoute).toBe('valid-session');
 	});
 
+	it('returns both detail and message on 401, 403, 409, and 503 JSON responses', async () => {
+		const unauthResponse = await handle({
+			event: eventFor(new Request('http://afterword.test/api/recommendations')),
+			resolve: vi.fn()
+		} as never);
+		expect(unauthResponse.status).toBe(401);
+		const unauthPayload = await unauthResponse.json();
+		expect(unauthPayload.detail).toContain('Authentication required');
+		expect(unauthPayload.message).toBe(unauthPayload.detail);
+
+		const crossOriginResponse = await handle({
+			event: eventFor(
+				new Request('http://afterword.test/api/telemetry', {
+					method: 'POST',
+					headers: { origin: 'https://attacker.test', 'content-type': 'application/json' },
+					body: '{}'
+				}),
+				'valid-session'
+			),
+			resolve: vi.fn()
+		} as never);
+		expect(crossOriginResponse.status).toBe(403);
+		const crossOriginPayload = await crossOriginResponse.json();
+		expect(crossOriginPayload.message).toBe(crossOriginPayload.detail);
+
+		mockSessionLookup('alice-profile');
+		const conflictResponse = await handle({
+			event: eventFor(
+				new Request('http://afterword.test/api/recommendations', {
+					headers: { 'x-bookward-profile': 'bob-profile' }
+				}),
+				'valid-session'
+			),
+			resolve: vi.fn()
+		} as never);
+		expect(conflictResponse.status).toBe(409);
+		const conflictPayload = await conflictResponse.json();
+		expect(conflictPayload.detail).toContain('different profile');
+		expect(conflictPayload.message).toBe(conflictPayload.detail);
+
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+		const outageApiEvent = eventFor(new Request('http://afterword.test/api/recommendations'), 'valid-session');
+		const outageResponse = await handle({
+			event: outageApiEvent,
+			resolve: vi.fn()
+		} as never);
+		expect(outageResponse.status).toBe(503);
+		const outagePayload = await outageResponse.json();
+		expect(outagePayload.message).toBe(outagePayload.detail);
+		expect((outageApiEvent as { cookies: { delete: ReturnType<typeof vi.fn> } }).cookies.delete).not.toHaveBeenCalled();
+	});
+
+	it('retains bookward_session and passes locals.engineUnavailable on page loads during engine outages', async () => {
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+
+		for (const pathname of ['/', '/login', '/account', '/admin']) {
+			const event = eventFor(new Request(`http://afterword.test${pathname}`), 'valid-session') as {
+				locals: App.Locals;
+				cookies: { delete: ReturnType<typeof vi.fn> };
+			};
+			const resolve = vi.fn().mockResolvedValue(new Response('<main id="main-content"></main>', { status: 503 }));
+			const response = await handle({ event: event as never, resolve } as never);
+
+			expect(response.status).toBe(503);
+			expect(event.locals.engineUnavailable).toBe(true);
+			expect(event.cookies.delete).not.toHaveBeenCalled();
+			expect(resolve).toHaveBeenCalledTimes(1);
+		}
+	});
+
+	it('fails closed with HTTP 503 on mutations during engine outages without clearing the session cookie', async () => {
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+		const event = eventFor(
+			new Request('http://afterword.test/?/decide', {
+				method: 'POST',
+				headers: {
+					origin: 'http://afterword.test',
+					accept: 'application/json',
+					'x-sveltekit-action': 'true',
+					'content-type': 'application/x-www-form-urlencoded'
+				},
+				body: new URLSearchParams({ __profile_id: 'alice-profile', id: '7', status: 'saved' })
+			}),
+			'valid-session'
+		) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+		const resolve = vi.fn();
+
+		const response = await handle({ event: event as never, resolve } as never);
+		expect(response.status).toBe(503);
+		expect(resolve).not.toHaveBeenCalled();
+		expect(event.cookies.delete).not.toHaveBeenCalled();
+	});
+
+	it('renders HTML with <main> on unhydrated 409 form posts while keeping the session active', async () => {
+		mockSessionLookup('alice-profile');
+		const event = eventFor(
+			new Request('http://afterword.test/auth/logout', {
+				method: 'POST',
+				headers: {
+					origin: 'http://afterword.test',
+					accept: 'text/html,application/xhtml+xml',
+					'content-type': 'application/x-www-form-urlencoded'
+				},
+				body: new URLSearchParams({ __profile_id: 'stale-profile' })
+			}),
+			'valid-session'
+		) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+		const resolve = vi.fn();
+
+		const response = await handle({ event: event as never, resolve } as never);
+		const body = await response.text();
+
+		expect(response.status).toBe(409);
+		expect(response.headers.get('content-type')).toContain('text/html');
+		expect(body).toContain('<main id="main-content"');
+		expect(body).toContain('This page belongs to a different profile. Reload before continuing.');
+		expect(resolve).not.toHaveBeenCalled();
+		expect(event.cookies.delete).not.toHaveBeenCalled();
+	});
+
+	it('propagates verified client IPs to unauthenticated and authenticated handlers and survives missing proxy headers', async () => {
+		let loginClientIp: string | undefined;
+		const loginEvent = {
+			...(eventFor(new Request('http://afterword.test/login')) as Record<string, unknown>),
+			getClientAddress: () => '198.51.100.42'
+		};
+		const loginResponse = await handle({
+			event: loginEvent as never,
+			resolve: vi.fn(() => {
+				loginClientIp = currentClientIp();
+				return Promise.resolve(new Response('login'));
+			})
+		} as never);
+		expect(loginResponse.status).toBe(200);
+		expect(loginClientIp).toBe('198.51.100.42');
+
+		const fallbackWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+		let fallbackClientIp: string | undefined;
+		const localEventWithoutProxyHeader = {
+			...(eventFor(new Request('http://afterword.test/login')) as Record<string, unknown>),
+			getClientAddress: () => {
+				throw new Error('Address header was specified with ADDRESS_HEADER=x-forwarded-for but is absent from request');
+			},
+			platform: { req: { socket: { remoteAddress: '127.0.0.1' } } }
+		};
+		const fallbackResponse = await handle({
+			event: localEventWithoutProxyHeader as never,
+			resolve: vi.fn(() => {
+				fallbackClientIp = currentClientIp();
+				return Promise.resolve(new Response('ok'));
+			})
+		} as never);
+		expect(fallbackResponse.status).toBe(200);
+		expect(fallbackClientIp).toBe('127.0.0.1');
+		expect(fallbackWarnSpy).toHaveBeenCalledTimes(1);
+		expect(fallbackWarnSpy).toHaveBeenCalledWith(
+			expect.stringContaining('Configured ADDRESS_HEADER could not resolve a client IP')
+		);
+
+		// Subsequent missing-header requests still fall back cleanly without spamming logs.
+		const secondFallback = await handle({
+			event: localEventWithoutProxyHeader as never,
+			resolve: vi.fn(() => Promise.resolve(new Response('ok')))
+		} as never);
+		expect(secondFallback.status).toBe(200);
+		expect(fallbackWarnSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it('validates ADDRESS_HEADER / ENGINE_SERVICE_SECRET in init and resolves XFF_DEPTH hops accurately', async () => {
+		const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+		vi.stubEnv('ADDRESS_HEADER', 'x-forwarded-for');
+		vi.stubEnv('ENGINE_SERVICE_SECRET', '');
+		expect(() => init()).toThrow(/ENGINE_SERVICE_SECRET must be set/);
+
+		vi.stubEnv('ADDRESS_HEADER', '');
+		vi.stubEnv('ENGINE_SERVICE_SECRET', '');
+		init();
+		expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('ENGINE_SERVICE_SECRET is not set'));
+
+		warnSpy.mockClear();
+		vi.stubEnv('ADDRESS_HEADER', 'x-forwarded-for');
+		vi.stubEnv('ENGINE_SERVICE_SECRET', 'shared-proxy-secret');
+		vi.stubEnv('XFF_DEPTH', '1');
+		init();
+		expect(warnSpy).not.toHaveBeenCalled();
+
+		const runAdapterAddressCase = async (options: {
+			addressHeader: string;
+			xffDepth: number;
+			headers?: Record<string, string>;
+			socketIp: string;
+		}) => {
+			const reqHeaders = new Headers(options.headers);
+			const request = new Request('http://afterword.test/login', { headers: reqHeaders });
+			let resolvedIp: string | undefined;
+			const addressHeaderLower = options.addressHeader.toLowerCase();
+			await handle({
+				event: {
+					...(eventFor(request) as Record<string, unknown>),
+					platform: { req: { socket: { remoteAddress: options.socketIp } } },
+					getClientAddress: () => {
+						if (addressHeaderLower) {
+							return forwardedAddress({
+								header: addressHeaderLower,
+								value: reqHeaders.get(addressHeaderLower) ?? undefined,
+								depth: options.xffDepth,
+								envPrefix: ''
+							});
+						}
+						return options.socketIp;
+					}
+				} as never,
+				resolve: vi.fn(() => {
+					resolvedIp = currentClientIp();
+					return Promise.resolve(new Response('ok'));
+				})
+			} as never);
+			return resolvedIp;
+		};
+
+		// Unset ADDRESS_HEADER ignores spoofed X-Forwarded-For and uses the socket peer IP.
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: '',
+				xffDepth: 1,
+				headers: { 'x-forwarded-for': '203.0.113.9' },
+				socketIp: '172.18.0.5'
+			})
+		).resolves.toBe('172.18.0.5');
+
+		// XFF_DEPTH=1 picks the rightmost X-Forwarded-For entry (ignoring client-prepended spoofed IPs).
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: 'x-forwarded-for',
+				xffDepth: 1,
+				headers: { 'x-forwarded-for': '192.0.2.99, 198.51.100.42' },
+				socketIp: '172.18.0.5'
+			})
+		).resolves.toBe('198.51.100.42');
+
+		// XFF_DEPTH=2 picks the second-from-right entry behind two trusted proxy hops.
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: 'x-forwarded-for',
+				xffDepth: 2,
+				headers: { 'x-forwarded-for': '192.0.2.99, 198.51.100.42, 10.0.0.2' },
+				socketIp: '172.18.0.5'
+			})
+		).resolves.toBe('198.51.100.42');
+
+		// Single-value proxy header (e.g. cf-connecting-ip) returns the header value directly.
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: 'cf-connecting-ip',
+				xffDepth: 1,
+				headers: { 'cf-connecting-ip': '198.51.100.88' },
+				socketIp: '172.18.0.5'
+			})
+		).resolves.toBe('198.51.100.88');
+
+		// Missing configured ADDRESS_HEADER or XFF_DEPTH hop underflow logs once and falls back to socket remoteAddress.
+		resetClientAddressFallbackWarning();
+		warnSpy.mockClear();
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: 'x-forwarded-for',
+				xffDepth: 1,
+				headers: {},
+				socketIp: '127.0.0.1'
+			})
+		).resolves.toBe('127.0.0.1');
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+		expect(warnSpy).toHaveBeenCalledWith(
+			expect.stringContaining('Configured ADDRESS_HEADER could not resolve a client IP')
+		);
+
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: 'x-forwarded-for',
+				xffDepth: 3,
+				headers: { 'x-forwarded-for': '198.51.100.42' },
+				socketIp: '127.0.0.1'
+			})
+		).resolves.toBe('127.0.0.1');
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+
+		// Blank single-value header with ADDRESS_HEADER set also warns once and falls back to socket remoteAddress.
+		resetClientAddressFallbackWarning();
+		warnSpy.mockClear();
+		vi.stubEnv('ADDRESS_HEADER', 'cf-connecting-ip');
+		await expect(
+			runAdapterAddressCase({
+				addressHeader: 'cf-connecting-ip',
+				xffDepth: 1,
+				headers: { 'cf-connecting-ip': '   ' },
+				socketIp: '127.0.0.1'
+			})
+		).resolves.toBe('127.0.0.1');
+		expect(warnSpy).toHaveBeenCalledTimes(1);
+	});
+
 	it('parses multipart uploads once without cloning the request and reuses formData in actions', async () => {
 		mockSessionLookup();
 		const form = new FormData();
@@ -539,6 +848,168 @@ describe('authentication boundary', () => {
 		).rejects.toMatchObject({
 			status: 413,
 			body: { message: expect.stringContaining('10 MB') }
+		});
+	});
+
+	it('allows POST /auth/logout to clear bookward_session and redirect 303 during an engine outage', async () => {
+		vi.stubEnv('ORIGIN', 'http://afterword.test');
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed: ECONNREFUSED')));
+
+		const headerCases: Array<Record<string, string>> = [
+			{
+				origin: 'http://afterword.test',
+				accept: 'application/json',
+				'x-sveltekit-action': 'true',
+				'content-type': 'application/x-www-form-urlencoded'
+			},
+			{
+				origin: 'http://afterword.test',
+				accept: 'text/html,application/xhtml+xml',
+				'content-type': 'application/x-www-form-urlencoded'
+			}
+		];
+		for (const headers of headerCases) {
+			const event = eventFor(
+				new Request('http://afterword.test/auth/logout', {
+					method: 'POST',
+					headers,
+					body: new URLSearchParams({ __profile_id: 'alice-profile' })
+				}),
+				'valid-session'
+			) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+			const resolve = vi.fn();
+
+			await expect(handle({ event: event as never, resolve } as never)).rejects.toMatchObject({
+				status: 303,
+				location: '/login?manual=1'
+			});
+			expect(event.cookies.delete).toHaveBeenCalledWith('bookward_session', {
+				httpOnly: true,
+				secure: false,
+				sameSite: 'lax',
+				path: '/'
+			});
+			expect(resolve).not.toHaveBeenCalled();
+		}
+
+		vi.stubEnv('ORIGIN', '');
+		const httpsEvent = eventFor(
+			new Request('https://books.example.com/auth/logout', {
+				method: 'POST',
+				headers: {
+					origin: 'https://books.example.com',
+					accept: 'application/json',
+					'x-sveltekit-action': 'true',
+					'content-type': 'application/x-www-form-urlencoded'
+				},
+				body: new URLSearchParams({ __profile_id: 'alice-profile' })
+			}),
+			'valid-session'
+		) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+		await expect(handle({ event: httpsEvent as never, resolve: vi.fn() } as never)).rejects.toMatchObject({
+			status: 303,
+			location: '/login?manual=1'
+		});
+		expect(httpsEvent.cookies.delete).toHaveBeenCalledWith('bookward_session', {
+			httpOnly: true,
+			secure: true,
+			sameSite: 'lax',
+			path: '/'
+		});
+	});
+
+	it('returns JSON 401 for unauthenticated or expired enhanced SvelteKit actions outside /auth/* while redirecting native posts and /auth/logout', async () => {
+		vi.stubEnv('ORIGIN', 'http://afterword.test');
+
+		const noSessionAction = new Request('http://afterword.test/?/decide', {
+			method: 'POST',
+			headers: {
+				origin: 'http://afterword.test',
+				accept: 'application/json',
+				'x-sveltekit-action': 'true',
+				'content-type': 'application/x-www-form-urlencoded'
+			},
+			body: new URLSearchParams({ id: '7', status: 'saved' })
+		});
+		const noSessionResponse = await handle({
+			event: eventFor(noSessionAction),
+			resolve: vi.fn()
+		} as never);
+		expect(noSessionResponse.status).toBe(401);
+		await expect(noSessionResponse.json()).resolves.toEqual({
+			detail: 'Authentication required. Sign in again to continue.',
+			message: 'Authentication required. Sign in again to continue.'
+		});
+
+		vi.stubGlobal(
+			'fetch',
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ detail: 'Session expired' }), {
+					status: 401,
+					headers: { 'content-type': 'application/json' }
+				})
+			)
+		);
+		const expiredEvent = eventFor(
+			new Request('http://afterword.test/?/decide', {
+				method: 'POST',
+				headers: {
+					origin: 'http://afterword.test',
+					accept: 'application/json',
+					'x-sveltekit-action': 'true',
+					'content-type': 'application/x-www-form-urlencoded'
+				},
+				body: new URLSearchParams({ __profile_id: 'alice-profile', id: '7', status: 'saved' })
+			}),
+			'expired-session'
+		) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+		const expiredResponse = await handle({
+			event: expiredEvent as never,
+			resolve: vi.fn()
+		} as never);
+		expect(expiredResponse.status).toBe(401);
+		expect(expiredEvent.cookies.delete).toHaveBeenCalledWith('bookward_session', {
+			httpOnly: true,
+			secure: false,
+			sameSite: 'lax',
+			path: '/'
+		});
+		await expect(expiredResponse.json()).resolves.toEqual({
+			detail: 'Authentication required. Sign in again to continue.',
+			message: 'Authentication required. Sign in again to continue.'
+		});
+
+		const nativePost = new Request('http://afterword.test/?/decide', {
+			method: 'POST',
+			headers: {
+				origin: 'http://afterword.test',
+				accept: 'text/html,application/xhtml+xml',
+				'content-type': 'application/x-www-form-urlencoded'
+			},
+			body: new URLSearchParams({ id: '7', status: 'saved' })
+		});
+		await expect(
+			handle({ event: eventFor(nativePost), resolve: vi.fn() } as never)
+		).rejects.toMatchObject({
+			status: 303,
+			location: `/login?next=${encodeURIComponent('/?/decide')}`
+		});
+
+		const logoutWithoutSession = new Request('http://afterword.test/auth/logout', {
+			method: 'POST',
+			headers: {
+				origin: 'http://afterword.test',
+				accept: 'application/json',
+				'x-sveltekit-action': 'true',
+				'content-type': 'application/x-www-form-urlencoded'
+			},
+			body: new URLSearchParams()
+		});
+		await expect(
+			handle({ event: eventFor(logoutWithoutSession), resolve: vi.fn() } as never)
+		).rejects.toMatchObject({
+			status: 303,
+			location: '/login?manual=1'
 		});
 	});
 });
