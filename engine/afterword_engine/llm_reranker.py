@@ -16,7 +16,7 @@ import secrets
 import threading
 import time
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -31,7 +31,7 @@ from .identity import ReadIdentityIndex, book_identity, book_row_identity_match_
 from .security import (
     resolve_public_target,
     safe_error_message,
-    validate_service_url,
+    validate_public_url,
 )
 from .tenancy import current_profile_id, profile_database_path
 
@@ -51,6 +51,7 @@ LLM_CIRCUIT_COOLDOWN_SECONDS = 300.0
 
 _KEY_FINGERPRINT_SALT = secrets.token_bytes(16)
 _SAFE_LLM_PATH_RE = re.compile(r"^/[A-Za-z0-9._~:/=-]*$")
+_SAFE_LLM_QUERY_RE = re.compile(r"^[A-Za-z0-9._~:/?@!$&'()*+,;=%-]*$")
 _BARE_OPEN_LIBRARY_WORK = re.compile(r"^OL\d+W$", re.IGNORECASE)
 
 _DECISION_EVENT_TYPES = frozenset(
@@ -129,7 +130,18 @@ llm_allowed_hosts = llm_rerank_allowed_hosts
 
 def _normalize_chat_url(url: str) -> str:
     """Normalize an OpenAI-compatible base or chat-completions endpoint URL."""
-    cleaned = url.strip().rstrip("/")
+    cleaned = url.strip()
+    if not cleaned:
+        return ""
+    if "?" in cleaned or "#" in cleaned:
+        parts = urlsplit(cleaned)
+        norm_path = parts.path.rstrip("/")
+        if norm_path.endswith("/chat/completions"):
+            pass
+        elif norm_path.endswith(("/v1", "/openai")):
+            norm_path = f"{norm_path}/chat/completions"
+        return urlunsplit((parts.scheme, parts.netloc, norm_path, parts.query, ""))
+    cleaned = cleaned.rstrip("/")
     if not cleaned:
         return ""
     if cleaned.endswith("/chat/completions"):
@@ -149,7 +161,7 @@ def normalized_llm_origin(url: str) -> str:
     host = (parsed.hostname or "").lower().rstrip(".")
     if scheme not in {"http", "https"} or not host:
         return ""
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+    if parsed.username or parsed.password:
         return ""
     default_port = 443 if scheme == "https" else 80
     try:
@@ -162,13 +174,15 @@ def normalized_llm_origin(url: str) -> str:
 
 
 def canonical_llm_url(url: str) -> str:
-    """Return canonical scheme://host[:non_default_port]/normalized-chat-path."""
+    """Return canonical scheme://host[:non_default_port]/normalized-chat-path[?query]."""
     origin = normalized_llm_origin(url)
     if not origin:
         return ""
     normalized = _normalize_chat_url(str(url or "").strip())
-    path = urlparse(normalized).path or "/"
-    return f"{origin}{path}"
+    parsed = urlparse(normalized)
+    path = parsed.path or "/"
+    query_suffix = f"?{parsed.query}" if parsed.query else ""
+    return f"{origin}{path}{query_suffix}"
 
 
 def is_custom_llm_endpoint(api_url: str | None) -> bool:
@@ -220,10 +234,12 @@ def validate_llm_api_url(
     parsed = urlparse(cleaned)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("LLM API URL must use HTTP or HTTPS")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ValueError(
-            "LLM API URL cannot contain credentials, query parameters, or fragments"
-        )
+    if parsed.username or parsed.password:
+        raise ValueError("LLM API URL cannot contain credentials")
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("Invalid LLM API URL port") from exc
     requested_host = (parsed.hostname or "").lower().rstrip(".")
     if not requested_host:
         raise ValueError("LLM API URL must include a hostname")
@@ -232,11 +248,18 @@ def validate_llm_api_url(
         raise ValueError(
             "LLM API URL must use HTTPS when an API key is configured unless the host is allowlisted"
         )
-    validate_service_url(cleaned, hosts)
+    if requested_host not in hosts:
+        validate_public_url(
+            cleaned,
+            allow_http=(parsed.scheme == "http" and not has_api_key),
+        )
     normalized = _normalize_chat_url(cleaned)
-    norm_path = urlparse(normalized).path or "/"
+    norm_parsed = urlparse(normalized)
+    norm_path = norm_parsed.path or "/"
     if ".." in norm_path.split("/") or not _SAFE_LLM_PATH_RE.fullmatch(norm_path):
         raise ValueError("LLM API URL contains an invalid path")
+    if norm_parsed.query and not _SAFE_LLM_QUERY_RE.fullmatch(norm_parsed.query):
+        raise ValueError("LLM API URL contains invalid query characters")
     return normalized
 
 
@@ -272,6 +295,11 @@ def _prepare_llm_request_target(
     if ".." in raw_path.split("/") or not _SAFE_LLM_PATH_RE.fullmatch(raw_path):
         raise ValueError("LLM API URL contains an invalid path")
 
+    raw_query = parsed.query
+    if raw_query and not _SAFE_LLM_QUERY_RE.fullmatch(raw_query):
+        raise ValueError("LLM API URL contains invalid query characters")
+    query_suffix = f"?{raw_query}" if raw_query else ""
+
     requested_host = (parsed.hostname or "").lower().rstrip(".")
     if not requested_host:
         raise ValueError("LLM API URL must include a hostname")
@@ -287,7 +315,11 @@ def _prepare_llm_request_target(
         connect_host = (
             f"[{matched_allowed}]" if ":" in matched_allowed else matched_allowed
         )
-        return f"{scheme}://{connect_host}{port_suffix}{raw_path}", {}, None
+        return (
+            f"{scheme}://{connect_host}{port_suffix}{raw_path}{query_suffix}",
+            {},
+            None,
+        )
 
     if scheme == "http" and has_api_key:
         raise ValueError(
@@ -313,7 +345,7 @@ def _prepare_llm_request_target(
         else None
     )
     return (
-        f"{scheme}://{connect_host}{port_suffix}{raw_path}",
+        f"{scheme}://{connect_host}{port_suffix}{raw_path}{query_suffix}",
         {"Host": host_header},
         extensions,
     )
@@ -917,6 +949,7 @@ def apply_llm_rerank_adjustments(
     cap = max(0.0, float(max_delta))
     adjusted_count = 0
     seen_ids: set[int] = set()
+    validated_adjustments: list[dict[str, Any]] = []
     for entry in adjustments:
         if not isinstance(entry, dict):
             continue
@@ -943,6 +976,13 @@ def apply_llm_rerank_adjustments(
                 explanation = list(cand.get("explanation") or [])
                 explanation.append(f"LLM delta ({applied_delta:+.2f}): {reason}")
                 cand["explanation"] = explanation
+            validated_adjustments.append(
+                {
+                    "id": cid,
+                    "delta": clipped_delta,
+                    "reason": reason,
+                }
+            )
         except (KeyError, TypeError, ValueError, OverflowError):
             continue
 
@@ -951,6 +991,9 @@ def apply_llm_rerank_adjustments(
             "applied": True,
             "adjusted_count": 0,
             "mode": "adjustments",
+            "top_k": limit,
+            "max_delta": cap,
+            "adjustments": [],
         }
 
     reranked_head = [
@@ -964,6 +1007,9 @@ def apply_llm_rerank_adjustments(
         "applied": True,
         "adjusted_count": adjusted_count,
         "mode": "adjustments",
+        "top_k": limit,
+        "max_delta": cap,
+        "adjustments": validated_adjustments,
     }
 
 
@@ -1032,10 +1078,17 @@ def apply_llm_rerank_order(
             key=lambda pair: (-float(pair[1].get("score") or 0.0), pair[0]),
         )
     ]
+    validated_rankings = [
+        {"id": cid, **({"reason": reasons[cid]} if cid in reasons else {})}
+        for cid in ordered_ids
+    ]
     return reranked_head + tail, {
         "applied": True,
         "reranked_count": len(reasons) or n,
         "mode": "listwise",
+        "top_k": limit,
+        "max_delta": float(max_nudge),
+        "rankings": validated_rankings,
     }
 
 

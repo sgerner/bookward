@@ -193,3 +193,108 @@ def test_failed_lookup_timestamp_blocks_immediate_retry_but_allows_stale_retry(
     stale_retry = asyncio.run(ingestion.refresh_read_work_identities())
     assert stale_retry == {"checked": 1, "matched": 0, "lookup_failures": 1, "remaining": 0}
     assert attempts == [ISBN13, ISBN13]
+
+
+def test_refresh_read_work_identities_resolves_coauthor_collisions_without_suffix_false_hits(
+    database, monkeypatch
+):
+    secondary_isbn = "9780060853983"
+    suffix_isbn = "9780307474278"
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE url='builtin://upcoming'"
+        ).fetchone()[0]
+        con.execute("UPDATE candidates SET status='rejected'")
+        cand_multi = con.execute(
+            "INSERT INTO candidates(title,author,source_url,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,'recommended',?)",
+            (
+                "The Golden Compass",
+                "Philip Pullman & Chris Wormell",
+                "https://example.test/golden-compass",
+                source_id,
+                96,
+                "golden-compass-coauthor",
+            ),
+        ).lastrowid
+        cand_secondary = con.execute(
+            "INSERT INTO candidates(title,author,source_url,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,'recommended',?)",
+            (
+                "Agnes Nutter Prophecies",
+                "Terry Pratchett",
+                "https://example.test/agnes-nutter",
+                source_id,
+                94,
+                "agnes-nutter-secondary",
+            ),
+        ).lastrowid
+        cand_suffix = con.execute(
+            "INSERT INTO candidates(title,author,source_url,source_id,score,status,normalized_key) "
+            "VALUES(?,?,?,?,?,'recommended',?)",
+            (
+                "Unrelated Work",
+                "Walter M. Miller, Jr.",
+                "https://example.test/unrelated-jr",
+                source_id,
+                92,
+                "unrelated-jr",
+            ),
+        ).lastrowid
+        for cid, work_id in (
+            (cand_multi, "/works/OL111W"),
+            (cand_secondary, "/works/OL222W"),
+            (cand_suffix, "/works/OL333W"),
+        ):
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted',provider='openlibrary',"
+                "provider_id=?,work_id=? WHERE candidate_id=?",
+                (work_id, work_id, cid),
+            )
+        read_single = con.execute(
+            "INSERT INTO reads(title,author,isbn,source) VALUES(?,?,?,'goodreads_rss')",
+            ("Northern Lights", "Philip Pullman", ISBN13),
+        ).lastrowid
+        read_additional = con.execute(
+            "INSERT INTO reads(title,author,additional_authors,isbn,source) "
+            "VALUES(?,?,?,?,'goodreads_csv')",
+            ("Good Omens", "Neil Gaiman", "Terry Pratchett", secondary_isbn),
+        ).lastrowid
+        read_suffix = con.execute(
+            "INSERT INTO reads(title,author,isbn,source) VALUES(?,?,?,'goodreads_csv')",
+            ("Slaughterhouse-Five", "Kurt Vonnegut, Jr.", suffix_isbn),
+        ).lastrowid
+
+    looked_up = []
+
+    async def fake_edition_lookup(_client, isbn13):
+        looked_up.append(isbn13)
+        work_map = {
+            ISBN13: "/works/OL111W",
+            secondary_isbn: "/works/OL222W",
+        }
+        return httpx.Response(
+            200,
+            json={
+                "isbn_13": [isbn13],
+                "works": [{"key": work_map[isbn13]}],
+            },
+            request=httpx.Request("GET", f"https://openlibrary.org/isbn/{isbn13}.json"),
+        )
+
+    monkeypatch.setattr(ingestion, "_request_openlibrary_edition", fake_edition_lookup)
+    monkeypatch.setattr(covers, "OPEN_LIBRARY_MIN_REQUEST_INTERVAL_SECONDS", 0)
+
+    result = asyncio.run(ingestion.refresh_read_work_identities())
+    assert result == {"checked": 2, "matched": 2, "lookup_failures": 0, "remaining": 0}
+    assert set(looked_up) == {ISBN13, secondary_isbn}
+    assert suffix_isbn not in looked_up
+    assert row("SELECT openlibrary_work_id FROM reads WHERE id=?", (read_single,)) == {
+        "openlibrary_work_id": "/works/OL111W"
+    }
+    assert row("SELECT openlibrary_work_id FROM reads WHERE id=?", (read_additional,)) == {
+        "openlibrary_work_id": "/works/OL222W"
+    }
+    assert row("SELECT openlibrary_work_id FROM reads WHERE id=?", (read_suffix,)) == {
+        "openlibrary_work_id": ""
+    }

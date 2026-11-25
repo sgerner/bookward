@@ -3076,3 +3076,158 @@ def test_mode_persistence_and_blank_url_credential_hygiene(
         )
     assert yielded_probe_chunks == 2
     assert closed_probe_streams == 1
+
+
+def test_query_urls_and_cached_slate_decision_evidence_replay_zero_drift(
+    tmp_path, monkeypatch
+) -> None:
+    import socket
+    import numpy as np
+    import pytest
+    import afterword_engine.llm_reranker as reranker_module
+    from afterword_engine.config import settings
+    from afterword_engine.database import connect, initialize, transaction
+    from afterword_engine.decision_evidence import (
+        load_decision_evidence,
+        replay_decision_evidence,
+    )
+    from afterword_engine.main import tracked_recommendations
+    from afterword_engine.secrets import seal
+
+    db_path = tmp_path / "cached-replay.db"
+    monkeypatch.setattr(settings, "db", str(db_path))
+    monkeypatch.setattr(settings, "exploration_enabled", False)
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "")
+    initialize(seed_demo=False)
+    reranker_module.clear_llm_rerank_state()
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))
+        ],
+    )
+
+    azure_url = "https://llm.example:8443/openai/deployments/gpt4/chat/completions?api-version=2024-08-01#frag"
+    assert (
+        reranker_module.validate_llm_api_url(azure_url)
+        == "https://llm.example:8443/openai/deployments/gpt4/chat/completions?api-version=2024-08-01"
+    )
+    pinned_url, host_hdr, _ = reranker_module._prepare_llm_request_target(azure_url)
+    assert (
+        pinned_url
+        == "https://93.184.216.34:8443/openai/deployments/gpt4/chat/completions?api-version=2024-08-01"
+    )
+    assert host_hdr == {"Host": "llm.example:8443"}
+    assert reranker_module.canonical_llm_url(azure_url) != reranker_module.canonical_llm_url(
+        "https://llm.example:8443/openai/deployments/gpt4/chat/completions?api-version=2025-01-01"
+    )
+    with pytest.raises(ValueError, match="credentials"):
+        reranker_module.validate_llm_api_url(
+            "https://user:secret@llm.example/v1/chat/completions"
+        )
+
+    with transaction() as con:
+        source_id = con.execute("SELECT id FROM sources WHERE is_default=1 LIMIT 1").fetchone()[0]
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,source) VALUES(?,?,?,?,?)",
+            ("Anchor Read", "Anchor Author", 5.0, "2026-10-01", "manual"),
+        )
+        c1 = int(
+            con.execute(
+                "INSERT INTO candidates(title,author,description,genres,score,status,source_id,normalized_key) "
+                "VALUES(?,?,?,?,?,'recommended',?,?)",
+                ("First Book", "Author A", "Desc A", '["Fiction"]', 82.0, source_id, "first-book-author-a"),
+            ).lastrowid
+        )
+        c2 = int(
+            con.execute(
+                "INSERT INTO candidates(title,author,description,genres,score,status,source_id,normalized_key) "
+                "VALUES(?,?,?,?,?,'recommended',?,?)",
+                ("Second Book", "Author B", "Desc B", '["Fiction"]', 81.2, source_id, "second-book-author-b"),
+            ).lastrowid
+        )
+        for cid in (c1, c2):
+            con.execute(
+                "INSERT INTO candidate_quality(candidate_id,quality_status,quality_score,metadata_confidence) "
+                "VALUES(?,'accepted',0.85,0.8) "
+                "ON CONFLICT(candidate_id) DO UPDATE SET quality_status='accepted',quality_score=0.85,metadata_confidence=0.8",
+                (cid,),
+            )
+        con.executemany(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret",
+            [
+                ("llm_rerank_enabled", "1", 0),
+                ("llm_rerank_provider", "azure", 0),
+                ("llm_rerank_api_url", azure_url, 0),
+                ("llm_rerank_api_key", seal("sk-azure-secret"), 1),
+                ("llm_rerank_model", "gpt-4o-mini", 0),
+            ],
+        )
+
+    http_calls = 0
+
+    class LiveOnceClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            nonlocal http_calls
+            assert stream is True
+            assert "api-version=2024-08-01" in request["url"]
+            assert "#frag" not in request["url"]
+            http_calls += 1
+
+            class Resp:
+                status_code = 200
+                headers = {"content-type": "application/json"}
+
+                def raise_for_status(self) -> None:
+                    return None
+
+                def iter_bytes(self):
+                    body = {
+                        "adjustments": [
+                            {"id": c2, "delta": 1.1, "reason": "Strong reader match"}
+                        ]
+                    }
+                    payload = {"choices": [{"message": {"content": json.dumps(body)}}]}
+                    yield json.dumps(payload).encode("utf-8")
+
+                def close(self) -> None:
+                    return None
+
+            return Resp()
+
+    monkeypatch.setattr(reranker_module.httpx, "Client", LiveOnceClient)
+
+    served_live, run_live = tracked_recommendations(status="recommended", limit=10, offset=0)
+    served_cached, run_cached = tracked_recommendations(status="recommended", limit=10, offset=0)
+    assert http_calls == 1
+    assert [item["id"] for item in served_live] == [c2, c1]
+    assert [item["id"] for item in served_cached] == [c2, c1]
+
+    with connect() as con:
+        rec_live = load_decision_evidence(con, run_live)
+        rec_cached = load_decision_evidence(con, run_cached)
+
+    assert rec_cached["decision"]["policy"]["ranking"]["llm_rerank"]["cached"] is True
+    assert "adjustments" not in rec_cached["decision"]["policy"]["ranking"]["llm_rerank"]
+    assert len(rec_cached["decision"]["stage_inputs"]["llm_rerank"]["adjustments"]) == 1
+
+    for rec in (rec_live, rec_cached):
+        replayed = replay_decision_evidence(rec)
+        assert replayed["verification"]["matches_archived"] is True
+        assert replayed["verification"]["max_score_drift"] == 0.0
+        assert [item["id"] for item in replayed["pools"]["served"]] == [c2, c1]

@@ -33,6 +33,7 @@ from .database import (
     normalize_key,
     persist_metadata_field_provenance,
     private_setting,
+    purge_demo_reads,
     recompute_candidate_sources,
     row,
     rows,
@@ -41,9 +42,11 @@ from .database import (
 )
 from .identity import (
     book_author_identity_key,
+    book_author_identity_keys,
     book_catalog_title_identity_key,
     book_identity_match_keys,
     book_openlibrary_work_id,
+    book_row_author_identity_keys,
     book_row_identity_match_keys,
     read_metadata_identity_hash,
 )
@@ -887,6 +890,7 @@ def import_csv(content: bytes) -> dict[str, int | str]:
             title = str(source_row.get("Title") or "").strip()[:500]
             if source == "storygraph_csv":
                 author = _storygraph_primary_author(source_row.get("Authors"))
+                additional_authors = ""
                 shelf = str(source_row.get("Read Status") or "").strip().lower()
                 isbn = _storygraph_isbn(source_row.get("ISBN/UID"))
                 rating_raw = str(source_row.get("Star Rating") or "").strip()
@@ -896,6 +900,7 @@ def import_csv(content: bytes) -> dict[str, int | str]:
                 )
             else:
                 author = str(source_row.get("Author") or "").strip()[:300]
+                additional_authors = str(source_row.get("Additional Authors") or "").strip()[:500]
                 shelf = str(source_row.get("Exclusive Shelf") or "").strip().lower()
                 isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
                 rating_raw = str(source_row.get("My Rating") or "").strip()
@@ -907,6 +912,7 @@ def import_csv(content: bytes) -> dict[str, int | str]:
                     shelf,
                     title,
                     author,
+                    additional_authors,
                     isbn,
                     _read_date_value(source_row.get("Date Added")),
                 )
@@ -922,6 +928,7 @@ def import_csv(content: bytes) -> dict[str, int | str]:
                 values = (
                     title,
                     author,
+                    additional_authors,
                     rating,
                     read_at,
                     isbn,
@@ -935,26 +942,37 @@ def import_csv(content: bytes) -> dict[str, int | str]:
         raise ValueError("CSV is malformed") from exc
     from .learning import attribute_read_outcomes
     with transaction() as con:
+        if count > 0:
+            purge_demo_reads(con)
         for kind, values in batches:
             if kind == "shelf":
                 con.executemany(
-                    "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
-                    "VALUES(?, ?, ?, ?, ?) "
+                    "INSERT INTO goodreads_shelf_items("
+                    "shelf, title, author, additional_authors, isbn, added_at"
+                    ") VALUES(?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(shelf, title, author) DO UPDATE SET "
+                    "additional_authors=COALESCE(NULLIF(excluded.additional_authors, ''), "
+                    "goodreads_shelf_items.additional_authors), "
                     "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
                     "added_at=COALESCE(excluded.added_at, goodreads_shelf_items.added_at), "
                     "updated_at=CURRENT_TIMESTAMP",
                     values,
                 )
                 continue
+            # Shelf-to-read promotion intentionally preserves prior scoring batches
+            # and serving runs so `attribute_read_outcomes()` can link this completed
+            # read to preceding impressions while the book remains in `reads`.
             con.executemany(
                 "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
                 ((item[0], item[1]) for item in values),
             )
             con.executemany(
-                "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
-                "VALUES(?,?,?,?,?,?) "
+                "INSERT INTO reads("
+                "title,author,additional_authors,rating,read_at,isbn,source"
+                ") VALUES(?,?,?,?,?,?,?) "
                 "ON CONFLICT(title,author) DO UPDATE SET "
+                "additional_authors=COALESCE(NULLIF(excluded.additional_authors, ''), "
+                "reads.additional_authors),"
                 "rating=excluded.rating,read_at=COALESCE(excluded.read_at,reads.read_at),"
                 "openlibrary_work_id=CASE WHEN excluded.isbn IS NOT NULL "
                 "AND excluded.isbn IS NOT reads.isbn THEN '' ELSE reads.openlibrary_work_id END,"
@@ -1127,12 +1145,14 @@ async def refresh_read_work_identities(
     for candidate in candidates:
         if not book_openlibrary_work_id(candidate):
             continue
-        author_key = book_author_identity_key(candidate.get("author"))
-        if not author_key:
+        author_keys = book_row_author_identity_keys(candidate)
+        if not author_keys:
             continue
-        candidates_by_author.setdefault(author_key, []).append(
-            (candidate, book_row_identity_match_keys(candidate))
-        )
+        candidate_keys = book_row_identity_match_keys(candidate)
+        for author_key in author_keys:
+            candidates_by_author.setdefault(author_key, []).append(
+                (candidate, candidate_keys)
+            )
 
     now = datetime.now(timezone.utc)
     retry_before = now - timedelta(days=READ_WORK_IDENTITY_RETRY_DAYS)
@@ -1153,8 +1173,17 @@ async def refresh_read_work_identities(
             if attempted > retry_before:
                 continue
 
-        author_key = book_author_identity_key(read.get("author"))
-        author_candidates = candidates_by_author.get(author_key, [])
+        read_author_keys = book_row_author_identity_keys(read)
+        if not read_author_keys:
+            continue
+        seen_candidate_ids: set[int] = set()
+        author_candidates: list[tuple[dict, set]] = []
+        for author_key in read_author_keys:
+            for candidate, candidate_keys in candidates_by_author.get(author_key, ()):
+                candidate_id = int(candidate["id"])
+                if candidate_id not in seen_candidate_ids:
+                    seen_candidate_ids.add(candidate_id)
+                    author_candidates.append((candidate, candidate_keys))
         if not author_candidates:
             continue
         read_keys = book_row_identity_match_keys(read)
@@ -1394,7 +1423,7 @@ def _verified_read_metadata(metadata, read):
     else:
         wanted13, wanted10 = isbn_parts(read.get("isbn"))
         read_title = book_catalog_title_identity_key(read.get("title", ""))
-        read_author = book_author_identity_key(read.get("author", ""))
+        read_authors = book_row_author_identity_keys(read)
         matched_isbn_traces = [
             trace for trace in traces
             if isinstance(trace, dict)
@@ -1426,8 +1455,8 @@ def _verified_read_metadata(metadata, read):
             catalog_authors = source_payload.get("authors", [])
             if not isinstance(catalog_authors, (list, tuple)):
                 catalog_authors = [catalog_authors]
-            author_matches = any(
-                book_author_identity_key(author) == read_author
+            author_matches = bool(read_authors) and any(
+                bool(read_authors & book_author_identity_keys(author))
                 for author in catalog_authors
                 if author
             )
@@ -2304,12 +2333,29 @@ def _apply_goodreads_shelves(
     shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
 ) -> dict[str, int]:
     imported: dict[str, int] = {}
+    updated_shelves: list[str] = []
     for shelf in shelves:
-        shelf_rows = fetched_shelves.get(shelf)
-        if shelf_rows is None:
+        if fetched_shelves.get(shelf) is None:
             imported[shelf] = 0
-            continue
-        with transaction() as con:
+        else:
+            updated_shelves.append(shelf)
+    if not updated_shelves:
+        return imported
+
+    from .identity import book_row_identity_match_keys
+
+    with transaction() as con:
+        shelf_marks = ",".join("?" for _ in updated_shelves)
+        previous_rows = [
+            dict(row)
+            for row in con.execute(
+                "SELECT shelf, title, author, isbn, openlibrary_work_id "
+                f"FROM goodreads_shelf_items WHERE shelf IN ({shelf_marks})",
+                updated_shelves,
+            ).fetchall()
+        ]
+        for shelf in updated_shelves:
+            shelf_rows = fetched_shelves[shelf] or []
             con.execute("DELETE FROM goodreads_shelf_items WHERE shelf=?", (shelf,))
             con.executemany(
                 "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
@@ -2321,6 +2367,38 @@ def _apply_goodreads_shelves(
                 shelf_rows,
             )
             imported[shelf] = len(shelf_rows)
+
+        if previous_rows:
+            remaining_keys: set[tuple[str, ...]] = set()
+            for row in con.execute(
+                "SELECT shelf, title, author, isbn, openlibrary_work_id "
+                "FROM goodreads_shelf_items"
+            ).fetchall():
+                remaining_keys.update(book_row_identity_match_keys(dict(row)))
+            removed_rows = [
+                row
+                for row in previous_rows
+                if not set(book_row_identity_match_keys(row)).issubset(remaining_keys)
+            ]
+            if removed_rows:
+                read_keys: set[tuple[str, ...]] = set()
+                for row in con.execute(
+                    "SELECT title, author, isbn, openlibrary_work_id FROM reads"
+                ).fetchall():
+                    read_keys.update(book_row_identity_match_keys(dict(row)))
+                # Intentional: books promoted from shelves into `reads` remain part
+                # of the user's library and retain prior batches/runs so read-outcome
+                # attribution and score provenance stay intact (erased via `read_ids`
+                # if the read row itself is later purged).
+                deleted_shelf_rows = [
+                    row
+                    for row in removed_rows
+                    if not (set(book_row_identity_match_keys(row)) & read_keys)
+                ]
+                if deleted_shelf_rows:
+                    from .decision_evidence import purge_recommendation_evidence
+
+                    purge_recommendation_evidence(con, shelf_items=deleted_shelf_rows)
     return imported
 
 
@@ -2358,6 +2436,11 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
             isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip('="')[:32] or None
             read_rows.append((title, author, rating, read_at, isbn))
             count += 1
+        if count > 0:
+            purge_demo_reads(con)
+        # Shelf-to-read promotion intentionally preserves prior scoring batches and
+        # serving runs so `attribute_read_outcomes()` can attach outcomes to earlier
+        # exposures while the book remains in `reads`.
         con.executemany(
             "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
             ((item[0], item[1]) for item in read_rows),
