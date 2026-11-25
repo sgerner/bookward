@@ -2647,3 +2647,91 @@ def test_backup_scheduler_loop_runs_due_checks_off_event_loop_thread(
     assert observed_threads["profile_due"] and loop_thread_id not in observed_threads["profile_due"]
     assert alice["profile_id"] not in checked_profiles
     assert set(checked_profiles) == {"legacy", bob["profile_id"]}
+
+
+def test_scheduler_preserves_disabled_profile_snapshots_on_missing_data_volume_and_warns_during_auth_scrub(
+    database, monkeypatch, caplog
+):
+    import uuid
+    from afterword_engine.tenancy import profile_scope
+
+    profiles.initialize_auth()
+    profiles.create_account(
+        "owner-dr", f"owner-dr-{uuid.uuid4().hex}", role="admin"
+    )
+    disabled_reader = profiles.create_account(
+        "disabled-dr", f"disabled-dr-{uuid.uuid4().hex}"
+    )
+    disabled_pid = disabled_reader["profile_id"]
+    with profile_scope(disabled_pid):
+        initialize(seed_demo=False)
+
+    monkeypatch.setattr(settings, "backup_retention_count", 1)
+    monkeypatch.setattr(settings, "backup_interval_hours", 24)
+    monkeypatch.setattr(backups, "BACKUP_INITIAL_DELAY_SECONDS", 0)
+    monkeypatch.setattr(backups, "BACKUP_POLL_SECONDS", 0.05)
+
+    with profile_scope(disabled_pid):
+        snap = backups.create_backup()
+        bdir = backups.backup_directory()
+        surviving_id = "bookward-20260101T000000Z-aaaa1111"
+        (bdir / f"{snap['id']}.sqlite3").rename(bdir / f"{surviving_id}.sqlite3")
+        (bdir / f"{snap['id']}.secret.key").rename(bdir / f"{surviving_id}.secret.key")
+
+    profiles.set_account_status(disabled_reader["id"], "disabled")
+    auth_snap = backups.create_auth_backup()
+
+    # Simulate disaster recovery: wipe /data profile DBs and restore auth.sqlite3
+    # while leaving disabled_pid's SQLite file missing (since lifespan only boots active profiles).
+    disabled_db = backups.profile_database_path(disabled_pid)
+    disabled_db.unlink()
+    backups.restore_auth_backup(auth_snap["id"])
+    assert not disabled_db.exists()
+
+    # Also simulate an active auth recovery hold alongside a pending auth-backup scrub.
+    with profiles.auth_connect() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO auth_meta(key,value) VALUES(?,?)",
+            (backups.AUTH_BACKUP_HOLD_KEY, "2026-01-10T00:00:00+00:00"),
+        )
+    backups.record_pending_auth_backup_scrub(
+        uuid.uuid4().hex, uuid.uuid4().hex, "deleteduser"
+    )
+
+    monkeypatch.setattr(
+        backups,
+        "_utc_now",
+        lambda: datetime(2026, 1, 10, 0, 0, tzinfo=timezone.utc),
+    )
+    caplog.set_level("WARNING", logger="afterword_engine.backups")
+
+    async def run_once():
+        stop = asyncio.Event()
+
+        async def stop_soon():
+            await asyncio.sleep(0.03)
+            stop.set()
+
+        await asyncio.gather(stop_soon(), backups.backup_scheduler_loop(stop))
+
+    asyncio.run(run_once())
+
+    # Surviving snapshot and sidecar for disabled profile must NOT be pruned while DB is missing.
+    assert (bdir / f"{surviving_id}.sqlite3").is_file()
+    assert (bdir / f"{surviving_id}.secret.key").is_file()
+    assert any(
+        "Scheduled identity-registry backup skipped while recovery hold is active"
+        in record.message
+        for record in caplog.records
+    )
+    assert any(
+        f"Scheduled Bookward backup pruning skipped for disabled profile {disabled_pid}"
+        in record.message
+        for record in caplog.records
+    )
+
+    # Once the disabled profile is re-enabled and initialized, it enters recovery hold automatically.
+    with profile_scope(disabled_pid):
+        initialize(seed_demo=False)
+        assert backups.recovery_hold_active() is True
+

@@ -568,7 +568,7 @@ def maintenance_is_due(now: datetime | None = None) -> bool:
             last_run = datetime.fromisoformat(str(row["value"]).replace("Z", "+00:00"))
             if last_run.tzinfo is None:
                 last_run = last_run.replace(tzinfo=timezone.utc)
-    except (sqlite3.Error, ValueError):
+    except (sqlite3.Error, OSError, ValueError):
         LOGGER.warning(
             "Could not inspect storage maintenance schedule; failing closed",
             exc_info=True,
@@ -2534,9 +2534,10 @@ def restore_backup(backup_id: str) -> dict:
 
 
 def _run_scheduled_auth_backup() -> dict | None:
+    scrubbed_pending = False
     if has_pending_auth_backup_scrubs():
         retry_pending_auth_backup_scrubs()
-        return None
+        scrubbed_pending = True
     if backup_interval_hours() <= 0:
         return None
     auth_hold = _auth_recovery_hold_value()
@@ -2550,6 +2551,8 @@ def _run_scheduled_auth_backup() -> dict | None:
         LOGGER.warning(
             "Scheduled identity-registry backup skipped because recovery hold status could not be read"
         )
+        return None
+    if scrubbed_pending:
         return None
     if auth_backup_is_due():
         return create_auth_backup()
@@ -2646,7 +2649,27 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
                         continue
 
                     def _prune_disabled():
-                        with database_lock(profile_database_path()):
+                        db_path = profile_database_path()
+                        with database_lock(db_path):
+                            try:
+                                db_missing = (
+                                    not db_path.is_file() or db_path.stat().st_size == 0
+                                )
+                            except OSError:
+                                LOGGER.warning(
+                                    "Scheduled Bookward backup pruning skipped for disabled profile %s "
+                                    "because profile database status could not be read",
+                                    profile_id,
+                                )
+                                return
+                            if db_missing:
+                                if list_backups():
+                                    LOGGER.warning(
+                                        "Scheduled Bookward backup pruning skipped for disabled profile %s "
+                                        "while profile database is missing and surviving snapshots exist",
+                                        profile_id,
+                                    )
+                                return
                             if recovery_hold_active():
                                 return
                             _prune_backups(expire_before=expire_before)
