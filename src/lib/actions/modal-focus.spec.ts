@@ -182,6 +182,41 @@ describe("modalFocus", () => {
     expect(fakeDocument.body.style.overflow).toBe("auto");
   });
 
+  it("traps document-level Tab presses when active focus falls outside the dialog", () => {
+    const outside = new FakeElement();
+    const { dialog, initial, secondary } = createDialogWithControls();
+    const handle = modalFocus(dialog as unknown as HTMLElement);
+
+    fakeDocument.activeElement = outside;
+    const forwardFromOutside = {
+      key: "Tab",
+      shiftKey: false,
+      target: outside,
+      preventDefault: vi.fn(),
+    };
+    for (const listener of fakeDocument.listeners.get("keydown") ?? []) {
+      listener(forwardFromOutside as unknown as Event);
+    }
+    expect(forwardFromOutside.preventDefault).toHaveBeenCalledTimes(1);
+    expect(fakeDocument.activeElement).toBe(initial);
+
+    fakeDocument.activeElement = outside;
+    const backwardFromOutside = {
+      key: "Tab",
+      shiftKey: true,
+      target: outside,
+      preventDefault: vi.fn(),
+    };
+    for (const listener of fakeDocument.listeners.get("keydown") ?? []) {
+      listener(backwardFromOutside as unknown as Event);
+    }
+    expect(backwardFromOutside.preventDefault).toHaveBeenCalledTimes(1);
+    expect(fakeDocument.activeElement).toBe(secondary);
+
+    handle.destroy();
+    expect(fakeDocument.listeners.get("keydown")?.size ?? 0).toBe(0);
+  });
+
   it("restores connected HTMLElement opener on destroy when no fallback is provided even if isFocusableTarget fails", () => {
     const trigger = new FakeElement();
     trigger.rectCount = 0;

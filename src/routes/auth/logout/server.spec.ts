@@ -40,4 +40,23 @@ describe('logout route', () => {
 			path: '/',
 		});
 	});
+
+	it('clears bookward_session and redirects 303 even when upstream /auth/logout fails', async () => {
+		engine.mockRejectedValueOnce(new Error("Bookward's recommendation engine is unavailable."));
+		const cookies = { delete: vi.fn() };
+
+		await expect(
+			POST({ cookies, url: new URL('https://books.example.com/auth/logout') } as never)
+		).rejects.toMatchObject({
+			status: 303,
+			location: '/login?manual=1',
+		});
+		expect(engine).toHaveBeenCalledTimes(1);
+		expect(cookies.delete).toHaveBeenCalledWith('bookward_session', {
+			httpOnly: true,
+			secure: true,
+			sameSite: 'lax',
+			path: '/',
+		});
+	});
 });
