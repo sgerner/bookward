@@ -1512,7 +1512,9 @@ def archive_recommendation_event(
         + len(source.encode("utf-8"))
         + len(occurred_at.encode("utf-8"))
     )
-    if not _budget_allows(connection, estimated_bytes, exclude_run_ids=(run_id,)):
+    if not _budget_allows(
+        connection, estimated_bytes, exclude_run_ids=(run_id,) if run_id else ()
+    ):
         LOGGER.warning("Recommendation evidence storage quota reached for events")
         return None
     revision = int(

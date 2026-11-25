@@ -215,6 +215,23 @@ def test_non_ranking_recommendation_statuses_skip_run_creation_and_preserve_attr
             assert browse.status_code == 200
             assert all(item["recommendation_run_id"] == "" for item in browse.json())
 
+        with connect() as con:
+            assert con.execute("SELECT COUNT(*) FROM recommendation_runs").fetchone()[0] == 1
+            saved_outcomes = con.execute(
+                """
+                SELECT i.run_id, o.label, o.label_kind
+                FROM recommendation_outcomes o
+                JOIN recommendation_impressions i ON i.id = o.impression_id
+                WHERE i.candidate_id = ?
+                ORDER BY o.id ASC
+                """,
+                (rec_id,),
+            ).fetchall()
+            assert [
+                (r["run_id"], float(r["label"]), r["label_kind"])
+                for r in saved_outcomes
+            ] == [(discover_run_id, 1.0, "explicit_feedback")]
+
         restore_resp = client.post(
             f"/api/recommendations/{rec_id}/feedback",
             json={"action": "restore"},
@@ -240,9 +257,31 @@ def test_non_ranking_recommendation_statuses_skip_run_creation_and_preserve_attr
                 (rec_id,),
             ).fetchall()
             assert [(r["run_id"], float(r["label"]), r["label_kind"]) for r in outcomes] == [
+                (discover_run_id, 1.0, "rating_positive"),
+            ]
+            archived_outcomes = con.execute(
+                """
+                SELECT run_id, label, label_kind
+                FROM recommendation_evidence_outcomes
+                WHERE candidate_id = ?
+                ORDER BY id ASC
+                """,
+                (rec_id,),
+            ).fetchall()
+            assert [
+                (r["run_id"], float(r["label"]), r["label_kind"])
+                for r in archived_outcomes
+            ] == [
                 (discover_run_id, 1.0, "explicit_feedback"),
                 (discover_run_id, 1.0, "rating_positive"),
             ]
+            replay = load_decision_evidence(con, discover_run_id)
+            assert replay is not None
+            assert [
+                (float(item["label"]), item["label_kind"])
+                for item in replay["outcomes"]
+                if int(item["candidate_id"]) == rec_id
+            ] == [(1.0, "rating_positive")]
 
 
 def test_impression_fatigue_query_uses_partial_visible_index(database):
