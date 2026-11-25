@@ -34,8 +34,14 @@ def test_third_author_repeat_uses_close_candidate_with_bounded_displacement():
     assert diagnostics["author_repeat_swaps"] == 1
     assert diagnostics["similarity_swaps"] == 0
     assert diagnostics["max_displacement"] == 3
+    assert ranked[2]["explanation"] == [
+        "Moved up for variety so one author does not crowd your top picks"
+    ]
+    assert "explanation" not in ranked[0]
+    assert "explanation" not in ranked[3]
     # The input and its tail are never mutated or reordered.
     assert [item["id"] for item in recommendations] == [1, 2, 3, 4, 5]
+    assert all("explanation" not in item for item in recommendations)
 
 
 def test_low_scoring_alternative_does_not_suppress_niche_author_depth():
@@ -73,6 +79,27 @@ def test_near_duplicate_swaps_only_when_score_floor_and_local_bound_allow_it():
     )
     assert [item["id"] for item in ranked] == [1, 3, 2, 4, 5]
     assert diagnostics["similarity_swaps"] == 1
+    assert ranked[1]["explanation"] == [
+        "Moved up for variety alongside closely related books in your top picks"
+    ]
+    assert "explanation" not in ranked[2]
+
+    # Cosine ~0.80 (>= 0.75 default near-duplicate threshold) also swaps and appends variety note.
+    moderate_dup_vectors = {
+        1: [1.0, 0.0],
+        2: [0.8, 0.6],
+        3: [0.0, 1.0],
+        4: [0.0, -1.0],
+        5: [-1.0, 0.0],
+    }
+    moderate_ranked, moderate_diag = diversify_discovery_slate(
+        recommendations, moderate_dup_vectors, slate_size=2
+    )
+    assert [item["id"] for item in moderate_ranked] == [1, 3, 2, 4, 5]
+    assert moderate_diag["similarity_swaps"] == 1
+    assert moderate_ranked[1]["explanation"] == [
+        "Moved up for variety alongside closely related books in your top picks"
+    ]
 
     bounded, bounded_diagnostics = diversify_discovery_slate(
         recommendations, vectors, slate_size=4, max_displacement=1

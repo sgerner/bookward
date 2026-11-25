@@ -826,3 +826,342 @@ def test_read_metadata_identity_hash_handles_none_dict_and_sqlite_row_inputs():
     finally:
         con.close()
 
+
+def test_read_identity_index_matches_coauthors_subtitles_and_series_variants():
+    cases = [
+        (
+            {"title": "Good Omens", "author": "Neil Gaiman", "additional_authors": "Terry Pratchett"},
+            {"title": "Good Omens", "author": "Terry Pratchett & Neil Gaiman"},
+        ),
+        (
+            {"title": "Good Omens", "author": "Neil Gaiman", "additional_authors": "Terry Pratchett"},
+            {"title": "Good Omens", "author": "Terry Pratchett"},
+        ),
+        (
+            {"title": "This Is How You Lose the Time War", "author": "Amal El-Mohtar"},
+            {"title": "This Is How You Lose the Time War", "author": "Amal El-Mohtar and Max Gladstone"},
+        ),
+        (
+            {"title": "The Talisman", "author": "Stephen King, Peter Straub"},
+            {"title": "The Talisman", "author": "Peter Straub"},
+        ),
+        (
+            {"title": "Piranesi", "author": "Susanna Clarke"},
+            {"title": "Piranesi: A Novel", "author": "Susanna Clarke"},
+        ),
+        (
+            {"title": "Station Eleven: A Novel", "author": "Emily St. John Mandel"},
+            {"title": "Station Eleven", "author": "Emily St. John Mandel"},
+        ),
+        (
+            {"title": "Educated", "author": "Tara Westover"},
+            {"title": "Educated: A Memoir", "author": "Tara Westover"},
+        ),
+        (
+            {"title": "Dune", "author": "Frank Herbert"},
+            {"title": "Dune: Deluxe Edition", "author": "Frank Herbert"},
+        ),
+        (
+            {"title": "Red Rising", "author": "Pierce Brown"},
+            {"title": "Red Rising (Red Rising)", "author": "Pierce Brown"},
+        ),
+        (
+            {"title": "Leviathan Wakes", "author": "James S. A. Corey"},
+            {"title": "Leviathan Wakes (The Expanse, Book One)", "author": "James S. A. Corey"},
+        ),
+        (
+            {"title": "Leviathan Wakes", "author": "James S. A. Corey"},
+            {"title": "Leviathan Wakes: The Expanse, Book One", "author": "James S. A. Corey"},
+        ),
+    ]
+    for read_row, candidate_row in cases:
+        indexed = ReadIdentityIndex.from_reads([read_row])
+        assert indexed.matches(candidate_row), f"Expected match for {read_row} vs {candidate_row}"
+
+    # Guardrails: sequels, omnibuses, generational suffixes, and inverted names remain distinct.
+    dune_index = ReadIdentityIndex.from_reads([{"title": "Dune", "author": "Frank Herbert"}])
+    assert not dune_index.matches({"title": "Dune: Messiah", "author": "Frank Herbert"})
+    assert not dune_index.matches({"title": "Dune: Messiah: Deluxe Edition", "author": "Frank Herbert"})
+    messiah_index = ReadIdentityIndex.from_reads([{"title": "Dune: Messiah", "author": "Frank Herbert"}])
+    assert messiah_index.matches({"title": "Dune: Messiah: Deluxe Edition", "author": "Frank Herbert"})
+
+    omnibus_index = ReadIdentityIndex.from_reads([{"title": "Tales", "author": "Author"}])
+    assert not omnibus_index.matches({"title": "Tales (Tales, #1-3)", "author": "Author"})
+    assert not omnibus_index.matches({"title": "Tales (Books One-Three)", "author": "Author"})
+    assert not omnibus_index.matches({"title": "Tales: Three Stories", "author": "Author"})
+
+    suffix_index = ReadIdentityIndex.from_reads([
+        {"title": "Shared Title", "author": "Kurt Vonnegut, Jr."},
+        {"title": "Suffix Only", "author": "III"},
+    ])
+    assert not suffix_index.matches({"title": "Shared Title", "author": "Walter M. Miller, Jr."})
+    assert not suffix_index.matches({"title": "Suffix Only", "author": "Real Author, III"})
+    assert not suffix_index.matches({"title": "Suffix Only", "author": "III"})
+
+    inverted_index = ReadIdentityIndex.from_reads([
+        {"title": "Homecoming", "author": "Atkinson, Kate"},
+    ])
+    assert not inverted_index.matches({"title": "Homecoming", "author": "Morton, Kate"})
+
+
+def test_serving_scoring_quality_and_digest_exclude_coauthor_subtitle_and_series_reads(database):
+    from afterword_engine.quality import _dedupe_and_hide
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute(
+            "INSERT INTO reads(title,author,additional_authors,rating,source) VALUES(?,?,?,5,'goodreads_csv')",
+            ("Good Omens", "Neil Gaiman", "Terry Pratchett"),
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,5,'goodreads_csv')",
+            ("Red Rising", "Pierce Brown"),
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,5,'goodreads_csv')",
+            ("Dune", "Frank Herbert"),
+        )
+
+    coauthor_cid = add_candidate("Good Omens", "Terry Pratchett & Neil Gaiman", score=98)
+    subtitle_cid = add_candidate("Piranesi: A Novel", "Susanna Clarke", score=97)
+    repeated_series_cid = add_candidate("Red Rising (Red Rising)", "Pierce Brown", score=96)
+    word_series_cid = add_candidate("Dune (Dune Chronicles, Book One)", "Frank Herbert", score=95)
+    sequel_cid = add_candidate("Dune: Messiah", "Frank Herbert", score=94)
+
+    with transaction() as con:
+        con.executemany(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            [
+                (coauthor_cid,),
+                (subtitle_cid,),
+                (repeated_series_cid,),
+                (word_series_cid,),
+                (sequel_cid,),
+            ],
+        )
+
+    visible_ids = {item["id"] for item in recommendation_list(status="recommended", limit=None)}
+    assert visible_ids == {sequel_cid}
+
+    digest_ids = {
+        item["id"]
+        for item in _candidate_rows({"minimum_score": 0, "maximum_books": 20, "only_new": False})
+    }
+    assert digest_ids == {sequel_cid}
+
+    class FakeEmbedder:
+        name, model = "test", "multi-key-exclusion"
+
+        def __init__(self):
+            self.texts = []
+
+        async def embed(self, texts):
+            self.texts.extend(texts)
+            return [[1.0, 0.0] for _ in texts]
+
+    embedder = FakeEmbedder()
+    assert asyncio.run(score_all(embedder=embedder)) == 1
+    assert any("Dune: Messiah" in text for text in embedder.texts)
+    assert not any("Terry Pratchett & Neil Gaiman" in text for text in embedder.texts)
+    assert not any("Piranesi: A Novel" in text for text in embedder.texts)
+    assert not any("Red Rising (Red Rising)" in text for text in embedder.texts)
+
+    with transaction() as con:
+        _dedupe_and_hide(con)
+        statuses = dict(
+            con.execute(
+                "SELECT id,status FROM candidates WHERE id IN (?,?,?,?,?)",
+                (coauthor_cid, subtitle_cid, repeated_series_cid, word_series_cid, sequel_cid),
+            ).fetchall()
+        )
+    assert statuses == {
+        coauthor_cid: "rejected",
+        subtitle_cid: "rejected",
+        repeated_series_cid: "rejected",
+        word_series_cid: "rejected",
+        sequel_cid: "recommended",
+    }
+
+
+def test_coauthor_matching_is_asymmetric_without_candidate_additional_authors():
+    # Read has structured additional_authors -> matches secondary-author candidate.
+    read_with_coauthor = ReadIdentityIndex.from_reads([
+        {
+            "title": "Dune",
+            "author": "Frank Herbert",
+            "additional_authors": "Brian Herbert",
+        }
+    ])
+    assert read_with_coauthor.matches({"title": "Dune", "author": "Brian Herbert"})
+
+    # Candidates have no additional_authors column: a single-author read by the
+    # secondary contributor does NOT match a primary-only candidate unless both
+    # contributors appear in candidates.author or they share an ISBN/work ID.
+    reverse_read = ReadIdentityIndex.from_reads([
+        {"title": "Dune", "author": "Brian Herbert", "additional_authors": ""}
+    ])
+    assert not reverse_read.matches({"title": "Dune", "author": "Frank Herbert"})
+    assert reverse_read.matches({"title": "Dune", "author": "Frank Herbert & Brian Herbert"})
+
+    # The 4-argument book_identity_matches fallback compares primary author strings only.
+    assert book_identity_matches("Dune", "Frank Herbert & Brian Herbert", "Dune", "Brian Herbert")
+    assert not book_identity_matches("Dune", "Frank Herbert", "Dune", "Brian Herbert")
+
+    # Partial co-author overlap requires exact/genre-edition title keys in both
+    # directions so subtitled co-authored adaptations do not match solo-author
+    # classics, while identical contributor sets continue to match omitted subtitles.
+    austen_index = ReadIdentityIndex.from_reads([
+        {"title": "Pride and Prejudice", "author": "Jane Austen"}
+    ])
+    assert not austen_index.matches(
+        {
+            "title": "Pride and Prejudice: The Complete Novel, with Zombies",
+            "author": "Jane Austen & Seth Grahame-Smith",
+        }
+    )
+    assert not austen_index.matches(
+        {
+            "title": "Pride and Prejudice: Dawn of the Dreadfuls",
+            "author": "Jane Austen & Seth Grahame-Smith",
+        }
+    )
+    assert not austen_index.matches(
+        {
+            "title": "Pride and Prejudice and Zombies",
+            "author": "Jane Austen & Seth Grahame-Smith",
+        }
+    )
+    mashup_read_index = ReadIdentityIndex.from_reads([
+        {
+            "title": "Pride and Prejudice: The Complete Novel, with Zombies",
+            "author": "Jane Austen",
+            "additional_authors": "Seth Grahame-Smith",
+        }
+    ])
+    assert not mashup_read_index.matches({"title": "Pride and Prejudice", "author": "Jane Austen"})
+    solo_mashup_read_index = ReadIdentityIndex.from_reads([
+        {
+            "title": "Pride and Prejudice: The Complete Novel, with Zombies",
+            "author": "Seth Grahame-Smith",
+        }
+    ])
+    assert not solo_mashup_read_index.matches(
+        {"title": "Pride and Prejudice", "author": "Jane Austen & Seth Grahame-Smith"}
+    )
+    assert not book_identity_matches(
+        "Pride and Prejudice",
+        "Jane Austen",
+        "Pride and Prejudice: The Complete Novel, with Zombies",
+        "Jane Austen & Seth Grahame-Smith",
+    )
+    time_war_team = ReadIdentityIndex.from_reads([
+        {
+            "title": "This Is How You Lose the Time War",
+            "author": "Amal El-Mohtar",
+            "additional_authors": "Max Gladstone",
+        }
+    ])
+    assert time_war_team.matches(
+        {
+            "title": "This Is How You Lose the Time War: The Letters of Red and Blue",
+            "author": "Max Gladstone & Amal El-Mohtar",
+        }
+    )
+    assert book_identity_matches(
+        "This Is How You Lose the Time War",
+        "Amal El-Mohtar & Max Gladstone",
+        "This Is How You Lose the Time War: The Letters of Red and Blue",
+        "Max Gladstone & Amal El-Mohtar",
+    )
+    # Exact-title shared-contributor rows intentionally match.
+    dune_solo = ReadIdentityIndex.from_reads([
+        {"title": "Dune", "author": "Frank Herbert"}
+    ])
+    assert dune_solo.matches({"title": "Dune", "author": "Frank Herbert & Brian Herbert"})
+
+
+def test_article_led_subtitle_sequels_do_not_match_each_other(database):
+    from afterword_engine.quality import _dedupe_and_hide
+
+    gunslinger_read = {"title": "The Dark Tower: The Gunslinger", "author": "Stephen King"}
+    dark_tower_index = ReadIdentityIndex.from_reads([gunslinger_read])
+    assert not dark_tower_index.matches(
+        {"title": "The Dark Tower: The Drawing of the Three", "author": "Stephen King"}
+    )
+    assert not dark_tower_index.matches(
+        {"title": "The Dark Tower: The Waste Lands", "author": "Stephen King"}
+    )
+    assert not book_identity_matches(
+        "The Dark Tower: The Gunslinger",
+        "Stephen King",
+        "The Dark Tower: The Drawing of the Three",
+        "Stephen King",
+    )
+    assert not book_identity_matches(
+        "The Lord of the Rings: The Fellowship of the Ring",
+        "J. R. R. Tolkien",
+        "The Lord of the Rings: The Return of the King",
+        "J. R. R. Tolkien",
+    )
+    # Same book with format/edition suffixes and bare omitted-subtitle pairs still match.
+    assert dark_tower_index.matches(
+        {"title": "The Dark Tower: The Gunslinger (Unabridged)", "author": "Stephen King"}
+    )
+    assert dark_tower_index.matches(
+        {"title": "The Dark Tower: The Gunslinger: Deluxe Edition", "author": "Stephen King"}
+    )
+    assert dark_tower_index.matches({"title": "The Dark Tower", "author": "Stephen King"})
+    bare_index = ReadIdentityIndex.from_reads([
+        {"title": "The Dark Tower", "author": "Stephen King"}
+    ])
+    assert bare_index.matches(gunslinger_read)
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute("DELETE FROM reads")
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,5,'goodreads_csv')",
+            ("The Dark Tower: The Gunslinger", "Stephen King"),
+        )
+
+    gunslinger_cid = add_candidate("The Dark Tower: The Gunslinger (Unabridged)", "Stephen King", score=96)
+    drawing_cid = add_candidate("The Dark Tower: The Drawing of the Three", "Stephen King", score=95)
+    with transaction() as con:
+        con.executemany(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            [(gunslinger_cid,), (drawing_cid,)],
+        )
+
+    assert {item["id"] for item in recommendation_list(status="recommended", limit=None)} == {drawing_cid}
+    assert {
+        item["id"]
+        for item in _candidate_rows({"minimum_score": 0, "maximum_books": 20, "only_new": False})
+    } == {drawing_cid}
+
+    class FakeEmbedder:
+        name, model = "test", "article-subtitle-sequels"
+
+        def __init__(self):
+            self.texts = []
+
+        async def embed(self, texts):
+            self.texts.extend(texts)
+            return [[1.0, 0.0] for _ in texts]
+
+    embedder = FakeEmbedder()
+    assert asyncio.run(score_all(embedder=embedder)) == 1
+    assert any("The Drawing of the Three" in text for text in embedder.texts)
+    assert not any("The Gunslinger (Unabridged)" in text for text in embedder.texts)
+
+    with transaction() as con:
+        _dedupe_and_hide(con)
+        statuses = dict(
+            con.execute(
+                "SELECT id,status FROM candidates WHERE id IN (?,?)",
+                (gunslinger_cid, drawing_cid),
+            ).fetchall()
+        )
+    assert statuses == {
+        gunslinger_cid: "rejected",
+        drawing_cid: "recommended",
+    }

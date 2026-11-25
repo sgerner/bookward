@@ -10,6 +10,8 @@ services:
       ENGINE_URL: http://engine:8000
       ENGINE_SERVICE_SECRET: ${ENGINE_SERVICE_SECRET:-}
       OIDC_AUTO_LOGIN: ${OIDC_AUTO_LOGIN:-false}
+      ADDRESS_HEADER: ${ADDRESS_HEADER:-}
+      XFF_DEPTH: ${XFF_DEPTH:-1}
       BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-12M}
     depends_on:
       engine:

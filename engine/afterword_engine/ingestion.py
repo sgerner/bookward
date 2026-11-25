@@ -9,6 +9,7 @@ import json
 import re
 import math
 import unicodedata
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
@@ -32,6 +33,7 @@ from .database import (
     normalize_key,
     persist_metadata_field_provenance,
     private_setting,
+    purge_demo_reads,
     recompute_candidate_sources,
     row,
     rows,
@@ -40,11 +42,21 @@ from .database import (
 )
 from .identity import (
     book_author_identity_key,
+    book_author_identity_keys,
     book_catalog_title_identity_key,
     book_identity_match_keys,
     book_openlibrary_work_id,
+    book_row_author_identity_keys,
     book_row_identity_match_keys,
     read_metadata_identity_hash,
+)
+from .http_bounds import (
+    JSON_CONTENT_TYPES,
+    SOURCE_CONTENT_TYPES,
+    materialize_response,
+    read_bounded_bytes_async,
+    read_bounded_json_async,
+    validate_response_headers,
 )
 from .isbn import canonical_isbn, isbn_parts, isbn_parts_from_source
 from .read_dates import read_day
@@ -878,6 +890,7 @@ def import_csv(content: bytes) -> dict[str, int | str]:
             title = str(source_row.get("Title") or "").strip()[:500]
             if source == "storygraph_csv":
                 author = _storygraph_primary_author(source_row.get("Authors"))
+                additional_authors = ""
                 shelf = str(source_row.get("Read Status") or "").strip().lower()
                 isbn = _storygraph_isbn(source_row.get("ISBN/UID"))
                 rating_raw = str(source_row.get("Star Rating") or "").strip()
@@ -887,6 +900,7 @@ def import_csv(content: bytes) -> dict[str, int | str]:
                 )
             else:
                 author = str(source_row.get("Author") or "").strip()[:300]
+                additional_authors = str(source_row.get("Additional Authors") or "").strip()[:500]
                 shelf = str(source_row.get("Exclusive Shelf") or "").strip().lower()
                 isbn = str(source_row.get("ISBN13") or source_row.get("ISBN") or "").strip('="') or None
                 rating_raw = str(source_row.get("My Rating") or "").strip()
@@ -898,6 +912,7 @@ def import_csv(content: bytes) -> dict[str, int | str]:
                     shelf,
                     title,
                     author,
+                    additional_authors,
                     isbn,
                     _read_date_value(source_row.get("Date Added")),
                 )
@@ -913,6 +928,7 @@ def import_csv(content: bytes) -> dict[str, int | str]:
                 values = (
                     title,
                     author,
+                    additional_authors,
                     rating,
                     read_at,
                     isbn,
@@ -926,26 +942,37 @@ def import_csv(content: bytes) -> dict[str, int | str]:
         raise ValueError("CSV is malformed") from exc
     from .learning import attribute_read_outcomes
     with transaction() as con:
+        if count > 0:
+            purge_demo_reads(con)
         for kind, values in batches:
             if kind == "shelf":
                 con.executemany(
-                    "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
-                    "VALUES(?, ?, ?, ?, ?) "
+                    "INSERT INTO goodreads_shelf_items("
+                    "shelf, title, author, additional_authors, isbn, added_at"
+                    ") VALUES(?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(shelf, title, author) DO UPDATE SET "
+                    "additional_authors=COALESCE(NULLIF(excluded.additional_authors, ''), "
+                    "goodreads_shelf_items.additional_authors), "
                     "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
                     "added_at=COALESCE(excluded.added_at, goodreads_shelf_items.added_at), "
                     "updated_at=CURRENT_TIMESTAMP",
                     values,
                 )
                 continue
+            # Shelf-to-read promotion intentionally preserves prior scoring batches
+            # and serving runs so `attribute_read_outcomes()` can link this completed
+            # read to preceding impressions while the book remains in `reads`.
             con.executemany(
                 "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
                 ((item[0], item[1]) for item in values),
             )
             con.executemany(
-                "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
-                "VALUES(?,?,?,?,?,?) "
+                "INSERT INTO reads("
+                "title,author,additional_authors,rating,read_at,isbn,source"
+                ") VALUES(?,?,?,?,?,?,?) "
                 "ON CONFLICT(title,author) DO UPDATE SET "
+                "additional_authors=COALESCE(NULLIF(excluded.additional_authors, ''), "
+                "reads.additional_authors),"
                 "rating=excluded.rating,read_at=COALESCE(excluded.read_at,reads.read_at),"
                 "openlibrary_work_id=CASE WHEN excluded.isbn IS NOT NULL "
                 "AND excluded.isbn IS NOT reads.isbn THEN '' ELSE reads.openlibrary_work_id END,"
@@ -978,6 +1005,7 @@ def _source_client():
     )
 
 
+@asynccontextmanager
 async def _request_pinned(client, method, url, *, params=None, allow_http=False):
     _, address, hostname = resolve_public_target(url, allow_http=allow_http)
     original = httpx.URL(url)
@@ -986,14 +1014,18 @@ async def _request_pinned(client, method, url, *, params=None, allow_http=False)
     host_header = hostname if original.port in (None, default_port) else f"{hostname}:{original.port}"
     unpinned_url = client.build_request(method, original, params=params).url
     public_request = client.build_request(method, redact_url(unpinned_url))
+    request = client.build_request(
+        method,
+        pinned,
+        params=params,
+        headers={"Host": host_header},
+        extensions={"sni_hostname": hostname},
+    )
+    response = None
     try:
-        response = await client.request(
-            method,
-            pinned,
-            params=params,
-            headers={"Host": host_header},
-            extensions={"sni_hostname": hostname},
-        )
+        response = await client.send(request, stream=True)
+        response.request = public_request
+        yield response
     except httpx.RequestError as exc:
         sanitized = sanitize_pinned_error_message(
             exc,
@@ -1005,8 +1037,9 @@ async def _request_pinned(client, method, url, *, params=None, allow_http=False)
         except TypeError:
             rewritten = httpx.RequestError(sanitized, request=public_request)
         raise rewritten from None
-    response.request = public_request
-    return response
+    finally:
+        if response is not None:
+            await response.aclose()
 
 
 async def _request_openlibrary_edition(client, isbn13: str):
@@ -1021,10 +1054,21 @@ async def _request_openlibrary_edition(client, isbn13: str):
     url = f"https://openlibrary.org/isbn/{isbn13}.json"
     for _ in range(READ_WORK_IDENTITY_MAX_REDIRECTS + 1):
         await wait_for_openlibrary_request_slot()
-        response = await _request_pinned(client, "GET", url)
-        location = response.headers.get("location", "").strip()
-        if not response.is_redirect or not location:
-            return response
+        async with _request_pinned(client, "GET", url) as response:
+            location = response.headers.get("location", "").strip()
+            if not response.is_redirect or not location:
+                if response.status_code == 404:
+                    return materialize_response(response, b"")
+                response.raise_for_status()
+                body = await read_bounded_bytes_async(
+                    response,
+                    max_bytes=settings.source_max_bytes,
+                    allowed_content_types=JSON_CONTENT_TYPES,
+                    allow_missing_content_type=True,
+                    content_type_error="Open Library returned an unsupported content type",
+                    size_error="Open Library response is too large",
+                )
+                return materialize_response(response, body)
 
         target = urljoin(url, location)
         parsed = urlparse(target)
@@ -1101,12 +1145,14 @@ async def refresh_read_work_identities(
     for candidate in candidates:
         if not book_openlibrary_work_id(candidate):
             continue
-        author_key = book_author_identity_key(candidate.get("author"))
-        if not author_key:
+        author_keys = book_row_author_identity_keys(candidate)
+        if not author_keys:
             continue
-        candidates_by_author.setdefault(author_key, []).append(
-            (candidate, book_row_identity_match_keys(candidate))
-        )
+        candidate_keys = book_row_identity_match_keys(candidate)
+        for author_key in author_keys:
+            candidates_by_author.setdefault(author_key, []).append(
+                (candidate, candidate_keys)
+            )
 
     now = datetime.now(timezone.utc)
     retry_before = now - timedelta(days=READ_WORK_IDENTITY_RETRY_DAYS)
@@ -1127,8 +1173,17 @@ async def refresh_read_work_identities(
             if attempted > retry_before:
                 continue
 
-        author_key = book_author_identity_key(read.get("author"))
-        author_candidates = candidates_by_author.get(author_key, [])
+        read_author_keys = book_row_author_identity_keys(read)
+        if not read_author_keys:
+            continue
+        seen_candidate_ids: set[int] = set()
+        author_candidates: list[tuple[dict, set]] = []
+        for author_key in read_author_keys:
+            for candidate, candidate_keys in candidates_by_author.get(author_key, ()):
+                candidate_id = int(candidate["id"])
+                if candidate_id not in seen_candidate_ids:
+                    seen_candidate_ids.add(candidate_id)
+                    author_candidates.append((candidate, candidate_keys))
         if not author_candidates:
             continue
         read_keys = book_row_identity_match_keys(read)
@@ -1368,7 +1423,7 @@ def _verified_read_metadata(metadata, read):
     else:
         wanted13, wanted10 = isbn_parts(read.get("isbn"))
         read_title = book_catalog_title_identity_key(read.get("title", ""))
-        read_author = book_author_identity_key(read.get("author", ""))
+        read_authors = book_row_author_identity_keys(read)
         matched_isbn_traces = [
             trace for trace in traces
             if isinstance(trace, dict)
@@ -1400,8 +1455,8 @@ def _verified_read_metadata(metadata, read):
             catalog_authors = source_payload.get("authors", [])
             if not isinstance(catalog_authors, (list, tuple)):
                 catalog_authors = [catalog_authors]
-            author_matches = any(
-                book_author_identity_key(author) == read_author
+            author_matches = bool(read_authors) and any(
+                bool(read_authors & book_author_identity_keys(author))
                 for author in catalog_authors
                 if author
             )
@@ -1940,35 +1995,38 @@ async def _fetch_bytes_with_client(
 ):
     current_url = str(url)
     for _ in range(SOURCE_MAX_REDIRECTS + 1):
-        response = await _request_pinned(
+        async with _request_pinned(
             client,
             "GET",
             current_url,
             allow_http=allow_goodreads_http,
-        )
-        if response.is_redirect:
-            location = response.headers.get("location")
-            if not location:
-                raise ValueError("Source returned an invalid redirect")
-            current_url = str(httpx.URL(current_url).join(location))
-            continue
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "").lower()
-        if not any(
-            kind in content_type
-            for kind in ("html", "xml", "rss", "atom", "json", "javascript", "text/plain")
-        ):
-            raise ValueError("Source returned an unsupported content type")
-        chunks, size = [], 0
-        async for chunk in response.aiter_bytes():
-            size += len(chunk)
-            if size > settings.source_max_bytes:
-                raise ValueError("Source response is too large")
-            chunks.append(chunk)
-        payload = b"".join(chunks)
-        if return_url:
-            return payload, content_type, current_url
-        return payload, content_type
+        ) as response:
+            if response.is_redirect:
+                location = response.headers.get("location")
+                if not location:
+                    raise ValueError("Source returned an invalid redirect")
+                current_url = str(httpx.URL(current_url).join(location))
+                continue
+            response.raise_for_status()
+            content_type = validate_response_headers(
+                response,
+                max_bytes=settings.source_max_bytes,
+                allowed_content_types=SOURCE_CONTENT_TYPES,
+                allow_missing_content_type=False,
+                content_type_error="Source returned an unsupported content type",
+                size_error="Source response is too large",
+            )
+            content = await read_bounded_bytes_async(
+                response,
+                max_bytes=settings.source_max_bytes,
+                allowed_content_types=SOURCE_CONTENT_TYPES,
+                allow_missing_content_type=False,
+                content_type_error="Source returned an unsupported content type",
+                size_error="Source response is too large",
+            )
+            if return_url:
+                return content, content_type, current_url
+            return content, content_type
     raise ValueError("Source returned too many redirects")
 
 
@@ -2020,14 +2078,19 @@ async def _goodreads_tooltips(client, resource_ids):
     async def request_batches():
         collected = {}
         for start in range(0, len(resource_ids), 50):
-            response = await _request_pinned(
+            async with _request_pinned(
                 client,
                 "GET",
                 GOODREADS_TOOLTIPS_URL,
                 params=_goodreads_tooltip_params(resource_ids[start : start + 50]),
-            )
-            response.raise_for_status()
-            payload = response.json()
+            ) as response:
+                response.raise_for_status()
+                payload = await read_bounded_json_async(
+                    response,
+                    max_bytes=settings.source_max_bytes,
+                    content_type_error="Goodreads tooltips returned an unsupported content type",
+                    size_error="Goodreads tooltips response is too large",
+                )
             batch = payload.get("tooltips", {}) if isinstance(payload, dict) else {}
             if isinstance(batch, dict):
                 collected.update(batch)
@@ -2040,8 +2103,16 @@ async def _goodreads_tooltips(client, resource_ids):
         # page. If an edge node requires a fresh session, seed it once and
         # retry the same bounded batches; the fixed public host is pinned and
         # revalidated on every request.
-        home = await _request_pinned(client, "GET", "https://www.goodreads.com/")
-        home.raise_for_status()
+        async with _request_pinned(client, "GET", "https://www.goodreads.com/") as home:
+            home.raise_for_status()
+            await read_bounded_bytes_async(
+                home,
+                max_bytes=settings.source_max_bytes,
+                allowed_content_types=SOURCE_CONTENT_TYPES,
+                allow_missing_content_type=True,
+                content_type_error="Goodreads returned an unsupported content type",
+                size_error="Goodreads response is too large",
+            )
         return await request_batches()
 
 
@@ -2262,12 +2333,29 @@ def _apply_goodreads_shelves(
     shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
 ) -> dict[str, int]:
     imported: dict[str, int] = {}
+    updated_shelves: list[str] = []
     for shelf in shelves:
-        shelf_rows = fetched_shelves.get(shelf)
-        if shelf_rows is None:
+        if fetched_shelves.get(shelf) is None:
             imported[shelf] = 0
-            continue
-        with transaction() as con:
+        else:
+            updated_shelves.append(shelf)
+    if not updated_shelves:
+        return imported
+
+    from .identity import book_row_identity_match_keys
+
+    with transaction() as con:
+        shelf_marks = ",".join("?" for _ in updated_shelves)
+        previous_rows = [
+            dict(row)
+            for row in con.execute(
+                "SELECT shelf, title, author, isbn, openlibrary_work_id "
+                f"FROM goodreads_shelf_items WHERE shelf IN ({shelf_marks})",
+                updated_shelves,
+            ).fetchall()
+        ]
+        for shelf in updated_shelves:
+            shelf_rows = fetched_shelves[shelf] or []
             con.execute("DELETE FROM goodreads_shelf_items WHERE shelf=?", (shelf,))
             con.executemany(
                 "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
@@ -2279,6 +2367,38 @@ def _apply_goodreads_shelves(
                 shelf_rows,
             )
             imported[shelf] = len(shelf_rows)
+
+        if previous_rows:
+            remaining_keys: set[tuple[str, ...]] = set()
+            for row in con.execute(
+                "SELECT shelf, title, author, isbn, openlibrary_work_id "
+                "FROM goodreads_shelf_items"
+            ).fetchall():
+                remaining_keys.update(book_row_identity_match_keys(dict(row)))
+            removed_rows = [
+                row
+                for row in previous_rows
+                if not set(book_row_identity_match_keys(row)).issubset(remaining_keys)
+            ]
+            if removed_rows:
+                read_keys: set[tuple[str, ...]] = set()
+                for row in con.execute(
+                    "SELECT title, author, isbn, openlibrary_work_id FROM reads"
+                ).fetchall():
+                    read_keys.update(book_row_identity_match_keys(dict(row)))
+                # Intentional: books promoted from shelves into `reads` remain part
+                # of the user's library and retain prior batches/runs so read-outcome
+                # attribution and score provenance stay intact (erased via `read_ids`
+                # if the read row itself is later purged).
+                deleted_shelf_rows = [
+                    row
+                    for row in removed_rows
+                    if not (set(book_row_identity_match_keys(row)) & read_keys)
+                ]
+                if deleted_shelf_rows:
+                    from .decision_evidence import purge_recommendation_evidence
+
+                    purge_recommendation_evidence(con, shelf_items=deleted_shelf_rows)
     return imported
 
 
@@ -2316,6 +2436,11 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
             isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip('="')[:32] or None
             read_rows.append((title, author, rating, read_at, isbn))
             count += 1
+        if count > 0:
+            purge_demo_reads(con)
+        # Shelf-to-read promotion intentionally preserves prior scoring batches and
+        # serving runs so `attribute_read_outcomes()` can attach outcomes to earlier
+        # exposures while the book remains in `reads`.
         con.executemany(
             "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
             ((item[0], item[1]) for item in read_rows),

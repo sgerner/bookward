@@ -24,7 +24,6 @@
     KeyRound,
     Library,
     Link2,
-    LogOut,
     Mail,
     MessageCircle,
     RefreshCw,
@@ -40,9 +39,12 @@
   } from "@lucide/svelte";
   import BookCoverTrigger from "#lib/components/BookCoverTrigger.svelte";
   import ChipToggle from "#lib/components/ChipToggle.svelte";
+  import DiscoverLoadMoreFooter from "#lib/components/DiscoverLoadMoreFooter.svelte";
   import InlineAlert from "#lib/components/InlineAlert.svelte";
   import ModalDialog from "#lib/components/ModalDialog.svelte";
   import LabeledSelect from "#lib/components/LabeledSelect.svelte";
+  import LogoutMenuForm from "#lib/components/LogoutMenuForm.svelte";
+  import MarkReadErrorAlert from "#lib/components/MarkReadErrorAlert.svelte";
   import PopoverDialog from "#lib/components/PopoverDialog.svelte";
   import ProfileField from "#lib/components/ProfileField.svelte";
   import StarRating from "#lib/components/StarRating.svelte";
@@ -55,13 +57,23 @@
     type ApiTokenCopyStatus,
   } from "#lib/api-token-clipboard.js";
   import { actionResultMessage } from "#lib/action-result-message.js";
+  import {
+    createLogoutSubmit,
+    createMarkReadSubmit,
+  } from "#lib/reader-form-actions.js";
   import { tokenForView } from "#lib/api-token-ui.js";
+  import { payloadErrorMessage } from "#lib/client-errors.js";
   import {
     canRunDigestNow,
     canTestDigestChannel,
     hasUnsavedDigestChanges,
     shouldShowDigestTestButton,
   } from "#lib/digest-ui.js";
+  import {
+    createNotificationChannels,
+    type TransientNotice,
+    type UndoBanner,
+  } from "#lib/notification-channels.js";
   import {
     formatLibrarrSearchStatus,
     formatLlmCatalogStatus,
@@ -84,10 +96,23 @@
     resolveLibrarrResultFormat,
     shouldShowLibrarrEmptyBanner,
   } from "#lib/librarr-stream.js";
+  import {
+    applyReadingHistoryScores,
+    createUrlNavigationController,
+    READING_HISTORY_SCORE_BATCH_SIZE,
+    readUrlViewState,
+    reconcileBookMutation,
+    reconcilePagedBooks,
+    runReadingHistoryScoreBatches,
+    sortReadingHistory,
+    type DecisionFilter,
+    type ReadingHistoryScorePatch,
+    type ReadingHistorySort,
+    type View,
+  } from "#lib/page-state.js";
   import { formatSourceScanStatus, sourceScanTone } from "#lib/source-health.js";
   import bookwardMark from "#lib/assets/bookward-mark.svg";
 
-  type View = "discover" | "saved" | "decisions" | "sources" | "settings";
   type FilterableView = "discover" | "saved" | "decisions";
   type NavItem = {
     id: View;
@@ -148,9 +173,16 @@
 
   let { data, form } = $props();
   type PageBook = (typeof data.books)[number];
-  let activeView = $state<View>(readView(page.url.searchParams.get("view")));
+  const initialUrlState = untrack(() =>
+    readUrlViewState(
+      page.shallow?.url ?? page.url,
+      data.digestReview.requested,
+    ),
+  );
+  let activeView = $state<View>(initialUrlState.view);
   let markReadBook = $state<PageBook | null>(null);
   let markReadRating = $state<number | null>(0);
+  let markReadError = $state("");
   let discoverSearch = $state("");
   let savedSearch = $state("");
   let decisionsSearch = $state("");
@@ -160,17 +192,21 @@
   let shortlistSort = $state<"score" | "title" | "author">("score");
   let profileMenuOpen = $state(false);
   let expandedRecommendationDetails = $state(new Set<number>());
+  let expandedSynopses = $state(new Set<number>());
+  let measuredSynopses = $state(new Set<number>());
+  let overflowingSynopses = $state(new Set<number>());
   let openReadMenuId = $state<number | null>(null);
   const DISCOVER_PAGE_SIZE = 8;
   const DECISION_PAGE_SIZE = 24;
   const FILTER_DEBOUNCE_MS = 180;
-  const FORM_NOTIFICATION_DISMISS_MS = 5000;
-  const FORM_NOTIFICATION_ERROR_DISMISS_MS = FORM_NOTIFICATION_DISMISS_MS + 1500;
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
-  let loadMoreSentinel = $state<HTMLElement | null>(null);
   let additionalDiscoverBooks = $state<PageBook[]>([]);
-  let unfilteredDiscoverOffset = $state(0);
-  let unfilteredDiscoverHasMore = $state(false);
+  let unfilteredDiscoverOffset = $state(
+    untrack(() => data.books.filter((book) => book.status === "recommended").length),
+  );
+  let unfilteredDiscoverHasMore = $state(
+    untrack(() => Boolean(data.recommendations_has_more)),
+  );
   let filteredDiscoverBooks = $state<PageBook[]>([]);
   let filteredDiscoverOffset = $state(0);
   let filteredDiscoverHasMore = $state(false);
@@ -179,7 +215,7 @@
   let discoverFilterAbortController: AbortController | null = null;
   let discoverFilterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let additionalDecisionBooks = $state<PageBook[]>([]);
-  let unfilteredDecisionOffset = $state(0);
+  let unfilteredDecisionOffset = $state(untrack(() => data.decisions.length));
   let queriedDecisionBooks = $state<PageBook[]>([]);
   let queriedDecisionOffset = $state(0);
   let queriedDecisionsHasMore = $state(false);
@@ -194,7 +230,7 @@
   let decisionsHasMoreOverride = $state<boolean | null>(null);
   let decisionsLoading = $state(false);
   let decisionsLoadError = $state("");
-  let decisionFilter = $state<"all" | "maybe_later" | "rejected" | "read">("all");
+  let decisionFilter = $state<DecisionFilter>(initialUrlState.decisionFilter);
   let readingHistory = $state<ReadingHistoryItem[]>([]);
   let readingHistoryState = $state<"idle" | "loading" | "ready" | "error">("idle");
   let readingHistoryImmediate = $state(false);
@@ -203,21 +239,41 @@
   let readingHistoryScoreError = $state("");
   let readingHistoryScoreOffset = 0;
   let readingHistoryScoreTask: Promise<void> | null = null;
+  let readingHistoryGeneration = 0;
   let readingHistoryScoreRefreshQueued = false;
+  let bufferedReadingHistoryScores = $state(new Map<number, ReadingHistoryScorePatch>());
   let readingHistoryVisibleCount = $state(30);
   let readingHistoryRatingFilter = $state<"all" | "rated" | "unrated">("all");
   let readingHistorySourceFilter = $state("all");
-  let readingHistorySort = $state<"recent" | "oldest" | "score_high" | "score_low" | "rating_high" | "title">("recent");
+  let readingHistorySort = $state<ReadingHistorySort>("recent");
   let expandedReadingDetails = $state<number[]>([]);
   let historyRatingOverrides = $state<Record<number, number | null>>({});
   let pendingRatingIds = $state(new Set<number>());
-  // This is only an identity sentinel. Keeping it outside `$state` avoids
-  // proxying `data.books` and retriggering the synchronization effect forever.
-  let previousDataBooks: PageBook[] | null = null;
-  let previousDataRecommendationsHasMore: boolean | null = null;
-  let previousDataDecisions: PageBook[] | null = null;
-  let previousDataDecisionsHasMore: boolean | null = null;
+  // Keep identity sentinels outside `$state` to avoid proxying server arrays
+  // and retriggering synchronization effects unnecessarily.
+  let previousDataBooks: PageBook[] | null = untrack(() => data.books);
+  let previousDataRecommendationsHasMore: boolean | null = untrack(() =>
+    Boolean(data.recommendations_has_more),
+  );
+  let previousDataDecisions: PageBook[] | null = untrack(() => data.decisions);
+  let previousDataDecisionsHasMore: boolean | null = untrack(() =>
+    Boolean(data.decisions_has_more),
+  );
   let previousDataHistory: (typeof data.history) | null = null;
+  let previousProfileId: string | undefined = untrack(
+    () => data.user?.profile_id,
+  );
+  let previousDiscoverSearch = "";
+  let previousDiscoverGenre = "";
+  const undoBookSnapshots = new Map<
+    number,
+    {
+      book: PageBook;
+      previousStatus: string;
+      discoverIndex: number;
+      decisionIndex: number;
+    }
+  >();
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -239,7 +295,7 @@
   let librarrBulkAdding = $state(false);
   let librarrAdded = $state<Set<string>>(new Set());
   let librarrSearchAbortController: AbortController | null = null;
-  let digestMode = $state(page.url.searchParams.get("digest") === "1");
+  let digestMode = $state(initialUrlState.digestMode);
   let selectedDigestIds = $state<Set<number>>(new Set());
   let digestEnabledOverride = $state<boolean | null>(null);
   let digestOnlyNewOverride = $state<boolean | null>(null);
@@ -263,23 +319,12 @@
   let digestClearSmtpCredentials = $state(false);
   let apiTokenCopyStatus = $state<ApiTokenCopyStatus | null>(null);
   let revealedApiToken = $state<string | null>(null);
-  let formNotificationDismissed = $state(false);
-  let notificationPointerInside = false;
-  let notificationFocusInside = false;
-  let notificationPaused = false;
-  let formNotificationTimer: ReturnType<typeof setTimeout> | null = null;
-  let formNotificationDismissDelay = FORM_NOTIFICATION_DISMISS_MS;
-  let optimisticNotification = $state<{
-    message: string;
-    error: boolean;
-    id: number;
-    undo_id?: number;
-    undo_decisions?: Array<{ id: number; decision_id: number }>;
-    undo_label?: string;
-  } | null>(null);
-  let optimisticNotificationId = 0;
-  let optimisticNotificationTimer: ReturnType<typeof setTimeout> | null = null;
-  let optimisticNotificationDismissDelay = FORM_NOTIFICATION_ERROR_DISMISS_MS;
+  let transientNotice = $state<TransientNotice | null>(null);
+  let undoBanner = $state<UndoBanner | null>(null);
+  const notifications = createNotificationChannels((snapshot) => {
+    transientNotice = snapshot.transientNotice;
+    undoBanner = snapshot.undoBanner;
+  });
   let defaultSourceEnabledOverride = $state<boolean | null>(null);
   let sourceEnabledOverrides = $state<Record<number, boolean>>({});
   let openSourceEditIds = $state(new Set<number>());
@@ -411,7 +456,8 @@
   const digestSettings = $derived(data.profile.digest);
   const digestVisible = $derived(
     digestMode &&
-      (!page.url.searchParams.has("digest_period") || data.digestReview.requested),
+      (!(page.shallow?.url ?? page.url).searchParams.has("digest_period") ||
+        data.digestReview.requested),
   );
   const digestRequested = $derived(
     digestVisible && data.digestReview.requested,
@@ -618,35 +664,17 @@
     };
     const matchesSearch = (item: ReadingHistoryItem) =>
       !query || `${item.title} ${item.author} ${item.source}`.toLowerCase().includes(query);
-    const timestamps = new Map<number, number>();
-    const readTimestamp = (item: ReadingHistoryItem) => {
-      const cached = timestamps.get(item.id);
-      if (cached !== undefined) return cached;
-      const timestamp = Date.parse(item.read_at ?? item.created_at);
-      const normalized = Number.isFinite(timestamp) ? timestamp : 0;
-      timestamps.set(item.id, normalized);
-      return normalized;
-    };
-    return synchronizedReadingHistory
-      .filter((item) =>
+    const matching = synchronizedReadingHistory.filter(
+      (item) =>
         matchesSearch(item) &&
         matchesRating(item) &&
         (readingHistorySourceFilter === "all" || item.source === readingHistorySourceFilter),
-      )
-      .sort((left, right) => {
-        if (readingHistorySort === "oldest") return readTimestamp(left) - readTimestamp(right) || left.title.localeCompare(right.title);
-        if (readingHistorySort === "score_high" || readingHistorySort === "score_low") {
-          if (left.algorithm_score === null) return right.algorithm_score === null ? left.title.localeCompare(right.title) : 1;
-          if (right.algorithm_score === null) return -1;
-          const scoreOrder = readingHistorySort === "score_high"
-            ? right.algorithm_score - left.algorithm_score
-            : left.algorithm_score - right.algorithm_score;
-          return scoreOrder || left.title.localeCompare(right.title);
-        }
-        if (readingHistorySort === "rating_high") return (right.rating ?? 0) - (left.rating ?? 0) || left.title.localeCompare(right.title);
-        if (readingHistorySort === "title") return left.title.localeCompare(right.title);
-        return readTimestamp(right) - readTimestamp(left) || left.title.localeCompare(right.title);
-      });
+    );
+    return sortReadingHistory(
+      matching,
+      readingHistorySort,
+      readingHistoryScoreState === "idle" || readingHistoryScoreState === "loading",
+    );
   });
   const readingHistorySources = $derived(
     [...new Set(readingHistory.map((item) => item.source).filter(Boolean))]
@@ -656,7 +684,9 @@
     filteredReadingHistory.slice(0, readingHistoryVisibleCount),
   );
   const scoredReadingHistoryCount = $derived(
-    readingHistory.filter((item) => item.algorithm_score !== null).length,
+    readingHistory.filter(
+      (item) => item.algorithm_score !== null || bufferedReadingHistoryScores.has(item.id),
+    ).length,
   );
   const selectedDigestCount = $derived(selectedDigestIds.size);
   const selectedDigestRunId = $derived.by(() => {
@@ -968,9 +998,9 @@
       const response = await fetch("/api/llm/models", {
         headers: data.user?.profile_id ? profileHeaders : undefined,
       });
-      const body = await response.json();
+      const body = await response.json().catch(() => ({}));
       if (!response.ok) {
-        llmCatalogError = body?.message || "Could not load models.dev catalog.";
+        llmCatalogError = payloadErrorMessage(body, "Could not load models.dev catalog.");
         return;
       }
       llmCatalogProviders = Array.isArray(body?.providers) ? body.providers : [];
@@ -1020,10 +1050,12 @@
           headers: data.user?.profile_id ? profileHeaders : undefined,
         });
       }
-      const body = await response.json();
+      const body = await response.json().catch(() => ({}));
       if (!response.ok) {
-        llmLocalModelsError =
-          body?.message || "Could not discover models from endpoint.";
+        llmLocalModelsError = payloadErrorMessage(
+          body,
+          "Could not discover models from endpoint.",
+        );
         return;
       }
       const models = Array.isArray(body?.models) ? body.models : [];
@@ -1068,11 +1100,11 @@
           use_saved_key: !typedKey && canReuseSavedLlmKey,
         }),
       });
-      const body = await response.json();
+      const body = await response.json().catch(() => ({}));
       if (!response.ok) {
         llmTestStatus = {
           ok: false,
-          message: body?.message || "Connection check failed.",
+          message: payloadErrorMessage(body, "Connection check failed."),
         };
         return;
       }
@@ -1224,157 +1256,183 @@
     },
   ]);
   const formState = $derived((form ?? null) as FormState);
-  const visibleNotification = $derived(
-    optimisticNotification ??
-      (formState?.message && !formNotificationDismissed ? formState : null),
-  );
-  const formIsError = $derived(Boolean(visibleNotification?.error));
-
-  function scheduleFormNotificationDismiss() {
-    if (formNotificationTimer) clearTimeout(formNotificationTimer);
-    formNotificationTimer = null;
-    if (untrack(() => notificationPaused || Boolean(optimisticNotification))) return;
-    if (formNotificationDismissDelay === 0) return;
-    formNotificationTimer = setTimeout(() => {
-      formNotificationDismissed = true;
-      formNotificationTimer = null;
-    }, formNotificationDismissDelay);
-  }
-
-  function scheduleOptimisticNotificationDismiss() {
-    if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
-    optimisticNotificationTimer = null;
-    const id = optimisticNotification?.id;
-    if (id === undefined || notificationPaused) return;
-    optimisticNotificationTimer = setTimeout(() => {
-      if (optimisticNotification?.id !== id) return;
-      optimisticNotification = null;
-      formNotificationDismissed = true;
-      optimisticNotificationTimer = null;
-    }, optimisticNotificationDismissDelay);
-  }
-
-  function updateNotificationPause() {
-    const shouldPause = notificationPointerInside || notificationFocusInside;
-    if (shouldPause === notificationPaused) return;
-    notificationPaused = shouldPause;
-    if (notificationPaused) {
-      if (formNotificationTimer) clearTimeout(formNotificationTimer);
-      if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
-      formNotificationTimer = null;
-      optimisticNotificationTimer = null;
-    } else if (optimisticNotification) {
-      scheduleOptimisticNotificationDismiss();
-    } else if (formState?.message && !formNotificationDismissed) {
-      scheduleFormNotificationDismiss();
-    }
-  }
+  const formIsError = $derived(Boolean(transientNotice?.error));
 
   function onNotificationFocusOut(event: FocusEvent) {
     const container = event.currentTarget as HTMLElement;
     if (event.relatedTarget instanceof Node && container.contains(event.relatedTarget)) return;
-    notificationFocusInside = false;
-    updateNotificationPause();
+    notifications.setFocusInside(false);
   }
 
   $effect(() => {
-    // Read the prop itself so identical messages from separate submissions
-    // still restart the notification timer.
-    const currentForm = form as FormState;
-    const message = currentForm?.message;
-    formNotificationDismissed = false;
-    if (!message) return;
-
-    formNotificationDismissDelay = currentForm?.error
-      ? FORM_NOTIFICATION_ERROR_DISMISS_MS
-      : currentForm?.undo_id || currentForm?.undo_decisions?.length
-        ? 0
-        : FORM_NOTIFICATION_DISMISS_MS;
-    scheduleFormNotificationDismiss();
-    return () => {
-      if (formNotificationTimer) clearTimeout(formNotificationTimer);
-      formNotificationTimer = null;
-    };
+    notifications.applyForm(form as FormState);
   });
 
-  function readView(value: string | null): View {
-    return value && ["discover", "saved", "decisions", "sources", "settings"].includes(value)
-      ? (value as View)
-      : "discover";
+  function resetClientPagination() {
+    discoverFilterAbortController?.abort();
+    discoverFilterAbortController = null;
+    decisionQueryAbortController?.abort();
+    decisionQueryAbortController = null;
+    additionalDiscoverBooks = [];
+    unfilteredDiscoverOffset = data.books.filter(
+      (book) => book.status === "recommended",
+    ).length;
+    unfilteredDiscoverHasMore = Boolean(data.recommendations_has_more);
+    filteredDiscoverBooks = [];
+    filteredDiscoverOffset = 0;
+    filteredDiscoverHasMore = false;
+    filteredDiscoverLoadedKey = "";
+    filteredDiscoverPending = false;
+    discoverLoading = false;
+    discoverLoadError = "";
+    discoverVisibleCount = DISCOVER_PAGE_SIZE;
+    additionalDecisionBooks = [];
+    unfilteredDecisionOffset = data.decisions.length;
+    queriedDecisionBooks = [];
+    queriedDecisionOffset = 0;
+    queriedDecisionsHasMore = false;
+    queriedDecisionLoadedKey = "";
+    queriedDecisionPending = false;
+    decisionsHasMoreOverride = null;
+    decisionsLoading = false;
+    decisionsLoadError = "";
+    undoBookSnapshots.clear();
   }
+
+  function resetReadingHistory() {
+    readingHistoryGeneration += 1;
+    readingHistoryScoreTask = null;
+    readingHistoryScoreRefreshQueued = false;
+    readingHistory = [];
+    readingHistoryState = "idle";
+    readingHistoryError = "";
+    readingHistoryScoreState = "idle";
+    readingHistoryScoreError = "";
+    readingHistoryScoreOffset = 0;
+    bufferedReadingHistoryScores = new Map();
+  }
+
   async function loadReadingHistory() {
     if (readingHistoryState === "loading" || readingHistoryState === "ready") return;
+    const generation = ++readingHistoryGeneration;
+    readingHistoryScoreTask = null;
     readingHistoryState = "loading";
     readingHistoryImmediate = true;
     readingHistoryError = "";
     readingHistoryScoreState = "idle";
     readingHistoryScoreError = "";
     readingHistoryScoreOffset = 0;
+    bufferedReadingHistoryScores = new Map();
     try {
       const response = await fetch("/api/reading-history", { headers: profileHeaders });
       const payload = (await response.json().catch(() => ({}))) as {
         items?: ReadingHistoryItem[];
         message?: string;
+        detail?: string;
       };
+      if (generation !== readingHistoryGeneration) return;
       if (!response.ok || !Array.isArray(payload.items)) {
-        throw new Error(payload.message || "Reading history could not be loaded.");
+        throw new Error(payloadErrorMessage(payload, "Reading history could not be loaded."));
       }
       readingHistory = payload.items;
       readingHistoryImmediate = true;
       readingHistoryState = "ready";
-      void loadReadingHistoryScores(payload.items.length);
+      void loadReadingHistoryScores(payload.items.length, generation);
     } catch (error) {
+      if (generation !== readingHistoryGeneration) return;
       readingHistoryError = error instanceof Error
         ? error.message
         : "Reading history could not be loaded.";
       readingHistoryState = "error";
     }
   }
-  function loadReadingHistoryScores(total: number) {
+  function loadReadingHistoryScores(total: number, generation = readingHistoryGeneration) {
     if (readingHistoryScoreTask) return readingHistoryScoreTask;
-    const batchSize = 20;
-    if (total === 0) {
+    const batchSize = READING_HISTORY_SCORE_BATCH_SIZE;
+    if (total === 0 || readingHistoryScoreOffset >= total) {
+      if (bufferedReadingHistoryScores.size > 0) {
+        readingHistory = applyReadingHistoryScores(
+          readingHistory,
+          bufferedReadingHistoryScores,
+        );
+        bufferedReadingHistoryScores = new Map();
+      }
       readingHistoryScoreState = "ready";
       return Promise.resolve();
     }
     readingHistoryScoreState = "loading";
     readingHistoryScoreError = "";
-    const task = (async () => {
+    let finished = false;
+    let task: Promise<void> | null = null;
+    const run = async () => {
       try {
-        for (let offset = readingHistoryScoreOffset; offset < total; offset += batchSize) {
-          const response = await fetch(
-            `/api/reading-history/scores?offset=${offset}&limit=${batchSize}`,
-            { headers: profileHeaders },
-          );
-          const payload = (await response.json().catch(() => ({}))) as {
-            scores?: Pick<ReadingHistoryItem, "id" | "algorithm_score" | "algorithm_explanation" | "metadata_confidence">[];
-            message?: string;
-          };
-          if (!response.ok || !Array.isArray(payload.scores)) {
-            throw new Error(payload.message || "Reading history scores could not be loaded.");
-          }
-          const scoresById = new Map(payload.scores.map((item) => [item.id, item]));
-          readingHistory = readingHistory.map((item) => {
-            const score = scoresById.get(item.id);
-            return score ? { ...item, ...score } : item;
-          });
-          readingHistoryScoreOffset = offset + batchSize;
+        const outcome = await runReadingHistoryScoreBatches({
+          total,
+          startOffset: readingHistoryScoreOffset,
+          initialBuffer: bufferedReadingHistoryScores,
+          batchSize,
+          isCurrent: () => generation === readingHistoryGeneration,
+          fetchBatch: async (offset, limit) => {
+            const response = await fetch(
+              `/api/reading-history/scores?offset=${offset}&limit=${limit}`,
+              { headers: profileHeaders },
+            );
+            const payload = (await response.json().catch(() => ({}))) as {
+              scores?: ReadingHistoryScorePatch[];
+              message?: string;
+              detail?: string;
+            };
+            return {
+              ok: response.ok,
+              status: response.status,
+              scores: payload.scores,
+              message: response.ok
+                ? payload.message
+                : payloadErrorMessage(payload, "Reading history scores could not be loaded."),
+            };
+          },
+          onBatch: ({ nextOffset, buffered }) => {
+            bufferedReadingHistoryScores = buffered;
+            readingHistoryScoreOffset = nextOffset;
+          },
+        });
+        if (outcome.status === "stale") return;
+        if (outcome.status === "error") {
+          readingHistoryScoreOffset = outcome.nextOffset;
+          bufferedReadingHistoryScores = outcome.buffered;
+          readingHistoryScoreError = outcome.message;
+          readingHistoryScoreState = "error";
+          return;
         }
+        readingHistoryScoreOffset = outcome.nextOffset;
+        readingHistory = applyReadingHistoryScores(
+          readingHistory,
+          outcome.buffered,
+        );
+        bufferedReadingHistoryScores = new Map();
         readingHistoryScoreState = "ready";
       } catch (error) {
+        if (generation !== readingHistoryGeneration) return;
         readingHistoryScoreError = error instanceof Error
           ? error.message
           : "Reading history scores could not be loaded.";
         readingHistoryScoreState = "error";
       } finally {
-        readingHistoryScoreTask = null;
+        finished = true;
+        if (task && readingHistoryScoreTask === task) {
+          readingHistoryScoreTask = null;
+        }
       }
-    })();
-    readingHistoryScoreTask = task;
+    };
+    task = run();
+    if (!finished) {
+      readingHistoryScoreTask = task;
+    }
     return task;
   }
   async function refreshReadingHistoryScores() {
     if (readingHistoryState !== "ready") return;
+    const generation = readingHistoryGeneration;
     if (readingHistoryScoreTask) {
       if (readingHistoryScoreRefreshQueued) return;
       readingHistoryScoreRefreshQueued = true;
@@ -1383,10 +1441,11 @@
       } finally {
         readingHistoryScoreRefreshQueued = false;
       }
-      if (readingHistoryState !== "ready") return;
+      if (generation !== readingHistoryGeneration || readingHistoryState !== "ready") return;
     }
     readingHistoryScoreOffset = 0;
-    await loadReadingHistoryScores(readingHistory.length);
+    bufferedReadingHistoryScores = new Map();
+    await loadReadingHistoryScores(readingHistory.length, generation);
   }
   const ratingController = createReadingHistoryRatingController({
     saveRating: async (id, nextRating) => {
@@ -1398,9 +1457,12 @@
       const payload = (await response.json().catch(() => ({}))) as {
         item?: { rating?: number | null };
         message?: string;
+        detail?: string;
       };
       if (!response.ok) {
-        throw new Error(payload.message || "Rating could not be saved. Your change was reverted.");
+        throw new Error(
+          payloadErrorMessage(payload, "Rating could not be saved. Your change was reverted."),
+        );
       }
       return payload.item && "rating" in payload.item ? (payload.item.rating ?? null) : nextRating;
     },
@@ -1429,14 +1491,53 @@
     },
     afterDomUpdate: () => tick(),
   });
-  function selectDecisionFilter(nextFilter: "all" | "maybe_later" | "rejected" | "read") {
+  const urlNavigation = createUrlNavigationController({
+    getState: () =>
+      untrack(() => ({
+        view: activeView,
+        decisionFilter,
+        digestMode,
+      })),
+    setState: (patch) => {
+      if (patch.view !== undefined) activeView = patch.view;
+      if (patch.decisionFilter !== undefined) decisionFilter = patch.decisionFilter;
+      if (patch.digestMode !== undefined) digestMode = patch.digestMode;
+    },
+    getDigestReviewRequested: () => data.digestReview.requested,
+    getCurrentLocationUrl: () =>
+      typeof window !== "undefined" ? new URL(window.location.href) : null,
+    pushUrl: (nextUrl) => pushState(nextUrl, {}),
+    scrollToTop: () => {
+      if (typeof window !== "undefined") {
+        window.scrollTo(0, 0);
+      }
+    },
+    onViewEvaluated: (view) => {
+      const nextToken = tokenForView(view, untrack(() => revealedApiToken));
+      if (!nextToken) apiTokenCopyStatus = null;
+      revealedApiToken = nextToken;
+    },
+    onResetDecisionPagination: () => {
+      readingHistoryVisibleCount = 30;
+    },
+    onClearDecisionsError: () => {
+      decisionsLoadError = "";
+    },
+    onExitDigestMode: () => {
+      clearDigestSelection();
+    },
+    onRequestReadingHistoryLoad: () => {
+      void loadReadingHistory();
+    },
+  });
+  function syncFromUrl(url: Parameters<typeof readUrlViewState>[0]) {
+    urlNavigation.syncFromUrl(url);
+  }
+  function selectDecisionFilter(nextFilter: DecisionFilter) {
     const inDecisionsView = activeView === "decisions";
     recommendationsImmediate = inDecisionsView;
     readingHistoryImmediate = inDecisionsView;
-    decisionFilter = nextFilter;
-    readingHistoryVisibleCount = 30;
-    decisionsLoadError = "";
-    if (nextFilter === "read") void loadReadingHistory();
+    urlNavigation.selectDecisionFilter(nextFilter);
   }
   function toggleReadingDetails(id: number) {
     expandedReadingDetails = expandedReadingDetails.includes(id)
@@ -1449,6 +1550,44 @@
     else next.add(id);
     expandedRecommendationDetails = next;
   }
+  function toggleSynopsis(id: number) {
+    const next = new Set(expandedSynopses);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    expandedSynopses = next;
+  }
+  function measureSynopsisOverflow(node: HTMLElement, id: number) {
+    let currentId = id;
+    const check = () => {
+      if (untrack(() => expandedSynopses.has(currentId))) return;
+      const overflows = node.scrollHeight > node.clientHeight + 1;
+      untrack(() => {
+        if (!measuredSynopses.has(currentId)) {
+          const nextMeasured = new Set(measuredSynopses);
+          nextMeasured.add(currentId);
+          measuredSynopses = nextMeasured;
+        }
+        if (overflowingSynopses.has(currentId) !== overflows) {
+          const nextOverflow = new Set(overflowingSynopses);
+          if (overflows) nextOverflow.add(currentId);
+          else nextOverflow.delete(currentId);
+          overflowingSynopses = nextOverflow;
+        }
+      });
+    };
+    check();
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(check) : null;
+    observer?.observe(node);
+    return {
+      update(nextId: number) {
+        currentId = nextId;
+        check();
+      },
+      destroy() {
+        observer?.disconnect();
+      },
+    };
+  }
   function readingSourceLabel(source: string) {
     return formatReadingSourceLabel(source);
   }
@@ -1459,18 +1598,22 @@
       ? value
       : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
   }
-  function go(view: View) {
-    const nextToken = tokenForView(view, revealedApiToken);
-    if (!nextToken) apiTokenCopyStatus = null;
-    revealedApiToken = nextToken;
-    activeView = view;
-    if (view === "decisions" && decisionFilter === "read") void loadReadingHistory();
-    if (typeof window !== "undefined") {
-      const url = new URL(window.location.href);
-      url.searchParams.set("view", view);
-      if (view !== "discover") url.searchParams.delete("digest");
-      pushState(url, {});
+  function go(view: View, nextDecisionFilter?: DecisionFilter) {
+    urlNavigation.go(view, nextDecisionFilter);
+  }
+  function onHomeClick(event: MouseEvent) {
+    if (
+      event.defaultPrevented ||
+      event.button !== 0 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey
+    ) {
+      return;
     }
+    event.preventDefault();
+    urlNavigation.goHome();
   }
   async function goToLibrarrSettings() {
     go("settings");
@@ -1486,32 +1629,11 @@
     section.focus({ preventScroll: true });
   }
   function announceActionError(message: string) {
-    if (formNotificationTimer) clearTimeout(formNotificationTimer);
-    formNotificationTimer = null;
-    const id = ++optimisticNotificationId;
-    formNotificationDismissed = true;
-    optimisticNotification = { message, error: true, id };
-    optimisticNotificationDismissDelay = FORM_NOTIFICATION_ERROR_DISMISS_MS;
-    scheduleOptimisticNotificationDismiss();
+    notifications.announceError(message);
   }
 
   function announceActionSuccess(message: string) {
-    if (formNotificationTimer) clearTimeout(formNotificationTimer);
-    formNotificationTimer = null;
-    const id = ++optimisticNotificationId;
-    formNotificationDismissed = true;
-    optimisticNotification = { message, error: false, id };
-    optimisticNotificationDismissDelay = FORM_NOTIFICATION_DISMISS_MS;
-    scheduleOptimisticNotificationDismiss();
-  }
-
-  function dismissNotification() {
-    if (formNotificationTimer) clearTimeout(formNotificationTimer);
-    formNotificationTimer = null;
-    if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
-    optimisticNotificationTimer = null;
-    optimisticNotification = null;
-    formNotificationDismissed = true;
+    notifications.announceSuccess(message);
   }
 
   function withPending(key: string, add: boolean) {
@@ -1520,6 +1642,74 @@
     else next.delete(key);
     pendingActions = next;
   }
+
+  function submitUndoDecision(key: string): SubmitFunction {
+    return ({ formData }) => {
+      withPending(key, true);
+      let change: OptimisticChange | void;
+      try {
+        change = optimisticUndoDecision(formData);
+      } catch {
+        change = undefined;
+      }
+      return async ({ update, result }) => {
+        const succeeded = result.type === "success" || result.type === "redirect";
+        const rollback = () => {
+          try {
+            change?.rollback?.();
+          } catch {
+            // A rollback must never obscure the action result.
+          }
+        };
+        try {
+          if (!succeeded) {
+            rollback();
+          }
+          if (result.type === "error") {
+            announceActionError(actionResultMessage(result));
+            return;
+          }
+          if (succeeded) {
+            notifications.clearUndoKey(key);
+          }
+          await update({ navigate: false });
+          if (succeeded) change?.commit?.();
+        } catch (error) {
+          rollback();
+          announceActionError(
+            error instanceof Error
+              ? error.message
+              : "The request could not be completed. Your change was reverted.",
+          );
+        } finally {
+          withPending(key, false);
+        }
+      };
+    };
+  }
+
+  function submitMarkRead(bookId: number): SubmitFunction {
+    return createMarkReadSubmit({
+      bookId,
+      setError: (message) => {
+        markReadError = message;
+      },
+      setPending: withPending,
+      startOptimistic: optimisticShortlistRead,
+      onSuccess: () => {
+        resetReadingHistory();
+        notifications.clearUndoForBook(bookId);
+      },
+    });
+  }
+
+  const submitLogout: SubmitFunction = createLogoutSubmit({
+    setPending: (pending) => withPending("logout", pending),
+    closeMenu: () => {
+      profileMenuOpen = false;
+    },
+    announceError: announceActionError,
+  });
 
   function setPending(
     key: string,
@@ -1550,10 +1740,10 @@
             announceActionError(actionResultMessage(result));
             return;
           }
-          if (optimisticNotificationTimer) clearTimeout(optimisticNotificationTimer);
-          optimisticNotificationTimer = null;
-          optimisticNotification = null;
-          await update();
+          await update({ navigate: false });
+          if (succeeded && key === "sync") {
+            resetClientPagination();
+          }
           if (
             succeeded &&
             (key.startsWith("read-") ||
@@ -1562,8 +1752,7 @@
               key === "csv-import" ||
               key === "goodreads-csv")
           ) {
-            readingHistory = [];
-            readingHistoryState = "idle";
+            resetReadingHistory();
           }
           if (succeeded) change?.commit?.();
           if (
@@ -1573,7 +1762,8 @@
               key === "goodreads-rss" ||
               key === "goodreads-csv" ||
               key === "source" ||
-              key.startsWith("source-"))
+              key.startsWith("source-") ||
+              key.startsWith("refresh-source-"))
           ) {
             if (hasActiveDiscoverFilter) reloadFilteredDiscover();
             if (isQueriedDecisionMode) reloadQueriedDecisions();
@@ -1651,12 +1841,14 @@
             announceActionError(actionResultMessage(result));
             return;
           }
-          await update({ reset: false });
+          await update({ reset: false, navigate: false });
           if (succeeded) {
             const nextDrafts = { ...sourceEditDrafts };
             delete nextDrafts[sourceId];
             sourceEditDrafts = nextDrafts;
             setSourceEditOpen(sourceId, false);
+            if (hasActiveDiscoverFilter) reloadFilteredDiscover();
+            if (isQueriedDecisionMode) reloadQueriedDecisions();
           }
         } catch (error) {
           announceActionError(
@@ -1671,25 +1863,42 @@
     };
   }
 
-  function applyCommittedStatusToClientSlices(id: number, status: string) {
-    const knownBook = allBooks.find((item) => item.id === id);
+  function applyCommittedStatusToClientSlices(
+    id: number,
+    status: string,
+    fallbackBook?: PageBook,
+  ) {
+    const knownBook = allBooks.find((item) => item.id === id) ?? fallbackBook;
     const prevFilteredDiscover = filteredDiscoverBooks.find((item) => item.id === id);
-    if (prevFilteredDiscover && prevFilteredDiscover.status === "recommended" && status !== "recommended") {
+    if (
+      prevFilteredDiscover &&
+      prevFilteredDiscover.status === "recommended" &&
+      status !== "recommended"
+    ) {
       filteredDiscoverOffset = Math.max(0, filteredDiscoverOffset - 1);
+    } else if (
+      prevFilteredDiscover &&
+      prevFilteredDiscover.status !== "recommended" &&
+      status === "recommended"
+    ) {
+      filteredDiscoverOffset += 1;
     }
     const prevQueriedDecision = queriedDecisionBooks.find((item) => item.id === id);
-    const wasDecision = prevQueriedDecision && ["rejected", "maybe_later"].includes(prevQueriedDecision.status);
+    const wasDecision = Boolean(
+      prevQueriedDecision &&
+        ["rejected", "maybe_later"].includes(prevQueriedDecision.status),
+    );
     const isDecision = ["rejected", "maybe_later"].includes(status);
     if (wasDecision && !isDecision) {
       queriedDecisionOffset = Math.max(0, queriedDecisionOffset - 1);
+    } else if (!wasDecision && isDecision && prevQueriedDecision) {
+      queriedDecisionOffset += 1;
     }
     const updateSlice = (items: PageBook[]) =>
       items.some((item) => item.id === id)
         ? items.map((item) => (item.id === id ? { ...item, status } : item))
         : items;
-    additionalDiscoverBooks = updateSlice(additionalDiscoverBooks);
     filteredDiscoverBooks = updateSlice(filteredDiscoverBooks);
-    additionalDecisionBooks = updateSlice(additionalDecisionBooks);
     if (
       isDecision &&
       !prevQueriedDecision &&
@@ -1705,20 +1914,54 @@
     }
   }
 
-  function optimisticBookStatus(id: number, status: string): OptimisticChange | void {
+  function optimisticBookStatus(
+    id: number,
+    status: string,
+    recordUndo = false,
+  ): OptimisticChange | void {
+    const discoverIndex = additionalDiscoverBooks.findIndex((item) => item.id === id);
+    const decisionIndex = additionalDecisionBooks.findIndex((item) => item.id === id);
     const book = allBooks.find((item) => item.id === id);
     if (!book) return;
+    if (recordUndo && ["saved", "rejected", "maybe_later"].includes(status)) {
+      undoBookSnapshots.set(id, {
+        book: { ...book },
+        previousStatus: book.status,
+        discoverIndex,
+        decisionIndex,
+      });
+    } else if (status === "recommended" || status === "read") {
+      undoBookSnapshots.delete(id);
+    }
+    const snapshot = { ...book };
     const previous = bookStatusOverrides[id];
     bookStatusOverrides = { ...bookStatusOverrides, [id]: status };
     return {
       commit: () => {
+        const reconciled = reconcileBookMutation({
+          serverBooks: data.books,
+          serverDecisions: data.decisions,
+          additionalDiscoverBooks,
+          additionalDecisionBooks,
+          id,
+          nextStatus: status,
+          snapshot,
+        });
+        additionalDiscoverBooks = reconciled.additionalDiscoverBooks;
+        additionalDecisionBooks = reconciled.additionalDecisionBooks;
+        unfilteredDiscoverOffset =
+          data.books.filter((item) => item.status === "recommended").length +
+          reconciled.additionalDiscoverBooks.length;
+        unfilteredDecisionOffset =
+          data.decisions.length + reconciled.additionalDecisionBooks.length;
         if (bookStatusOverrides[id] !== status) return;
-        applyCommittedStatusToClientSlices(id, status);
+        applyCommittedStatusToClientSlices(id, status, snapshot);
         const next = { ...bookStatusOverrides };
         delete next[id];
         bookStatusOverrides = next;
       },
       rollback: () => {
+        if (recordUndo) undoBookSnapshots.delete(id);
         if (bookStatusOverrides[id] !== status) return;
         const next = { ...bookStatusOverrides };
         if (previous === undefined) delete next[id];
@@ -1732,8 +1975,83 @@
     const id = Number(formData.get("id"));
     const status = String(formData.get("status") ?? "");
     return Number.isInteger(id) && ["saved", "rejected", "maybe_later", "recommended"].includes(status)
-      ? optimisticBookStatus(id, status)
+      ? optimisticBookStatus(id, status, true)
       : undefined;
+  }
+
+  function optimisticUndoDecision(formData: FormData): OptimisticChange | void {
+    const ids = [
+      ...new Set(
+        formData
+          .getAll("id")
+          .map((value) => Number(value))
+          .filter((id) => Number.isInteger(id)),
+      ),
+    ];
+    if (!ids.length) return;
+    const entries = ids.map((id) => {
+      const undoSnapshot = undoBookSnapshots.get(id);
+      const restoredStatus = undoSnapshot?.previousStatus ?? "recommended";
+      const fallbackBook = allBooks.find((item) => item.id === id);
+      const snapshot =
+        undoSnapshot?.book ?? (fallbackBook ? { ...fallbackBook } : undefined);
+      const previousOverride = bookStatusOverrides[id];
+      return { id, undoSnapshot, restoredStatus, snapshot, previousOverride };
+    });
+    const nextOverrides = { ...bookStatusOverrides };
+    for (const entry of entries) {
+      nextOverrides[entry.id] = entry.restoredStatus;
+    }
+    bookStatusOverrides = nextOverrides;
+    return {
+      commit: () => {
+        let nextDiscover = additionalDiscoverBooks;
+        let nextDecisions = additionalDecisionBooks;
+        for (const entry of entries) {
+          const reconciled = reconcileBookMutation({
+            serverBooks: data.books,
+            serverDecisions: data.decisions,
+            additionalDiscoverBooks: nextDiscover,
+            additionalDecisionBooks: nextDecisions,
+            id: entry.id,
+            nextStatus: entry.restoredStatus,
+            snapshot: entry.snapshot,
+            restoreDiscoverIndex: entry.undoSnapshot?.discoverIndex,
+            restoreDecisionIndex: entry.undoSnapshot?.decisionIndex,
+          });
+          nextDiscover = reconciled.additionalDiscoverBooks;
+          nextDecisions = reconciled.additionalDecisionBooks;
+          undoBookSnapshots.delete(entry.id);
+          applyCommittedStatusToClientSlices(
+            entry.id,
+            entry.restoredStatus,
+            entry.snapshot,
+          );
+        }
+        additionalDiscoverBooks = nextDiscover;
+        additionalDecisionBooks = nextDecisions;
+        unfilteredDiscoverOffset =
+          data.books.filter((item) => item.status === "recommended").length +
+          nextDiscover.length;
+        unfilteredDecisionOffset = data.decisions.length + nextDecisions.length;
+        const cleaned = { ...bookStatusOverrides };
+        for (const entry of entries) {
+          if (cleaned[entry.id] === entry.restoredStatus) {
+            delete cleaned[entry.id];
+          }
+        }
+        bookStatusOverrides = cleaned;
+      },
+      rollback: () => {
+        const reverted = { ...bookStatusOverrides };
+        for (const entry of entries) {
+          if (reverted[entry.id] !== entry.restoredStatus) continue;
+          if (entry.previousOverride === undefined) delete reverted[entry.id];
+          else reverted[entry.id] = entry.previousOverride;
+        }
+        bookStatusOverrides = reverted;
+      },
+    };
   }
 
   function optimisticRead(formData: FormData) {
@@ -1764,7 +2082,7 @@
         .map((value) => Number(value))
         .filter((id) => Number.isInteger(id)),
     )];
-    const changes = ids.map((id) => optimisticBookStatus(id, "saved")).filter(Boolean) as OptimisticChange[];
+    const changes = ids.map((id) => optimisticBookStatus(id, "saved", true)).filter(Boolean) as OptimisticChange[];
     return {
       commit: () => {
         changes.forEach((change) => change.commit?.());
@@ -2055,10 +2373,11 @@
         items?: PageBook[];
         has_more?: boolean;
         message?: string;
+        detail?: string;
       };
       if (discoverFilterAbortController !== controller) return;
       if (!response.ok || !Array.isArray(payload.items)) {
-        throw new Error(payload.message || "Recommendations could not be loaded.");
+        throw new Error(payloadErrorMessage(payload, "Recommendations could not be loaded."));
       }
       filteredDiscoverBooks = payload.items;
       filteredDiscoverOffset = payload.items.length;
@@ -2134,10 +2453,11 @@
         items?: PageBook[];
         has_more?: boolean;
         message?: string;
+        detail?: string;
       };
       if (discoverFilterAbortController !== controller) return;
       if (!response.ok || !Array.isArray(payload.items)) {
-        throw new Error(payload.message || "Recommendations could not be loaded.");
+        throw new Error(payloadErrorMessage(payload, "Recommendations could not be loaded."));
       }
       if (filteredMode) {
         if (activeDiscoverFilterKey !== expectedFilterKey) return;
@@ -2202,10 +2522,11 @@
         items?: PageBook[];
         has_more?: boolean;
         message?: string;
+        detail?: string;
       };
       if (decisionQueryAbortController !== controller) return;
       if (!response.ok || !Array.isArray(payload.items)) {
-        throw new Error(payload.message || "Past decisions could not be loaded.");
+        throw new Error(payloadErrorMessage(payload, "Past decisions could not be loaded."));
       }
       queriedDecisionBooks = payload.items;
       queriedDecisionOffset = payload.items.length;
@@ -2272,10 +2593,11 @@
         items?: PageBook[];
         has_more?: boolean;
         message?: string;
+        detail?: string;
       };
       if (decisionQueryAbortController !== controller) return;
       if (!response.ok || !Array.isArray(payload.items)) {
-        throw new Error(payload.message || "Past decisions could not be loaded.");
+        throw new Error(payloadErrorMessage(payload, "Past decisions could not be loaded."));
       }
       if (queriedMode) {
         if (activeDecisionQueryKey !== expectedKey) return;
@@ -2449,12 +2771,16 @@
     void searchLibrarr();
   }
   function openMarkRead(book: PageBook) {
+    openReadMenuId = null;
     markReadBook = book;
     markReadRating = 0;
+    markReadError = "";
+    openReadMenuId = null;
   }
   function closeMarkRead() {
     markReadBook = null;
     markReadRating = 0;
+    markReadError = "";
   }
   function closeLibrarrSearch() {
     librarrSearchAbortController?.abort();
@@ -2525,35 +2851,71 @@
   });
 
   $effect(() => {
-    const nextBooks = data.books;
-    const nextHasMore = Boolean(data.recommendations_has_more);
-    if (
-      previousDataBooks === nextBooks &&
-      previousDataRecommendationsHasMore === nextHasMore
-    )
-      return;
-    previousDataBooks = nextBooks;
-    previousDataRecommendationsHasMore = nextHasMore;
-    additionalDiscoverBooks = [];
-    unfilteredDiscoverOffset = nextBooks.filter(
-      (book) => book.status === "recommended",
-    ).length;
-    unfilteredDiscoverHasMore = nextHasMore;
-    discoverLoadError = "";
+    const nextProfileId = data.user?.profile_id;
+    if (previousProfileId === nextProfileId) return;
+    previousProfileId = nextProfileId;
+    resetClientPagination();
+    resetReadingHistory();
   });
 
   $effect(() => {
-    const nextDecisions = data.decisions;
-    const nextHasMore = Boolean(data.decisions_has_more);
+    const currentUrl = page.shallow?.url ?? page.url;
+    syncFromUrl(currentUrl);
+  });
+
+  $effect(() => {
     if (
+      activeView === "decisions" &&
+      decisionFilter === "read" &&
+      readingHistoryState === "idle"
+    ) {
+      void loadReadingHistory();
+    }
+  });
+
+  $effect(() => {
+    const nextBooks = data.books;
+    const nextRecommendationsHasMore = Boolean(data.recommendations_has_more);
+    const nextDecisions = data.decisions;
+    const nextDecisionsHasMore = Boolean(data.decisions_has_more);
+    if (
+      previousDataBooks === nextBooks &&
+      previousDataRecommendationsHasMore === nextRecommendationsHasMore &&
       previousDataDecisions === nextDecisions &&
-      previousDataDecisionsHasMore === nextHasMore
-    ) return;
+      previousDataDecisionsHasMore === nextDecisionsHasMore
+    ) {
+      return;
+    }
+    const prevDiscover = untrack(() => additionalDiscoverBooks);
+    const prevDecisions = untrack(() => additionalDecisionBooks);
+    const prevDiscoverHasMore = untrack(() => unfilteredDiscoverHasMore);
+    const prevDecisionsOverride = untrack(() => decisionsHasMoreOverride);
+    previousDataBooks = nextBooks;
+    previousDataRecommendationsHasMore = nextRecommendationsHasMore;
     previousDataDecisions = nextDecisions;
-    previousDataDecisionsHasMore = nextHasMore;
-    additionalDecisionBooks = [];
-    unfilteredDecisionOffset = nextDecisions.length;
-    decisionsHasMoreOverride = null;
+    previousDataDecisionsHasMore = nextDecisionsHasMore;
+    const reconciled = reconcilePagedBooks(
+      nextBooks,
+      nextDecisions,
+      prevDiscover,
+      prevDecisions,
+    );
+    additionalDiscoverBooks = reconciled.additionalDiscoverBooks;
+    additionalDecisionBooks = reconciled.additionalDecisionBooks;
+    unfilteredDiscoverOffset =
+      nextBooks.filter((book) => book.status === "recommended").length +
+      reconciled.additionalDiscoverBooks.length;
+    unfilteredDiscoverHasMore =
+      nextRecommendationsHasMore &&
+      (prevDiscover.length > 0 ? prevDiscoverHasMore : true);
+    unfilteredDecisionOffset =
+      nextDecisions.length + reconciled.additionalDecisionBooks.length;
+    decisionsHasMoreOverride = !nextDecisionsHasMore
+      ? false
+      : prevDecisions.length > 0 && prevDecisionsOverride === false
+        ? false
+        : null;
+    discoverLoadError = "";
     decisionsLoadError = "";
   });
 
@@ -2565,8 +2927,16 @@
   });
 
   $effect(() => {
-    discoverSearch;
-    discoverGenre;
+    const nextSearch = discoverSearch;
+    const nextGenre = discoverGenre;
+    if (
+      previousDiscoverSearch === nextSearch &&
+      previousDiscoverGenre === nextGenre
+    ) {
+      return;
+    }
+    previousDiscoverSearch = nextSearch;
+    previousDiscoverGenre = nextGenre;
     discoverVisibleCount = DISCOVER_PAGE_SIZE;
   });
 
@@ -2676,51 +3046,6 @@
       decisionsGenre = "";
     }
   });
-
-  // A delivery link can outlive its notification history. Keep that case
-  // useful by showing the normal Discover feed instead of an empty digest.
-  $effect(() => {
-    if (
-      digestMode &&
-      page.url.searchParams.has("digest_period") &&
-      !data.digestReview.requested
-    ) {
-      digestMode = false;
-    }
-  });
-
-  $effect(() => {
-    const sentinel = loadMoreSentinel;
-    const canLoadMore = hasMoreDiscoverBooks;
-    const loading = discoverLoading;
-    const pending = filteredDiscoverPending;
-    const hasError = Boolean(discoverLoadError);
-    const visibleCount = discoverViewVisibleBooks.length;
-    const serverOffset = hasActiveDiscoverFilter
-      ? filteredDiscoverOffset
-      : unfilteredDiscoverOffset;
-    void visibleCount;
-    void serverOffset;
-    if (
-      !sentinel ||
-      !canLoadMore ||
-      loading ||
-      pending ||
-      hasError ||
-      typeof IntersectionObserver === "undefined"
-    )
-      return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (!discoverLoadError && entries.some((entry) => entry.isIntersecting)) {
-          void loadMoreDiscover();
-        }
-      },
-      { rootMargin: "240px 0px" },
-    );
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  });
   function handleLibrarrMediaTypeChange(event: Event) {
     const nextMediaType: MediaType =
       (event.currentTarget as HTMLSelectElement).value === "ebook"
@@ -2786,9 +3111,10 @@
         const payload = (await response.json().catch(() => ({}))) as {
           results?: unknown[];
           message?: string;
+          detail?: string;
         };
         if (!response.ok)
-          throw new Error(payload.message || "Librarr search failed.");
+          throw new Error(payloadErrorMessage(payload, "Librarr search failed."));
         librarrResults = Array.isArray(payload.results)
           ? payload.results.filter((item): item is LibrarrResult =>
               Boolean(item && typeof item === "object" && !Array.isArray(item)),
@@ -2801,8 +3127,9 @@
         if (!response.ok) {
           const payload = (await response.json().catch(() => ({}))) as {
             message?: string;
+            detail?: string;
           };
-          throw new Error(payload.message || "Librarr search failed.");
+          throw new Error(payloadErrorMessage(payload, "Librarr search failed."));
         }
         if (!isEventStream) throw new Error("Librarr did not return a search stream.");
         const progress = await readLibrarrSearchStream(response, (results) => {
@@ -2852,9 +3179,11 @@
       });
       const payload = (await response.json().catch(() => ({}))) as {
         message?: string;
+        detail?: string;
       };
       if (!response.ok)
-        throw new Error(payload.message || "Librarr could not add that book.");
+        throw new Error(payloadErrorMessage(payload, "Librarr could not add that book."));
+      if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
       if (closeAfter) {
         announceActionSuccess(`${resultTitle(result)} added to Librarr.`);
@@ -2901,14 +3230,7 @@
 
   onMount(() => {
     const onPopState = () => {
-      const nextView = readView(
-        new URL(window.location.href).searchParams.get("view"),
-      );
-      const nextToken = tokenForView(nextView, revealedApiToken);
-      if (!nextToken) apiTokenCopyStatus = null;
-      revealedApiToken = nextToken;
-      activeView = nextView;
-      digestMode = new URL(window.location.href).searchParams.get("digest") === "1";
+      syncFromUrl(new URL(window.location.href));
     };
     const onKeydown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && openReadMenuId !== null) {
@@ -2978,7 +3300,10 @@
                   },
                   body,
                 });
-                if (!response.ok) throw new Error("Could not shortlist that book.");
+                if (!response.ok) {
+                  const payload = await response.json().catch(() => ({}));
+                  throw new Error(payloadErrorMessage(payload, "Could not shortlist that book."));
+                }
                 await applyAction(deserialize(await response.text()));
                 await invalidateAll();
                 change?.commit?.();
@@ -2999,6 +3324,7 @@
     }
     return () => {
       lifecycle.abort();
+      notifications.destroy();
       if (discoverFilterDebounceTimer) clearTimeout(discoverFilterDebounceTimer);
       if (decisionQueryDebounceTimer) clearTimeout(decisionQueryDebounceTimer);
       discoverFilterAbortController?.abort();
@@ -3028,18 +3354,19 @@
 
 <div
   data-sticky-shell
-  class="relative isolate min-h-screen overflow-x-clip text-surface-900-100 before:pointer-events-none before:fixed before:inset-0 before:-z-10 before:content-[''] before:bg-[radial-gradient(circle_at_14%_2%,_color-mix(in_oklab,_var(--color-primary-500)_72%,_transparent)_0%,_transparent_36%),radial-gradient(circle_at_86%_8%,_color-mix(in_oklab,_var(--color-secondary-500)_60%,_transparent)_0%,_transparent_32%),radial-gradient(circle_at_52%_100%,_color-mix(in_oklab,_var(--color-tertiary-500)_64%,_transparent)_0%,_transparent_44%)] before:opacity-70 after:pointer-events-none after:fixed after:inset-0 after:-z-10 after:content-[''] after:bg-[linear-gradient(118deg,_transparent_0%,_color-mix(in_oklab,_var(--color-primary-500)_22%,_transparent)_42%,_transparent_68%),linear-gradient(180deg,_transparent_50%,_color-mix(in_oklab,_var(--color-secondary-500)_18%,_transparent)_100%)] after:opacity-90 dark:before:opacity-90 dark:after:opacity-100"
+  class="relative isolate flex min-h-screen flex-col overflow-x-clip text-surface-900-100 before:pointer-events-none before:fixed before:inset-0 before:-z-10 before:content-[''] before:bg-[radial-gradient(circle_at_14%_2%,_color-mix(in_oklab,_var(--color-primary-500)_72%,_transparent)_0%,_transparent_36%),radial-gradient(circle_at_86%_8%,_color-mix(in_oklab,_var(--color-secondary-500)_60%,_transparent)_0%,_transparent_32%),radial-gradient(circle_at_52%_100%,_color-mix(in_oklab,_var(--color-tertiary-500)_64%,_transparent)_0%,_transparent_44%)] before:opacity-70 after:pointer-events-none after:fixed after:inset-0 after:-z-10 after:content-[''] after:bg-[linear-gradient(118deg,_transparent_0%,_color-mix(in_oklab,_var(--color-primary-500)_22%,_transparent)_42%,_transparent_68%),linear-gradient(180deg,_transparent_50%,_color-mix(in_oklab,_var(--color-secondary-500)_18%,_transparent)_100%)] after:opacity-90 dark:before:opacity-90 dark:after:opacity-100"
 >
   <header
     class="sticky top-0 z-40 border-b border-primary-500/15 preset-filled-surface-50-950 shadow-lg shadow-primary-500/5 backdrop-blur-xl"
   >
     <div
-      class="relative mx-auto flex min-h-16 max-w-7xl items-center gap-3 px-4 sm:px-6 lg:gap-6 lg:px-8"
+      class="header-reflow relative mx-auto flex min-h-16 max-w-7xl flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 sm:px-6 lg:gap-x-6 lg:px-8"
     >
       <a
         href="/"
         class="flex min-h-11 shrink-0 items-center gap-3 text-surface-950-50 no-underline"
         aria-label="Bookward home"
+        onclick={onHomeClick}
         ><span class="grid size-10 overflow-hidden rounded-2xl shadow-lg shadow-primary-500/20"
           ><img src={bookwardMark} alt="" width="128" height="128" class="size-full object-cover" aria-hidden="true" /></span
         ><span class="hidden text-lg font-semibold tracking-tight sm:inline md:hidden lg:inline"
@@ -3047,7 +3374,7 @@
         ></a
       >
       <nav
-        class="hidden min-w-0 flex-1 items-center gap-1 md:flex"
+        class="hidden min-w-0 flex-1 basis-[15rem] flex-wrap items-center gap-1.5 py-1 md:flex"
         aria-label="Primary navigation"
       >
         {#each navItems as item}{@const Icon = item.icon}<button
@@ -3058,7 +3385,7 @@
             ><Icon size={16} strokeWidth={1.8} /><span>{item.label}</span>{#if item.id === "saved"}<span class="badge badge-sm preset-tonal-secondary">{shortlistTotalCount}</span>{/if}</button
       >{/each}
       </nav>
-      <div class="ml-auto flex items-center gap-2">
+      <div class="ml-auto flex shrink-0 items-center gap-2">
         {#if activeView === "discover" || activeView === "saved" || activeView === "sources"}<form
             method="POST"
             action="?/runSync"
@@ -3092,7 +3419,7 @@
           {/snippet}
           {#snippet children()}
             <div class="border-b border-surface-300-700/40 px-2 pb-3">
-              <p class="truncate text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
+              <p class="text-reflow text-sm font-semibold text-surface-950-50">{data.user?.display_name || data.user?.username || "Account"}</p>
               {#if data.user?.role}<p class="mt-0.5 text-xs capitalize text-surface-700-300">{data.user.role}</p>{/if}
             </div>
             <div class="grid min-w-0 gap-1 py-2">
@@ -3100,10 +3427,11 @@
               {#if data.user?.role === "admin"}<a href="/admin" class="flex min-h-11 items-center gap-3 rounded-container px-3 text-sm text-surface-800-200 no-underline hover:preset-tonal-surface"><KeyRound size={17} aria-hidden="true" />Manage accounts</a>{/if}
               <ThemePicker compact />
             </div>
-            <form method="POST" action="/auth/logout" class="border-t border-surface-300-700/40 pt-2">
-              <ProfileField profileId={data.user?.profile_id} />
-              <button class="flex min-h-11 w-full items-center gap-3 rounded-container px-3 text-left text-sm text-surface-800-200 hover:preset-tonal-surface" type="submit"><LogOut size={17} aria-hidden="true" />Sign out</button>
-            </form>
+            <LogoutMenuForm
+              profileId={data.user?.profile_id}
+              pending={isPending("logout")}
+              onSubmit={submitLogout}
+            />
           {/snippet}
         </PopoverDialog>
       </div>
@@ -3111,7 +3439,7 @@
   </header>
 
   <div
-    class="mx-auto flex max-w-7xl gap-10 px-4 pb-28 pt-8 sm:px-6 lg:px-8 lg:pb-14 lg:pt-12"
+    class="mx-auto flex w-full max-w-7xl flex-1 gap-10 px-4 pb-10 pt-8 sm:px-6 lg:px-8 lg:pb-14 lg:pt-12"
   >
     <main id="main-content" tabindex="-1" class="min-w-0 flex-1">
       <div
@@ -3119,97 +3447,132 @@
         role={formIsError ? "alert" : "status"}
         aria-live={formIsError ? "assertive" : "polite"}
         aria-atomic="true"
-      >{visibleNotification?.message ?? ""}</div>
-      {#if visibleNotification}
-        {@const notificationUndoDecisions = visibleNotification.undo_decisions?.length
-          ? visibleNotification.undo_decisions
-          : visibleNotification.undo_id && visibleNotification.id
-            ? [{ id: visibleNotification.id, decision_id: visibleNotification.undo_id }]
-            : []}
-        {@const notificationUndoKey = notificationUndoDecisions.length
-          ? `undo-${notificationUndoDecisions.map((item) => item.decision_id).join("-")}`
-          : null}
-        {#key notificationUndoKey ?? visibleNotification.id ?? visibleNotification.message}
-          <div
-            class="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4.75rem)] z-50 flex justify-end px-4 sm:inset-x-auto sm:right-5 sm:w-[min(26rem,calc(100vw-2.5rem))] sm:px-0"
-          >
-            <div
-              in:fly={{ x: 24, y: -8, duration: motionDuration(240) }}
-              out:fly={{ x: 16, duration: motionDuration(170) }}
-              class={`pointer-events-auto relative w-full max-w-md overflow-hidden rounded-2xl border bg-surface-50-950/90 p-4 text-sm shadow-2xl shadow-primary-500/10 backdrop-blur-xl ${formIsError ? "border-error-500/25" : "border-success-500/25"}`}
-              role="group"
-              aria-label={formIsError ? "Action error notification" : "Action success notification"}
-              onpointerenter={() => {
-                notificationPointerInside = true;
-                updateNotificationPause();
-              }}
-              onpointerleave={() => {
-                notificationPointerInside = false;
-                updateNotificationPause();
-              }}
-              onfocusin={() => {
-                notificationFocusInside = true;
-                updateNotificationPause();
-              }}
-              onfocusout={onNotificationFocusOut}
-            >
-              <span
-                aria-hidden="true"
-                class={`absolute inset-y-0 left-0 w-1 ${formIsError ? "bg-error-500" : "bg-success-500"}`}
-              ></span>
-              <div class="flex items-start gap-3 pl-1">
+      >{transientNotice?.message ?? ""}</div>
+      <StatusRegion
+        message={undoBanner?.message ?? ""}
+        immediate
+        announceOnMount
+      />
+      {#if undoBanner || transientNotice}
+        <div
+          inert={Boolean(markReadBook || librarrSearchOpen)}
+          class="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4.75rem)] z-50 flex flex-col items-end gap-3 px-4 sm:inset-x-auto sm:right-5 sm:w-[min(26rem,calc(100vw-2.5rem))] sm:px-0"
+        >
+          {#if undoBanner}
+            {#key undoBanner.key}
+              <div
+                in:fly={{ x: 24, y: -8, duration: motionDuration(240) }}
+                out:fly={{ x: 16, duration: motionDuration(170) }}
+                class="pointer-events-auto relative w-full max-w-md overflow-hidden rounded-2xl border border-success-500/25 bg-surface-50-950/90 p-4 text-sm shadow-2xl shadow-primary-500/10 backdrop-blur-xl"
+                role="group"
+                aria-label="Decision undo notification"
+              >
                 <span
-                  class={`mt-0.5 grid size-9 shrink-0 place-items-center rounded-xl ${formIsError ? "preset-tonal-error" : "preset-tonal-success"}`}
                   aria-hidden="true"
-                >
-                  {#if formIsError}<CircleHelp size={18} />{:else}<Check size={18} />{/if}
-                </span>
-                <div class="min-w-0 flex-1">
-                  <p
-                    class={`mb-1 text-[0.65rem] font-semibold uppercase tracking-[0.16em] ${formIsError ? "text-error-600-400" : "text-success-600-400"}`}
+                  class="absolute inset-y-0 left-0 w-1 bg-success-500"
+                ></span>
+                <div class="flex items-start gap-3 pl-1">
+                  <span
+                    class="mt-0.5 grid size-9 shrink-0 place-items-center rounded-xl preset-tonal-success"
+                    aria-hidden="true"
                   >
-                    {formIsError ? "Action needs attention" : "All set"}
-                  </p>
-                  <p class="leading-relaxed text-surface-900-100">
-                    {visibleNotification.message}
-                  </p>
-                  {#if notificationUndoDecisions.length && notificationUndoKey}
+                    <Check size={18} />
+                  </span>
+                  <div class="min-w-0 flex-1">
+                    <p
+                      class="mb-1 text-[0.65rem] font-semibold uppercase tracking-[0.16em] text-success-600-400"
+                    >
+                      All set
+                    </p>
+                    <p class="leading-relaxed text-surface-900-100">
+                      {undoBanner.message}
+                    </p>
                     <form
                       method="POST"
                       action="?/undoDecision"
                       class="mt-3"
-                      use:enhance={setPending(notificationUndoKey)}
+                      use:enhance={submitUndoDecision(undoBanner.key)}
                     >
                       <ProfileField profileId={data.user?.profile_id} />
-                      {#each notificationUndoDecisions as item (`${item.id}-${item.decision_id}`)}
+                      {#each undoBanner.decisions as item (`${item.id}-${item.decision_id}`)}
                         <input type="hidden" name="id" value={item.id} />
                         <input type="hidden" name="decision_id" value={item.decision_id} />
                       {/each}
                       <button
                         type="submit"
                         class="btn btn-sm min-h-9 preset-tonal-primary"
-                        disabled={isPending(notificationUndoKey)}
-                        aria-busy={isPending(notificationUndoKey)}
-                        aria-label={`Undo ${visibleNotification.undo_label ?? "this decision"}`}
+                        disabled={isPending(undoBanner.key)}
+                        aria-busy={isPending(undoBanner.key)}
+                        aria-label={`Undo ${undoBanner.undo_label ?? "this decision"}`}
                       >
-                        {#if isPending(notificationUndoKey)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
+                        {#if isPending(undoBanner.key)}<RefreshCw size={14} class="animate-spin" />{:else}<History size={14} />{/if}
                         Undo
                       </button>
                     </form>
-                  {/if}
+                  </div>
+                  <button
+                    type="button"
+                    class="btn btn-icon btn-sm min-h-8 min-w-8 shrink-0 preset-tonal-surface"
+                    aria-label="Dismiss undo notification"
+                    onclick={() => notifications.dismissUndo()}
+                  >
+                    <X size={15} />
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  class="btn btn-icon btn-sm min-h-8 min-w-8 shrink-0 preset-tonal-surface"
-                  aria-label="Dismiss notification"
-                  onclick={dismissNotification}
-                >
-                  <X size={15} />
-                </button>
               </div>
+            {/key}
+          {/if}
+          {#if transientNotice}
+            <div
+              class="pointer-events-auto w-full max-w-md"
+              role="group"
+              aria-label={formIsError ? "Action error notification" : "Action success notification"}
+              onpointerenter={() => notifications.setPointerInside(true)}
+              onpointerleave={() => notifications.setPointerInside(false)}
+              onfocusin={() => notifications.setFocusInside(true)}
+              onfocusout={onNotificationFocusOut}
+            >
+              {#key transientNotice.id}
+                <div
+                  in:fly={{ x: 24, y: -8, duration: motionDuration(240) }}
+                  out:fly={{ x: 16, duration: motionDuration(170) }}
+                  class={`relative w-full overflow-hidden rounded-2xl border bg-surface-50-950/90 p-4 text-sm shadow-2xl shadow-primary-500/10 backdrop-blur-xl ${formIsError ? "border-error-500/25" : "border-success-500/25"}`}
+                >
+                  <span
+                    aria-hidden="true"
+                    class={`absolute inset-y-0 left-0 w-1 ${formIsError ? "bg-error-500" : "bg-success-500"}`}
+                  ></span>
+                  <div class="flex items-start gap-3 pl-1">
+                    <span
+                      class={`mt-0.5 grid size-9 shrink-0 place-items-center rounded-xl ${formIsError ? "preset-tonal-error" : "preset-tonal-success"}`}
+                      aria-hidden="true"
+                    >
+                      {#if formIsError}<CircleHelp size={18} />{:else}<Check size={18} />{/if}
+                    </span>
+                    <div class="min-w-0 flex-1">
+                      <p
+                        class={`mb-1 text-[0.65rem] font-semibold uppercase tracking-[0.16em] ${formIsError ? "text-error-600-400" : "text-success-600-400"}`}
+                      >
+                        {formIsError ? "Action needs attention" : "All set"}
+                      </p>
+                      <p class="leading-relaxed text-surface-900-100">
+                        {transientNotice.message}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      class="btn btn-icon btn-sm min-h-8 min-w-8 shrink-0 preset-tonal-surface"
+                      aria-label="Dismiss notification"
+                      onclick={() => notifications.dismissTransient()}
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+                </div>
+              {/key}
             </div>
-          </div>
-        {/key}
+          {/if}
+        </div>
       {/if}
 
       {#snippet recommendationView(view: "discover" | "saved" | "decisions")}
@@ -3246,7 +3609,7 @@
         })}
         <section class="mb-8 flex min-w-0 flex-col gap-5 px-1 sm:px-0 xl:flex-row xl:items-end xl:justify-between">
           <h1
-            class="min-w-0 break-words text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
+            class="text-reflow text-4xl font-semibold leading-[1.05] tracking-tight text-surface-950-50 sm:text-6xl"
           >{view === "discover" ? "Find your next favorite." : view === "saved" ? "Your shortlist." : view === "decisions" && decisionFilter === "read" ? "Your reading history." : "Past decisions."}</h1>
           <div class="flex min-w-0 w-full flex-col gap-3 xl:max-w-2xl sm:flex-row sm:items-center">
               <div class="input flex min-h-11 w-full min-w-0 items-center gap-1 px-0! py-0! sm:flex-1">
@@ -3305,9 +3668,9 @@
           <section class="mb-6" aria-label="History filters">
             <div class="flex flex-wrap gap-2" role="group" aria-label="Filter history">
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => selectDecisionFilter("all")}>All</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => selectDecisionFilter("maybe_later")}>Maybe later</button>
+              <button type="button" class={`btn btn-sm btn-reflow min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => selectDecisionFilter("maybe_later")}>Maybe later</button>
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => selectDecisionFilter("rejected")}>Passed</button>
-              <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({data.readCount})</button>
+              <button type="button" class={`btn btn-sm btn-reflow min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({data.readCount})</button>
             </div>
           </section>
         {/if}
@@ -3326,19 +3689,19 @@
               </div>
             </div>
             <div class="flex flex-wrap gap-2 sm:shrink-0">
-              <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => selectVisibleDigestBooks(viewVisibleBooks)}>Select all visible</button>
+              <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" onclick={() => selectVisibleDigestBooks(viewVisibleBooks)}>Select all visible</button>
               {#if selectedDigestCount > 0}
                 <form method="POST" action="?/shortlistBulk" use:enhance={setPendingDigestBulk()}>
                   <ProfileField profileId={data.user?.profile_id} />
                   {#if selectedDigestRunId}<input type="hidden" name="run_id" value={selectedDigestRunId} />{/if}
                   {#each [...selectedDigestIds] as id (id)}<input type="hidden" name="ids" value={id} />{/each}
-                  <button type="submit" class="btn btn-sm min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
+                  <button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-filled-secondary-500" disabled={isPending("shortlist-bulk")} aria-busy={isPending("shortlist-bulk")}>
                     {#if isPending("shortlist-bulk")}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Add {selectedDigestCount} to shortlist
                   </button>
                 </form>
                 <button type="button" class="btn btn-sm min-h-10 preset-tonal-surface" onclick={clearDigestSelection}>Clear</button>
               {/if}
-              <button type="button" class="btn btn-sm min-h-10 preset-tonal-surface" onclick={exitDigestMode}>View all</button>
+              <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-surface" onclick={exitDigestMode}>View all</button>
             </div>
           </section>
         {/if}
@@ -3349,6 +3712,11 @@
             {@const releaseLabel = formatRelease(book.published_on, book.published_kind)}
             {@const decisionLabel = book.status === "maybe_later" ? "Maybe later" : book.status === "rejected" ? "Passed" : "Read"}
             {@const decisionVariant = book.status === "maybe_later" ? "preset-tonal-warning" : book.status === "rejected" ? "preset-tonal-error" : "preset-tonal-success"}
+            {@const rationaleLabel = book.status === "rejected" ? "Why Bookward showed this" : book.status === "maybe_later" ? "Why Bookward suggested this" : "Why this might be for you"}
+            {@const synopsisText = (book.synopsis ?? "").trim()}
+            {@const synopsisExpanded = expandedSynopses.has(book.id)}
+            {@const showSynopsisToggle = synopsisExpanded || (measuredSynopses.has(book.id) ? overflowingSynopses.has(book.id) : synopsisText.length > 140)}
+            {@const formattedRank = Number(book.score).toFixed(1)}
             <article
               use:trackRecommendation={{ candidateId: book.id }}
               in:fly={{ y: 18, duration: motionDuration(380), delay: motionDelay(index) }}
@@ -3388,7 +3756,7 @@
                       />
                     </label>
                   {/if}
-                  <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {book.score}</span>
+                  <span class="badge badge-sm preset-filled-primary-500 sm:hidden" title="Relative ranking score, not a probability or star rating">Rank {formattedRank}</span>
                   {#if view === "decisions"}<span class={`badge badge-sm ${decisionVariant}`}>{decisionLabel}</span>{/if}
                   {#if book.status === "imported"}<span class="badge badge-sm preset-tonal-success">Added to Librarr</span>{/if}
                   {#if releaseLabel}<span>{releaseLabel}</span>{/if}
@@ -3405,9 +3773,27 @@
                     >{/if}
                 </div>
                 <div class="min-w-0">
-                  <h2 class="break-words text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
-                  <p class="mt-1 break-words text-base text-surface-700-300">{book.author}</p>
+                  <h2 class="text-reflow text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">{book.title}</h2>
+                  <p class="text-reflow mt-1 text-base text-surface-700-300">{book.author}</p>
                 </div>
+                {#if synopsisText}
+                  <div class="space-y-1">
+                    <p
+                      id={`book-synopsis-${book.id}`}
+                      use:measureSynopsisOverflow={book.id}
+                      class={`text-sm leading-6 text-surface-800-200 sm:text-base ${synopsisExpanded ? "" : "line-clamp-3"}`}
+                    >{synopsisText}</p>
+                    {#if showSynopsisToggle}
+                      <button
+                        type="button"
+                        class="inline-flex min-h-8 items-center text-sm font-medium text-secondary-700-300 underline decoration-secondary-500/60 underline-offset-4 hover:text-secondary-900-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-secondary-500"
+                        aria-expanded={synopsisExpanded}
+                        aria-controls={`book-synopsis-${book.id}`}
+                        onclick={() => toggleSynopsis(book.id)}
+                      >{synopsisExpanded ? "Show less" : "Read full summary"}</button>
+                    {/if}
+                  </div>
+                {/if}
                 <details
                   class="group/details text-base text-surface-700-300"
                   open={expandedRecommendationDetails.has(book.id)}
@@ -3419,22 +3805,28 @@
                   }}
                 >
                   <summary class="flex min-h-10 cursor-pointer list-none items-center gap-2 font-medium text-primary-600-400">
-                    <Sparkles size={15} /><span>Why this might be for you</span><ChevronDown size={15} class="ml-auto transition group-open/details:rotate-180" />
+                    <Sparkles size={15} /><span>{rationaleLabel}</span><ChevronDown size={15} class="ml-auto transition group-open/details:rotate-180" />
                   </summary>
-                  {#if expandedRecommendationDetails.has(book.id)}<div in:slide={{ duration: motionDuration(220) }} out:fade={{ duration: motionDuration(120) }}>
-                      <p class="mt-2 leading-6">{book.reason}</p>
-                      {#if book.synopsis}<div class="mt-4 border-l-2 border-secondary-500/50 pl-3">
-                          <p class="text-xs font-semibold uppercase tracking-[0.16em] text-secondary-600-400">Book summary</p>
-                          <p class="mt-1 leading-6 text-surface-800-200">{book.synopsis}</p>
-                        </div>{/if}
-                    </div>{/if}
+                  <div>
+                    {#if (book.explanation ?? []).length > 0}
+                      <ul class="mt-2 list-disc space-y-1.5 pl-5 text-sm leading-6 text-surface-800-200 sm:text-base">
+                        {#each book.explanation ?? [] as reasonItem, reasonIndex (`${book.id}-${reasonIndex}-${reasonItem}`)}
+                          <li>{reasonItem}</li>
+                        {/each}
+                      </ul>
+                    {:else if book.reason}
+                      <p class="mt-2 text-sm leading-6 text-surface-800-200 sm:text-base">{book.reason}</p>
+                    {:else}
+                      <p class="mt-2 text-sm leading-6 text-surface-700-300 sm:text-base">Ranked from your enabled sources and available catalog details.</p>
+                    {/if}
+                  </div>
                 </details>
                 <div class="mt-auto flex flex-wrap items-center gap-2 pt-0.5">
                   {#if book.status === "recommended"}
-                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
+                    {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Shortlist: ${book.title} by ${book.author}`} aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" aria-label={`Shortlist: ${book.title} by ${book.author}`} aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                     </form>
                     <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
@@ -3462,7 +3854,7 @@
                         <p class="text-sm font-semibold text-surface-950-50">Already read this?</p>
                         <button
                           type="button"
-                          class="btn btn-sm mt-3 min-h-10 w-full preset-filled-primary-500"
+                          class="btn btn-sm btn-reflow mt-3 min-h-10 w-full preset-filled-primary-500"
                           aria-label={`Mark Read: ${book.title} by ${book.author}`}
                           onclick={() => openMarkRead(book)}
                         ><BookOpen size={14} /> Mark Read</button>
@@ -3470,20 +3862,20 @@
                     </div>
                   {:else if book.status === "saved" || book.status === "imported"}
                     {#if librarrConnected}
-                      <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
+                      <button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>
                       {#if book.status === "saved"}
                         <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/importLibrar" use:enhance={setPending(`import-${book.id}`, optimisticImport)}>
                           <ProfileField profileId={data.user?.profile_id} />
-                          <input type="hidden" name="id" value={book.id} /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
+                          <input type="hidden" name="id" value={book.id} /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" aria-label={`Add ${configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist: ${book.title} by ${book.author}`} disabled={isPending(`import-${book.id}`)} aria-busy={isPending(`import-${book.id}`)}>{#if isPending(`import-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Library size={15} />{/if} Add {configuredLibrarrMediaType === "ebook" ? "ebook" : "audiobook"} to waitlist</button>
                         </form>
                       {/if}
                     {:else if book.status === "saved"}
-                      <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={goToLibrarrSettings}><Library size={15} /> Set up Librarr</button>
+                      <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" onclick={goToLibrarrSettings}><Library size={15} /> Set up Librarr</button>
                     {/if}
                     <button
                       in:fly={{ y: 8, duration: motionDuration(180) }}
                       type="button"
-                      class="btn btn-sm min-h-10 preset-filled-primary-500"
+                      class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500"
                       aria-label={`Mark Read: ${book.title} by ${book.author}`}
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
@@ -3494,7 +3886,7 @@
                   {:else if book.status === "rejected" || book.status === "maybe_later"}
                     <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
-                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm min-h-10 preset-filled-primary-500" aria-label={`Return to Discover: ${book.title}`} aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
+                      <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" aria-label={`Return to Discover: ${book.title}`} aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
                     </form>
                   {/if}
                 </div>
@@ -3506,7 +3898,7 @@
               </div>
             {:else if viewFilterError}<div class="card col-span-full flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center">
                 <InlineAlert message={viewFilterError} />
-                <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={() => (view === "decisions" ? reloadQueriedDecisions() : reloadFilteredDiscover())}><RefreshCw size={14} /> Try again</button>
+                <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" onclick={() => (view === "decisions" ? reloadQueriedDecisions() : reloadFilteredDiscover())}><RefreshCw size={14} /> Try again</button>
               </div>
             {:else}<div in:scale={{ duration: motionDuration(260) }} class="card col-span-full flex min-h-72 flex-col items-center justify-center gap-4 border-dashed preset-tonal-surface p-8 text-center">
                 <span class="grid size-14 place-items-center rounded-full preset-tonal-primary"><BookOpen size={24} /></span>
@@ -3514,21 +3906,26 @@
                   <h2 class="text-lg font-semibold text-surface-950-50">{view === "saved" && shortlistTotalCount === 0 ? "Your shortlist is empty" : view === "saved" && viewHasFilter ? "No shortlist books match these filters" : viewHasFilter ? "No books match these filters" : view === "decisions" && decisionFilter === "maybe_later" ? "No deferred books" : view === "decisions" && decisionFilter === "rejected" ? "No passed books" : view === "decisions" ? "No past decisions" : digestRequested ? "No unread digest picks left" : digestVisible ? "No digest picks yet" : "You are all caught up"}</h2>
                   <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{view === "saved" && shortlistTotalCount === 0 ? "Shortlist a recommendation when one catches your eye." : view === "saved" && viewHasFilter ? "Change the shortlist search or genre filter to see your saved books." : viewHasFilter ? "Change the search or genre filter to see more books." : view === "decisions" && decisionFilter === "maybe_later" ? "Books you set aside with Maybe later will appear here." : view === "decisions" && decisionFilter === "rejected" ? "Books you pass on will appear here." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestRequested ? "You have already acted on the books from this digest, or open View all to browse Discover." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
                 </div>
-                {#if view === "saved" && shortlistTotalCount === 0}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
+                {#if view === "saved" && shortlistTotalCount === 0}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn btn-reflow preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
                 {#if view === "discover" && !viewHasFilter && !digestVisible && !effectiveDiscoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync")}>
                   <ProfileField profileId={data.user?.profile_id} />
-                  <button type="submit" class="btn preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
+                  <button type="submit" class="btn btn-reflow preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
                     {#if isPending("sync")}<RefreshCw size={15} class="animate-spin" />{:else}<RefreshCw size={15} />{/if} Refresh recommendations
                   </button>
                 </form>{/if}
               </div>{/if}{/each}
-          {#if viewHasMoreDiscoverBooks}<div bind:this={loadMoreSentinel} class="col-span-full flex flex-col items-center gap-2 pt-1">
-              <InlineAlert message={discoverLoadError} />
-              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDiscover} disabled={discoverLoading} aria-busy={discoverLoading}>{#if discoverLoading}<RefreshCw size={14} class="animate-spin" />{:else if discoverLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {discoverLoadError ? "Try again" : "Load more"}</button>
-            </div>{/if}
+          {#if viewHasMoreDiscoverBooks}
+            <DiscoverLoadMoreFooter
+              observeEnabled={hasMoreDiscoverBooks && !filteredDiscoverPending}
+              loading={discoverLoading}
+              error={discoverLoadError}
+              resetKey={`${discoverViewVisibleBooks.length}:${hasActiveDiscoverFilter ? filteredDiscoverOffset : unfilteredDiscoverOffset}`}
+              onLoadMore={loadMoreDiscover}
+            />
+          {/if}
           {#if view === "decisions" && decisionFilter !== "read" && decisionsHasMore}<div class="col-span-full flex flex-col items-center gap-2 pt-1">
               <InlineAlert message={decisionsLoadError} />
-              <button type="button" class="btn btn-sm preset-tonal-secondary" onclick={loadMoreDecisions} disabled={decisionsLoading} aria-busy={decisionsLoading}>
+              <button type="button" class="btn btn-sm btn-reflow preset-tonal-secondary" onclick={loadMoreDecisions} disabled={decisionsLoading} aria-busy={decisionsLoading}>
                 {#if decisionsLoading}<RefreshCw size={14} class="animate-spin" />{:else if decisionsLoadError}<RefreshCw size={14} />{:else}<ArrowRight size={14} />{/if} {decisionsLoadError ? "Try again" : "Load more decisions"}
               </button>
             </div>{/if}
@@ -3536,7 +3933,7 @@
         {:else}
           <section
             aria-label="Read books"
-            aria-busy={readingHistoryState === "loading"}
+            aria-busy={readingHistoryState === "idle" || readingHistoryState === "loading"}
             class="min-w-0"
           >
             {#if readingHistoryState === "ready"}
@@ -3593,29 +3990,29 @@
                   size="sm"
                   message={`${readingHistoryScoreError} Scores loaded for ${scoredReadingHistoryCount} of ${readingHistory.length} books.`}
                 />
-                <button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
+                <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" onclick={() => void loadReadingHistoryScores(readingHistory.length)}>Retry scoring</button>
               </div>
             {/if}
-            {#if readingHistoryState === "loading"}
-              <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
+            {#if readingHistoryState === "idle" || readingHistoryState === "loading"}
+              <div class="card flex min-h-48 items-center justify-center gap-3 preset-tonal-surface p-8 text-sm text-surface-700-300" aria-busy="true"><RefreshCw size={17} class="animate-spin" />Loading your read books…</div>
             {:else if readingHistoryState === "error"}
               <div class="card flex min-h-48 flex-col items-center justify-center gap-3 preset-tonal-surface p-8 text-center">
                 <InlineAlert message={readingHistoryError} />
-                <button type="button" class="btn btn-sm min-h-10 preset-filled-primary-500" onclick={() => void loadReadingHistory()}><RefreshCw size={14} /> Try again</button>
+                <button type="button" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" onclick={() => void loadReadingHistory()}><RefreshCw size={14} /> Try again</button>
               </div>
             {:else if readingHistoryState === "ready" && filteredReadingHistory.length > 0}
               <p class="mb-3 text-xs text-surface-700-300">Showing {visibleReadingHistory.length} of {filteredReadingHistory.length} books</p>
               <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 {#each visibleReadingHistory as item (item.id)}
                   <article class="card min-w-0 preset-tonal-success p-4">
-                    <div class="flex items-start gap-3">
+                    <div class="flex flex-wrap items-start gap-3">
                       <span class="grid size-9 shrink-0 place-items-center preset-tonal-primary"><BookOpen size={16} /></span>
-                      <div class="min-w-0 flex-1">
-                        <h2 class="line-clamp-2 font-semibold leading-5 text-surface-950-50">{item.title}</h2>
-                        <p class="mt-1 truncate text-sm text-surface-700-300">{item.author}</p>
+                      <div class="min-w-0 flex-1 basis-[8rem]">
+                        <h2 class="text-reflow font-semibold leading-5 text-surface-950-50">{item.title}</h2>
+                        <p class="text-reflow mt-1 text-sm text-surface-700-300">{item.author}</p>
                         <p class="mt-2 text-xs text-surface-700-300">Bookward score <span class="font-semibold text-surface-950-50">{item.algorithm_score === null ? readingHistoryScoreState === "loading" ? "Calculating…" : "Unavailable" : `${item.algorithm_score.toFixed(1)} / 100`}</span></p>
                       </div>
-                      <div class="flex shrink-0 flex-col items-end gap-2">
+                      <div class="ml-auto flex shrink-0 flex-col items-end gap-2">
                         <span class="badge badge-sm preset-tonal-success">Read</span>
                         {#if item.rating !== null && item.rating > 0}
                           <StarRatingBadge rating={item.rating} />
@@ -3682,7 +4079,7 @@
                 {/each}
               </div>
               {#if visibleReadingHistory.length < filteredReadingHistory.length}
-                <div class="mt-5 flex justify-center"><button type="button" class="btn btn-sm min-h-10 preset-tonal-secondary" onclick={() => { readingHistoryImmediate = true; readingHistoryVisibleCount += 30; }}><ArrowRight size={14} /> Load more books</button></div>
+                <div class="mt-5 flex justify-center"><button type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" onclick={() => { readingHistoryImmediate = true; readingHistoryVisibleCount += 30; }}><ArrowRight size={14} /> Load more books</button></div>
               {/if}
             {:else}
               <div class="card flex min-h-64 flex-col items-center justify-center gap-3 border-dashed preset-tonal-surface p-8 text-center">
@@ -3736,7 +4133,7 @@
           >
             <section class="mb-6 min-w-0 max-w-2xl">
               <h1
-                class="text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
+                class="text-reflow text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
               >
                 Choose your sources.
               </h1>
@@ -3764,7 +4161,7 @@
                     </p>
                   </div>
                   <div
-                    class="flex min-w-0 w-full items-center gap-1 preset-tonal-surface p-1 sm:w-auto"
+                    class="flex min-w-0 w-full flex-wrap items-center gap-1 preset-tonal-surface p-1 sm:w-auto"
                     role="tablist"
                     aria-label="Filter sources by lifecycle"
                   >
@@ -3776,7 +4173,7 @@
                         aria-controls="source-filter-panel"
                         aria-selected={sourceFilter === option.value}
                         tabindex={sourceFilter === option.value ? 0 : -1}
-                        class={`min-h-9 min-w-0 flex-1 break-words px-2 text-center text-xs font-medium leading-tight transition sm:flex-none sm:px-3 ${sourceFilter === option.value ? "preset-filled-secondary-500" : "text-surface-700-300 hover:preset-tonal-secondary"}`}
+                        class={`text-reflow min-h-9 min-w-0 flex-1 px-2 py-1.5 text-center text-xs font-medium leading-tight transition sm:flex-none sm:px-3 ${sourceFilter === option.value ? "preset-filled-secondary-500" : "text-surface-700-300 hover:preset-tonal-secondary"}`}
                         onclick={() => (sourceFilter = option.value)}
                         onkeydown={(event) => {
                           if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -3806,17 +4203,17 @@
                   {#if sourceFilter === "all"}
                     <div
                       in:fly={{ x: -10, duration: motionDuration(240) }}
-                      class="flex min-h-24 items-center gap-4 py-4"
+                      class="flex min-h-24 flex-wrap items-center gap-4 py-4"
                     >
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"
                       ><Sparkles size={18} /></span
                       >
-                      <div class="min-w-0 flex-1">
-                        <h3 class="font-medium text-surface-950-50">
+                      <div class="min-w-0 flex-1 basis-[8rem]">
+                        <h3 class="text-reflow font-medium text-surface-950-50">
                           Bookward demo books
                         </h3>
-                        <p class="mt-1 text-sm text-surface-700-300">
+                        <p class="text-reflow mt-1 text-sm text-surface-700-300">
                           A small offline sample to test a fresh installation.
                         </p>
                         <span class="mt-1 block text-xs text-surface-600-400"
@@ -3824,6 +4221,7 @@
                         >
                       </div>
                       <form
+                        class="ml-auto shrink-0"
                         method="POST"
                         action="?/toggleDefault"
                         use:enhance={setPending("toggle-default", () => optimisticDefaultToggle())}
@@ -3844,17 +4242,17 @@
                     <div in:fade={{ duration: motionDuration(160) }} out:fade={{ duration: motionDuration(100) }}>
                   {#each visibleSourceGroups as group}
                     <div
-                      class="flex min-w-0 items-start justify-between gap-3 border-b border-surface-200-800 px-1 py-4 sm:items-end sm:gap-4"
+                      class="flex min-w-0 flex-wrap items-start justify-between gap-3 border-b border-surface-200-800 px-1 py-4 sm:items-end sm:gap-4"
                     >
-                      <div class="min-w-0 flex-1">
-                        <h3 class="font-semibold text-surface-950-50">
+                      <div class="min-w-0 flex-1 basis-[8rem]">
+                        <h3 class="text-reflow font-semibold text-surface-950-50">
                           {group.label}
                         </h3>
-                        <p class="mt-1 break-words text-sm text-surface-700-300">
+                        <p class="text-reflow mt-1 text-sm text-surface-700-300">
                           {group.description}
                         </p>
                       </div>
-                      <span class="badge max-w-[45%] shrink-0 whitespace-normal text-right leading-tight preset-tonal-surface"
+                      <span class="badge h-auto max-w-[45%] shrink-0 whitespace-normal text-right leading-tight preset-tonal-surface"
                         >{group.active} active · {group.sources.length} total</span
                       >
                     </div>
@@ -3866,17 +4264,17 @@
                             delay: motionDelay(source.id % 5, 24),
                           }}
                           out:fade={{ duration: motionDuration(120) }}
-                          class="flex min-h-24 min-w-0 items-center gap-3 border-b border-surface-200-800 py-4 last:border-b-0 sm:gap-4"
+                          class="flex min-h-24 min-w-0 flex-wrap items-start gap-3 border-b border-surface-200-800 py-4 last:border-b-0 sm:items-center sm:gap-4"
                         >
                           <span
                             class={`grid size-10 shrink-0 place-items-center ${source.lifecycle === "one_time" ? "preset-tonal-tertiary" : "preset-tonal-secondary"}`}
                             ><Link2 size={18} /></span
                           >
-                          <div class="min-w-0 flex-1">
-                            <h3 class="truncate font-medium text-surface-950-50">
+                          <div class="min-w-0 flex-1 basis-[8rem]">
+                            <h3 class="text-reflow font-medium text-surface-950-50">
                               {source.label}
                             </h3>
-                            <p class="mt-1 truncate text-sm text-surface-700-300">
+                            <p class="url-reflow mt-1 text-sm text-surface-700-300">
                               {source.url}
                             </p>
                             <span class="mt-1 block break-words text-xs text-surface-600-400">
@@ -3993,7 +4391,7 @@
                                       message={formState?.error && formState?.editSource?.id === source.id ? formState.message : ""}
                                     />
                                     <button
-                                      class="btn btn-sm min-h-9 preset-tonal-secondary"
+                                      class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
                                       type="submit"
                                       disabled={isPending(`edit-source-${source.id}`)}
                                       aria-busy={isPending(`edit-source-${source.id}`)}
@@ -4070,7 +4468,7 @@
                                           0 of {formState.zeroMatchConfirm.rawCount} book{formState.zeroMatchConfirm.rawCount === 1 ? "" : "s"} matched these filters. Existing candidates will be retained, and no new books will import until a title matches.
                                         </p>
                                         <button
-                                          class="btn btn-sm min-h-9 preset-filled-warning-500"
+                                          class="btn btn-sm btn-reflow min-h-9 preset-filled-warning-500"
                                           type="submit"
                                           name="confirmZeroMatch"
                                           value="1"
@@ -4081,7 +4479,7 @@
                                     {/if}
                                     <div class="flex flex-wrap items-center gap-2">
                                       <button
-                                        class="btn btn-sm min-h-9 preset-tonal-surface"
+                                        class="btn btn-sm btn-reflow min-h-9 preset-tonal-surface"
                                         type="submit"
                                         name="intent"
                                         value="preview"
@@ -4089,7 +4487,7 @@
                                         aria-busy={isPending(`source-filters-${source.id}`)}
                                       ><Search size={14} /> Preview matches</button>
                                       <button
-                                        class="btn btn-sm min-h-9 preset-tonal-secondary"
+                                        class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
                                         type="submit"
                                         name="intent"
                                         value="save"
@@ -4102,7 +4500,7 @@
                               {/if}
                             </div>
                           </div>
-                          <div class="flex shrink-0 items-center gap-2">
+                          <div class="ml-auto flex shrink-0 items-center gap-2">
                             {#if source.kind === "web" && sourceEnabled(source)}
                               <form
                                 method="POST"
@@ -4203,7 +4601,7 @@
                     keeps scanning even when the browser is closed.
                   </p>
                   <button
-                    class="btn mt-4 min-h-11 w-full preset-filled-secondary-500"
+                    class="btn btn-reflow mt-4 min-h-11 w-full preset-filled-secondary-500"
                     type="submit"
                     disabled={isPending("source-schedule")}
                     aria-busy={isPending("source-schedule")}
@@ -4283,7 +4681,7 @@
                     </div>
                   </details
                   ><button
-                    class="btn mt-5 min-h-11 w-full preset-filled-tertiary-500"
+                    class="btn btn-reflow mt-5 min-h-11 w-full preset-filled-tertiary-500"
                     type="submit"
                     disabled={isPending("source")}
                     aria-busy={isPending("source")}
@@ -4303,9 +4701,9 @@
             in:fade={{ duration: motionDuration(420) }}
             out:fade={{ duration: motionDuration(420) }}
           >
-            <section class="mb-6 max-w-2xl">
+            <section class="mb-6 min-w-0 max-w-2xl">
               <h1
-                class="text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
+                class="text-reflow text-4xl font-semibold tracking-tight text-surface-950-50 sm:text-5xl"
               >
                 Settings.
               </h1>
@@ -4405,7 +4803,7 @@
                     <form method="POST" action="?/setEvidenceRotation" use:enhance={setPending("toggle-evidence-rotation")}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="enabled" value={data.backupStatus.evidence_rotation_enabled ? "0" : "1"} />
-                      <button class="btn min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-evidence-rotation")} aria-busy={isPending("toggle-evidence-rotation")}>
+                      <button class="btn btn-reflow min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-evidence-rotation")} aria-busy={isPending("toggle-evidence-rotation")}>
                         {data.backupStatus.evidence_rotation_enabled ? "Pause evidence rotation" : "Enable evidence rotation"}
                       </button>
                     </form>
@@ -4426,14 +4824,14 @@
                     <div class="grid min-w-0 gap-2">
                       <form method="POST" action="?/compactStorage" use:enhance={setPending("compact-storage")}>
                         <ProfileField profileId={data.user?.profile_id} />
-                        <button class="btn min-h-11 w-full preset-tonal-primary" type="submit" disabled={isPending("compact-storage")} aria-busy={isPending("compact-storage")}>
+                        <button class="btn btn-reflow min-h-11 w-full preset-tonal-primary" type="submit" disabled={isPending("compact-storage")} aria-busy={isPending("compact-storage")}>
                           <RefreshCw size={16} class={isPending("compact-storage") ? "animate-spin" : ""} /> Compact storage
                         </button>
                       </form>
                       <form method="POST" action="?/setStorageRetention" use:enhance={setPending("toggle-retention")}>
                         <ProfileField profileId={data.user?.profile_id} />
                         <input type="hidden" name="enabled" value={data.backupStatus.retention_enabled ? "0" : "1"} />
-                        <button class="btn min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-retention")} aria-busy={isPending("toggle-retention")}>
+                        <button class="btn btn-reflow min-h-11 w-full preset-tonal-surface text-xs" type="submit" disabled={isPending("toggle-retention")} aria-busy={isPending("toggle-retention")}>
                           {data.backupStatus.retention_enabled ? "Pause automatic retention" : "Enable automatic retention"}
                         </button>
                       </form>
@@ -4445,7 +4843,7 @@
                   <div class="min-w-0">
                     <form method="POST" action="?/createBackup" use:enhance={setPending("create-backup")}>
                       <ProfileField profileId={data.user?.profile_id} />
-                      <button class="btn min-h-11 w-full preset-filled-secondary-500" type="submit" disabled={isPending("create-backup")} aria-busy={isPending("create-backup")}>
+                      <button class="btn btn-reflow min-h-11 w-full preset-filled-secondary-500" type="submit" disabled={isPending("create-backup")} aria-busy={isPending("create-backup")}>
                         {#if isPending("create-backup")}<RefreshCw size={16} class="animate-spin" />{:else}<Check size={16} />{/if} Create backup now
                       </button>
                     </form>
@@ -4475,7 +4873,7 @@
                           {/each}
                         </select></label>
                         <label class="block min-w-0 text-sm font-medium text-surface-800-200">Type RESTORE to confirm<input class="input mt-2 w-full" name="confirm" autocomplete="off" required pattern="RESTORE" /></label>
-                        <button class="btn min-h-11 w-full preset-filled-warning-500" type="submit" disabled={isPending("restore-backup")} aria-busy={isPending("restore-backup")}>
+                        <button class="btn btn-reflow min-h-11 w-full preset-filled-warning-500" type="submit" disabled={isPending("restore-backup")} aria-busy={isPending("restore-backup")}>
                           {#if isPending("restore-backup")}<RefreshCw size={16} class="animate-spin" />{:else}<RefreshCw size={16} />{/if} Restore selected backup
                         </button>
                       </form>
@@ -4497,14 +4895,14 @@
                 use:enhance={setPending("goodreads-rss")}
               >
                 <ProfileField profileId={data.user?.profile_id} />
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
                       ><BookOpen size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Goodreads RSS
                     </h2>
@@ -4539,7 +4937,7 @@
                     required
                   /></label
                 ><button
-                  class="btn mt-5 min-h-11 w-full preset-filled-secondary-500"
+                  class="btn btn-reflow mt-5 min-h-11 w-full preset-filled-secondary-500"
                   type="submit"
                   disabled={isPending("goodreads-rss")}
                   aria-busy={isPending("goodreads-rss")}
@@ -4550,7 +4948,7 @@
                 >
                 {#if data.profile.goodreads_url}
                   <button
-                    class="btn mt-2 min-h-10 w-full preset-tonal-surface"
+                    class="btn btn-reflow mt-2 min-h-10 w-full preset-tonal-surface"
                     type="submit"
                     formaction="?/disconnectGoodreads"
                     formnovalidate
@@ -4571,14 +4969,14 @@
                 use:enhance={setPending("csv-import")}
               >
                 <ProfileField profileId={data.user?.profile_id} />
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"
                       ><Upload size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       CSV library export
                     </h2>
@@ -4600,7 +4998,7 @@
                     required
                   /></label
                 ><button
-                  class="btn mt-5 min-h-11 w-full preset-filled-tertiary-500"
+                  class="btn btn-reflow mt-5 min-h-11 w-full preset-filled-tertiary-500"
                   type="submit"
                   disabled={isPending("csv-import")}
                   aria-busy={isPending("csv-import")}
@@ -4624,14 +5022,14 @@
                 use:enhance={setPending("librarr", optimisticLibrarr)}
               >
                 <ProfileField profileId={data.user?.profile_id} />
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
                       ><Library size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Librarr
                     </h2>
@@ -4683,7 +5081,7 @@
                     ></select
                   ></label
                 ><button
-                  class="btn mt-5 min-h-11 w-full preset-filled-secondary-500"
+                  class="btn btn-reflow mt-5 min-h-11 w-full preset-filled-secondary-500"
                   type="submit"
                   disabled={isPending("librarr")}
                   aria-busy={isPending("librarr")}
@@ -4701,14 +5099,14 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6"
               >
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-tertiary"
                       ><Settings2 size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Embedding provider
                     </h2>
@@ -4771,7 +5169,7 @@
                         : "Optional"}
                     /></label
                   ><button
-                    class="btn min-h-11 w-full preset-filled-primary-500"
+                    class="btn btn-reflow min-h-11 w-full preset-filled-primary-500"
                     type="submit"
                     disabled={isPending("embeddings")}
                     aria-busy={isPending("embeddings")}
@@ -4810,7 +5208,7 @@
                   >
                     <ProfileField profileId={data.user?.profile_id} />
                     <button
-                      class="btn min-h-11 w-full preset-filled-warning-500"
+                      class="btn btn-reflow min-h-11 w-full preset-filled-warning-500"
                       type="submit"
                       disabled={isPending("rebuild-embeddings")}
                       aria-busy={isPending("rebuild-embeddings")}
@@ -4830,14 +5228,14 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6"
               >
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
                       ><BookOpen size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Google Books API
                     </h2>
@@ -4884,7 +5282,7 @@
                     >
                   {/if}
                   <button
-                    class="btn min-h-11 w-full preset-filled-primary-500"
+                    class="btn btn-reflow min-h-11 w-full preset-filled-primary-500"
                     type="submit"
                     disabled={isPending("google-books")}
                     aria-busy={isPending("google-books")}
@@ -4904,14 +5302,14 @@
                 }}
                 class="card preset-tonal-surface p-5 sm:p-6"
               >
-                <div class="mb-5 flex items-center justify-between gap-4">
-                  <div class="flex min-w-0 items-center gap-3">
+                <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-secondary"
                       ><Database size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       Catalog audit
                     </h2>
@@ -5040,7 +5438,7 @@
                     <ProfileField profileId={data.user?.profile_id} />
                     <input type="hidden" name="mode" value="incremental" />
                     <button
-                      class="btn min-h-11 w-full preset-filled-primary-500"
+                      class="btn btn-reflow min-h-11 w-full preset-filled-primary-500"
                       type="submit"
                       disabled={catalogAudit.active || isPending("catalog-audit-incremental") || isPending("catalog-audit-full")}
                       aria-busy={isPending("catalog-audit-incremental")}
@@ -5059,7 +5457,7 @@
                     <ProfileField profileId={data.user?.profile_id} />
                     <input type="hidden" name="mode" value="full" />
                     <button
-                      class="btn min-h-11 w-full preset-tonal-secondary"
+                      class="btn btn-reflow min-h-11 w-full preset-tonal-secondary"
                       type="submit"
                       disabled={(catalogAudit.active && catalogAudit.mode === "full") || isPending("catalog-audit-full") || isPending("catalog-audit-incremental")}
                       aria-busy={isPending("catalog-audit-full")}
@@ -5081,13 +5479,13 @@
                 class="card preset-tonal-surface p-5 sm:p-6"
               >
                 <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
-                  <div class="flex min-w-0 items-center gap-3">
+                  <div class="flex min-w-0 flex-wrap items-center gap-3">
                     <span
                       class="grid size-10 shrink-0 place-items-center preset-tonal-primary"
                       ><Sparkles size={19} /></span
                     >
                     <h2
-                      class="truncate text-lg font-semibold text-surface-950-50"
+                      class="text-reflow text-lg font-semibold text-surface-950-50"
                     >
                       LLM reranker
                     </h2>
@@ -5201,7 +5599,7 @@
                         >
                         <button
                           type="button"
-                          class="btn btn-sm min-h-9 preset-tonal-secondary"
+                          class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
                           onclick={() => void loadLocalLlmModels()}
                           disabled={llmLocalModelsLoading}
                           aria-busy={llmLocalModelsLoading}
@@ -5265,7 +5663,7 @@
                         >
                         <button
                           type="button"
-                          class="btn btn-sm min-h-9 preset-tonal-secondary"
+                          class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
                           onclick={() => void loadLlmCatalog()}
                           disabled={llmCatalogLoading}
                           aria-busy={llmCatalogLoading}
@@ -5412,7 +5810,7 @@
                   {/if}
                   <div class="grid gap-3 sm:grid-cols-2">
                     <button
-                      class="btn min-h-11 w-full preset-tonal-secondary"
+                      class="btn btn-reflow min-h-11 w-full preset-tonal-secondary"
                       type="button"
                       onclick={() => void testLlmConnection()}
                       disabled={llmTesting || isPending("llm-rerank")}
@@ -5423,7 +5821,7 @@
                         />{:else}<Sparkles size={16} />{/if} Test connection</button
                     >
                     <button
-                      class="btn min-h-11 w-full preset-filled-primary-500"
+                      class="btn btn-reflow min-h-11 w-full preset-filled-primary-500"
                       type="submit"
                       disabled={isPending("llm-rerank")}
                       aria-busy={isPending("llm-rerank")}
@@ -5449,7 +5847,7 @@
                     ><KeyRound size={19} /></span
                   >
                   <div class="min-w-0 flex-1">
-                    <h2 class="text-lg font-semibold text-surface-950-50">API access</h2>
+                    <h2 class="text-reflow text-lg font-semibold text-surface-950-50">API access</h2>
                     <p class="mt-1 text-sm leading-6 text-surface-700-300">
                       Connect automations and other apps to Bookward with a token. Tokens are shown only once when created.
                     </p>
@@ -5458,20 +5856,20 @@
 
                 <div class="mb-5 min-w-0 border border-surface-300-700/50 p-3 text-sm">
                   <span class="block text-xs font-semibold uppercase tracking-wide text-surface-600-400">API base URL</span>
-                  <code class="mt-1 block break-all text-surface-950-50">{page.url.origin}/api/v1</code>
+                  <code class="url-reflow mt-1 block text-surface-950-50">{page.url.origin}/api/v1</code>
                   <span class="mt-2 block text-xs leading-5 text-surface-700-300">Send the token as <code class="break-words wrap-anywhere">Authorization: Bearer &lt;token&gt;</code>.</span>
                 </div>
 
                 {#if revealedApiToken}
                   <div class="mb-5 border-l-2 border-success-500 preset-tonal-success p-4">
-                    <div class="flex items-start gap-3">
+                    <div class="flex flex-wrap items-start gap-3">
                       <Check size={18} class="mt-0.5 shrink-0" aria-hidden="true" />
-                      <div class="min-w-0 flex-1">
+                      <div class="min-w-0 flex-1 basis-[8rem]">
                         <div role="alert">
                           <p class="font-semibold">Copy this token now</p>
                           <p class="mt-1 text-xs leading-5">For your security, Bookward will not display it again.</p>
                         </div>
-                        <code class="mt-3 block break-all rounded bg-surface-950-50/10 p-2 text-xs">{revealedApiToken}</code>
+                        <code class="url-reflow mt-3 block rounded bg-surface-950-50/10 p-2 text-xs">{revealedApiToken}</code>
                       </div>
                       <button
                         class="btn btn-sm min-h-9 shrink-0 preset-tonal-success"
@@ -5499,7 +5897,7 @@
                     Token name
                     <input class="input mt-2" name="name" maxlength="100" placeholder="Home Assistant" required />
                   </label>
-                  <button class="btn min-h-11 preset-filled-primary-500" type="submit" disabled={isPending("create-api-token")} aria-busy={isPending("create-api-token")}>
+                  <button class="btn btn-reflow min-h-11 preset-filled-primary-500" type="submit" disabled={isPending("create-api-token")} aria-busy={isPending("create-api-token")}>
                     {#if isPending("create-api-token")}<RefreshCw size={16} class="animate-spin" />{:else}<KeyRound size={16} />{/if} Generate token
                   </button>
                 </form>
@@ -5510,8 +5908,8 @@
                     <ul class="mt-3 divide-y divide-surface-300-700/40 border border-surface-300-700/40">
                       {#each apiTokens as token (token.id)}
                         <li class="flex flex-wrap items-center gap-3 p-3">
-                          <div class="min-w-0 flex-1">
-                            <p class="truncate text-sm font-medium text-surface-950-50">{token.name}</p>
+                          <div class="min-w-0 flex-1 basis-[8rem]">
+                            <p class="text-reflow text-sm font-medium text-surface-950-50">{token.name}</p>
                             <p class="mt-1 text-xs text-surface-700-300"><code class="break-words wrap-anywhere">{token.token_prefix}…</code> · Created {token.created_at}</p>
                             {#if token.last_used_at}<p class="mt-1 text-xs text-surface-700-300">Last used {token.last_used_at}</p>{/if}
                           </div>
@@ -5519,12 +5917,12 @@
                             <span class="badge preset-tonal-error">Revoked</span>
                           {:else}
                             <details>
-                              <summary class="btn btn-sm min-h-9 cursor-pointer preset-tonal-error" aria-label={`Revoke API token ${token.name}`}><Trash2 size={14} /> Revoke</summary>
+                              <summary class="btn btn-sm btn-reflow min-h-9 cursor-pointer preset-tonal-error" aria-label={`Revoke API token ${token.name}`}><Trash2 size={14} /> Revoke</summary>
                               <form method="POST" action="?/revokeApiToken" use:enhance={setPending(`revoke-api-token-${token.id}`, optimisticRevokeToken)} class="mt-2 grid max-w-xs justify-items-start gap-2">
                                 <ProfileField profileId={data.user?.profile_id} />
                                 <input type="hidden" name="id" value={token.id} />
                                 <p class="text-xs text-surface-700-300">Apps using this token will lose access to Bookward.</p>
-                                <button class="btn btn-sm min-h-9 preset-filled-error-500" type="submit" aria-label={`Confirm revoke: ${token.name}`} disabled={isPending(`revoke-api-token-${token.id}`)} aria-busy={isPending(`revoke-api-token-${token.id}`)}>Confirm revoke</button>
+                                <button class="btn btn-sm btn-reflow min-h-9 preset-filled-error-500" type="submit" aria-label={`Confirm revoke: ${token.name}`} disabled={isPending(`revoke-api-token-${token.id}`)} aria-busy={isPending(`revoke-api-token-${token.id}`)}>Confirm revoke</button>
                               </form>
                             </details>
                           {/if}
@@ -5683,7 +6081,7 @@
                     {:else}
                       <p in:fade={{ duration: motionDuration(180) }} class="text-sm text-surface-700-300">Weekly schedule is off. Save a channel below to test delivery before turning on automatic digests.</p>
                     {/if}
-                    <button class="btn min-h-11 w-full preset-filled-secondary-500 sm:w-auto" type="submit" disabled={isPending("digest-settings")} aria-busy={isPending("digest-settings")}>{#if isPending("digest-settings")}<RefreshCw size={16} class="animate-spin" />{:else}<Check size={16} />{/if} Save digest settings</button>
+                    <button class="btn btn-reflow min-h-11 w-full preset-filled-secondary-500 sm:w-auto" type="submit" disabled={isPending("digest-settings")} aria-busy={isPending("digest-settings")}>{#if isPending("digest-settings")}<RefreshCw size={16} class="animate-spin" />{:else}<Check size={16} />{/if} Save digest settings</button>
                   </div>
                 </form>
                 <div class="mt-5 flex flex-wrap items-center gap-2 border-t border-surface-300-700/40 pt-5">
@@ -5691,12 +6089,12 @@
                     {#if shouldShowDigestTestButton(digestSettings, digestDraft, channel)}<form method="POST" action="?/sendDigestTest" use:enhance={setPending(`digest-test-${channel}`)}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="channel" value={channel} />
-                      <button class="btn btn-sm min-h-10 preset-tonal-secondary" type="submit" disabled={!canTestDigestChannel(digestSettings, digestDraft, channel) || isPending(`digest-test-${channel}`)} aria-busy={isPending(`digest-test-${channel}`)}>{#if channel === "discord"}<MessageCircle size={15} />{:else}<Mail size={15} />{/if}{#if isPending(`digest-test-${channel}`)}<RefreshCw size={15} class="animate-spin" />{:else}Send {channel} test{/if}</button>
+                      <button class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" type="submit" disabled={!canTestDigestChannel(digestSettings, digestDraft, channel) || isPending(`digest-test-${channel}`)} aria-busy={isPending(`digest-test-${channel}`)}>{#if channel === "discord"}<MessageCircle size={15} />{:else}<Mail size={15} />{/if}{#if isPending(`digest-test-${channel}`)}<RefreshCw size={15} class="animate-spin" />{:else}Send {channel} test{/if}</button>
                     </form>{/if}
                   {/each}
                   <form method="POST" action="?/runDigest" use:enhance={setPending("digest-run")} class="ml-auto">
                     <ProfileField profileId={data.user?.profile_id} />
-                    <button class="btn btn-sm min-h-10 preset-filled-tertiary-500" type="submit" disabled={!canRunDigestNow(digestSettings, digestDraft) || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
+                    <button class="btn btn-sm btn-reflow min-h-10 preset-filled-tertiary-500" type="submit" disabled={!canRunDigestNow(digestSettings, digestDraft) || isPending("digest-run")} aria-busy={isPending("digest-run")}><Send size={15} /> Run digest now</button>
                   </form>
                 </div>
                 <StatusRegion
@@ -5729,8 +6127,8 @@
                     class="grid size-10 shrink-0 place-items-center preset-tonal-primary"
                     ><BookOpen size={19} /></span
                   >
-                  <h2 class="flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
-                  <button type="button" class="btn btn-sm min-h-9 preset-tonal-secondary" onclick={() => { selectDecisionFilter("read"); go("decisions"); }}>View full history <ArrowRight size={14} /></button>
+                  <h2 class="text-reflow flex-1 text-lg font-semibold text-surface-950-50">Recent reads</h2>
+                  <button type="button" class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary" onclick={() => go("decisions", "read")}>View full history <ArrowRight size={14} /></button>
                 </div>
                 {#if recentReads.length}<div
                     class="grid min-w-0 gap-2 sm:grid-cols-2 lg:grid-cols-3"
@@ -5745,12 +6143,12 @@
                         class="flex min-h-16 min-w-0 flex-wrap items-center gap-3 preset-tonal-surface p-3"
                       >
                         <BookOpen size={15} class="shrink-0 text-primary-500" />
-                        <div class="min-w-0 flex-1">
+                        <div class="min-w-0 flex-1 basis-[8rem]">
                           <span
-                            class="block truncate text-sm font-medium text-surface-950-50"
+                            class="text-reflow block text-sm font-medium text-surface-950-50"
                             >{item.title}</span
                           ><small
-                            class="block truncate text-xs text-surface-700-300"
+                            class="text-reflow mt-0.5 block text-xs text-surface-700-300"
                             >{item.author}</small
                           >
                         </div>
@@ -5785,18 +6183,18 @@
   </div>
 
   <nav
-    class="fixed inset-x-0 bottom-0 z-40 flex border-t preset-filled-surface-50-950 pb-[env(safe-area-inset-bottom)] md:hidden"
+    class="sticky inset-x-0 bottom-0 z-40 mt-auto flex flex-wrap border-t preset-filled-surface-50-950 pb-[env(safe-area-inset-bottom)] md:hidden"
     aria-label="Mobile navigation"
   >
     {#each navItems as item}{@const Icon = item.icon}<button
         type="button"
-        class={`relative flex min-h-16 min-w-0 flex-1 flex-col items-center justify-center gap-1 px-0.5 text-xs ${activeView === item.id ? "text-primary-600-400" : "text-surface-700-300"}`}
+        class={`relative flex min-h-16 flex-1 flex-col items-center justify-center gap-1 px-1 py-1.5 text-xs sm:px-1.5 ${activeView === item.id ? "text-primary-600-400" : "text-surface-700-300"}`}
         aria-current={activeView === item.id ? "page" : undefined}
         onclick={() => go(item.id)}
         ><Icon
           size={19}
           strokeWidth={activeView === item.id ? 2.2 : 1.8}
-        /><span class="flex items-center gap-1">{item.shortLabel}{#if item.id === "saved"}<span class="badge badge-sm preset-tonal-secondary">{shortlistTotalCount}</span>{/if}</span>{#if activeView === item.id}<span
+        /><span class="flex items-center gap-0.5">{item.shortLabel}{#if item.id === "saved"}<span class="badge badge-sm px-1 preset-tonal-secondary">{shortlistTotalCount}</span>{/if}</span>{#if activeView === item.id}<span
             in:scale={{ duration: motionDuration(150) }}
             out:fade={{ duration: motionDuration(90) }}
             class="absolute bottom-1 size-1 rounded-full preset-filled-primary-500"
@@ -5817,13 +6215,13 @@
           <div class="absolute -bottom-28 -left-20 size-72 rounded-full bg-secondary-500/10 blur-3xl"></div>
         </div>
         <div class="flex items-start justify-between gap-4 border-b border-surface-200-800/70 p-4 sm:gap-5 sm:p-7">
-          <div class="flex min-w-0 items-center gap-3 sm:gap-4">
+          <div class="flex min-w-0 flex-1 flex-wrap items-center gap-3 sm:gap-4">
             <span class="grid size-12 shrink-0 place-items-center rounded-2xl border border-primary-500/25 bg-primary-500/10 text-primary-600-400 shadow-inner shadow-primary-500/10">
               <BookOpen size={22} />
             </span>
-            <div class="min-w-0">
+            <div class="min-w-0 flex-1 basis-[4.5rem]">
               <p class="text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-primary-600-400">Keep the story</p>
-              <h2 id="mark-read-title" class="mt-1 break-words text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read: {markReadBook.title}</h2>
+              <h2 id="mark-read-title" class="text-reflow mt-1 text-2xl font-semibold tracking-tight text-surface-950-50 sm:text-3xl">Mark Read: {markReadBook.title}</h2>
             </div>
           </div>
           <button
@@ -5835,13 +6233,13 @@
           ><X size={17} /></button>
         </div>
 
-        <form method="POST" action="?/markRead" use:enhance={setPending(`shortlist-read-${markReadBook.id}`, optimisticShortlistRead)}>
+        <form method="POST" action="?/markRead" use:enhance={submitMarkRead(markReadBook.id)}>
           <div class="min-w-0 p-4 sm:p-7">
             <ProfileField profileId={data.user?.profile_id} />
             <input type="hidden" name="id" value={markReadBook.id} />
             <input type="hidden" name="rating" value={markReadRating || ""} />
 
-            <div class="flex items-center gap-4 rounded-2xl border border-surface-200-800/80 bg-surface-950/5 p-3 sm:p-4">
+            <div class="flex flex-wrap items-center gap-4 rounded-2xl border border-surface-200-800/80 bg-surface-950/5 p-3 sm:p-4">
               <div class="relative grid h-18 w-12 aspect-[2/3] shrink-0 place-items-center overflow-hidden rounded-xl border border-surface-200-800/80 bg-surface-900/40">
                 <BookOpen size={22} class="text-surface-600-400" aria-hidden="true" />
                 {#if markReadBook.cover_url}
@@ -5855,14 +6253,19 @@
                   />
                 {/if}
               </div>
-              <div class="min-w-0">
-                <p class="line-clamp-2 text-lg font-semibold leading-snug text-surface-950-50">{markReadBook.title}</p>
-                <p class="mt-1 truncate text-sm text-surface-700-300">{markReadBook.author}</p>
+              <div class="min-w-0 flex-1 basis-[8rem]">
+                <p class="text-reflow text-lg font-semibold leading-snug text-surface-950-50">{markReadBook.title}</p>
+                <p class="text-reflow mt-1 text-sm text-surface-700-300">{markReadBook.author}</p>
               </div>
               <span class="ml-auto hidden size-9 shrink-0 place-items-center rounded-full bg-secondary-500/10 text-secondary-600-400 sm:grid" aria-hidden="true"><Check size={17} /></span>
             </div>
 
             <p id="mark-read-description" class="mt-5 max-w-md text-sm leading-6 text-surface-700-300">Add this book to your read history. You can leave a rating now, or keep the moment unrated.</p>
+
+            <MarkReadErrorAlert
+              message={markReadError}
+              transitionDuration={motionDuration(180)}
+            />
 
             <div class="mt-6">
               <div class="flex items-baseline justify-between gap-3">
@@ -5874,10 +6277,10 @@
           </div>
 
           <div class="flex flex-col-reverse gap-2 border-t border-surface-200-800/70 bg-surface-950/5 p-5 sm:flex-row sm:justify-end sm:p-6">
-            <button type="button" class="btn min-h-11 preset-tonal-surface" onclick={closeMarkRead}>Not yet</button>
+            <button type="button" class="btn btn-reflow min-h-11 preset-tonal-surface" onclick={closeMarkRead}>Not yet</button>
             <button
               type="submit"
-              class="btn min-h-11 preset-filled-primary-500"
+              class="btn btn-reflow min-h-11 preset-filled-primary-500"
               disabled={isPending(`shortlist-read-${markReadBook.id}`)}
               aria-busy={isPending(`shortlist-read-${markReadBook.id}`)}
             >
@@ -5903,11 +6306,11 @@
             </p>
             <h2
               id="librarr-search-title"
-              class="mt-1 truncate text-2xl font-semibold tracking-tight text-surface-950-50"
+              class="text-reflow mt-1 text-2xl font-semibold tracking-tight text-surface-950-50"
             >
               Find a book to add
             </h2>
-            <p class="mt-1 truncate text-sm text-surface-700-300">
+            <p class="text-reflow mt-1 text-sm text-surface-700-300">
               {librarrSearchBook?.title} · {librarrSearchBook?.author}
             </p>
           </div>
@@ -5948,7 +6351,7 @@
             >
             <button
               type="submit"
-              class="btn min-h-12 preset-filled-primary-500"
+              class="btn btn-reflow min-h-12 preset-filled-primary-500"
               aria-busy={librarrSearchState === "searching"}
               >{#if librarrSearchState === "searching"}<RefreshCw
                   size={16}
@@ -6020,7 +6423,7 @@
             </div>
           {/if}
           {#if librarrResults.length}
-            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm min-h-11 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
+            {#if highConfidenceLibrarrResults.length > 1}<div class="mt-5 flex flex-wrap items-center justify-between gap-3 border border-primary-500/30 preset-tonal-primary p-3 text-sm"><span><strong>{highConfidenceLibrarrResults.length} high-confidence matches</strong><span class="ml-1 text-surface-700-300">(Librarr score ≥ 90)</span></span><button type="button" class="btn btn-sm btn-reflow min-h-11 preset-filled-primary-500" onclick={() => void addHighConfidenceLibrarrResults()} disabled={librarrAddingKey !== null || librarrBulkAdding} aria-busy={librarrBulkAdding}>{#if librarrBulkAdding}<RefreshCw size={14} class="animate-spin" /> Adding…{:else}<Library size={14} /> Add high-confidence matches{/if}</button></div>{/if}
             <div class="mt-5 space-y-3">
               {#each librarrResults as result, index (resultKey(result, index))}
                 {@const cover = resultCover(result)}
@@ -6030,7 +6433,7 @@
                     duration: motionDuration(220),
                     delay: motionDelay(index, 24),
                   }}
-                  class="flex min-w-0 items-center gap-4 preset-tonal-surface p-3 sm:p-4"
+                  class="flex min-w-0 flex-wrap items-center gap-3 preset-tonal-surface p-3 sm:gap-4 sm:p-4"
                 >
                   <div
                     class="relative grid h-18 w-12 aspect-[2/3] shrink-0 place-items-center overflow-hidden rounded-lg preset-filled-surface-500"
@@ -6053,13 +6456,13 @@
                             true)}
                       />{/if}
                   </div>
-                  <div class="min-w-0 flex-1">
+                  <div class="min-w-0 flex-1 basis-[8rem]">
                     <h3
-                      class="line-clamp-2 text-base font-semibold text-surface-950-50 sm:text-lg"
+                      class="text-reflow text-base font-semibold text-surface-950-50 sm:text-lg"
                     >
                       {resultTitle(result)}
                     </h3>
-                    <p class="mt-1 truncate text-sm text-surface-700-300">
+                    <p class="text-reflow mt-1 text-sm text-surface-700-300">
                       {resultAuthor(result)}
                     </p>
                     <span
@@ -6070,7 +6473,7 @@
                   </div>
                   <button
                     type="button"
-                    class="btn btn-sm min-h-11 min-w-11 shrink-0 preset-tonal-secondary"
+                    class="btn btn-sm ml-auto min-h-11 min-w-11 shrink-0 preset-tonal-secondary"
                     aria-label={`${librarrAdded.has(resultIdentity(result)) ? "Added" : "Add"} ${resultTitle(result)} to Librarr`}
                     disabled={librarrAddingKey !== null || librarrBulkAdding ||
                       librarrAdded.has(resultIdentity(result))}

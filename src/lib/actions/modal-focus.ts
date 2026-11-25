@@ -260,7 +260,6 @@ export function modalFocus(
       first.focus();
     }
   };
-
   const onDocumentKeydown = (event: KeyboardEvent) => {
     if (!isModalActive()) {
       releaseModal();

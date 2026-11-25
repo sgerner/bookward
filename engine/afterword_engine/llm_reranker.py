@@ -13,13 +13,14 @@ import re
 import threading
 import time
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
 from .config import settings
+from .http_bounds import read_bounded_json_async, read_bounded_json_sync
 from .identity import ReadIdentityIndex, book_identity, book_row_identity_match_keys
-from .security import safe_error_message, validate_service_url
+from .security import safe_error_message, validate_public_url, validate_service_url
 from .tenancy import current_profile_id, profile_database_path
 
 LOGGER = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ DEFAULT_CLOUD_LLM_URL = "https://api.openai.com/v1/chat/completions"
 MAX_LLM_TIMEOUT_SECONDS = 25.0
 MIN_LLM_TIMEOUT_SECONDS = 0.001
 MIN_MEANINGFUL_DELTA = 0.01
+MAX_SAME_ORIGIN_REDIRECTS = 2
 CACHE_TTL_SECONDS = 900.0
 MAX_CACHE_ENTRIES_PER_PROFILE = 32
 MAX_CACHED_PROFILES = 128
@@ -474,6 +476,7 @@ def apply_llm_rerank_adjustments(
     cap = max(0.0, float(max_delta))
     adjusted_count = 0
     seen_ids: set[int] = set()
+    validated_adjustments: list[dict[str, Any]] = []
     for entry in adjustments:
         if not isinstance(entry, dict):
             continue
@@ -500,6 +503,13 @@ def apply_llm_rerank_adjustments(
                 explanation = list(cand.get("explanation") or [])
                 explanation.append(f"LLM delta ({applied_delta:+.2f}): {reason}")
                 cand["explanation"] = explanation
+            validated_adjustments.append(
+                {
+                    "id": cid,
+                    "delta": clipped_delta,
+                    "reason": reason,
+                }
+            )
         except (KeyError, TypeError, ValueError, OverflowError):
             continue
 
@@ -508,6 +518,9 @@ def apply_llm_rerank_adjustments(
             "applied": True,
             "adjusted_count": 0,
             "mode": "adjustments",
+            "top_k": limit,
+            "max_delta": cap,
+            "adjustments": [],
         }
 
     reranked_head = [
@@ -521,6 +534,9 @@ def apply_llm_rerank_adjustments(
         "applied": True,
         "adjusted_count": adjusted_count,
         "mode": "adjustments",
+        "top_k": limit,
+        "max_delta": cap,
+        "adjustments": validated_adjustments,
     }
 
 
@@ -589,10 +605,17 @@ def apply_llm_rerank_order(
             key=lambda pair: (-float(pair[1].get("score") or 0.0), pair[0]),
         )
     ]
+    validated_rankings = [
+        {"id": cid, **({"reason": reasons[cid]} if cid in reasons else {})}
+        for cid in ordered_ids
+    ]
     return reranked_head + tail, {
         "applied": True,
         "reranked_count": len(reasons) or n,
         "mode": "listwise",
+        "top_k": limit,
+        "max_delta": float(max_nudge),
+        "rankings": validated_rankings,
     }
 
 
@@ -1153,6 +1176,158 @@ def _build_chat_request_bodies(
     return strict_body, plain_body
 
 
+def _validate_redirect_target(
+    origin_url: str,
+    status_code: int,
+    location: str,
+    *,
+    mode: str,
+    allowed_hosts: set[str] | None = None,
+    has_api_key: bool = False,
+) -> str:
+    if not location:
+        raise ValueError("LLM endpoint returned a redirect without a Location header")
+    if status_code not in {307, 308}:
+        raise ValueError("Method-changing redirects are not allowed for LLM POST requests")
+    if mode == "cloud" and (
+        urlparse(origin_url).query or urlparse(origin_url).fragment
+    ):
+        candidate = urljoin(origin_url, location)
+        parsed = urlparse(candidate)
+        orig_parsed = urlparse(origin_url)
+        orig_origin = (
+            (orig_parsed.scheme or "").lower(),
+            (orig_parsed.hostname or "").lower().rstrip("."),
+            orig_parsed.port or 443,
+        )
+        cand_origin = (
+            (parsed.scheme or "").lower(),
+            (parsed.hostname or "").lower().rstrip("."),
+            parsed.port or 443,
+        )
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.username
+            or parsed.password
+            or cand_origin != orig_origin
+        ):
+            raise ValueError("Cross-origin redirects are not allowed for LLM requests")
+        if ".." in (parsed.path or "").split("/") or ".." in unquote(parsed.path or "").split("/"):
+            raise ValueError("Invalid redirect path from LLM endpoint")
+        return validate_public_url(candidate)
+    orig_scheme, orig_host, orig_port, _orig_path = _validate_and_split_llm_origin(
+        origin_url,
+        allowed_hosts,
+        has_api_key=has_api_key,
+        require_https=(mode == "cloud"),
+    )
+    candidate = urljoin(origin_url, location)
+    try:
+        cand_scheme, cand_host, cand_port, cand_path = _validate_and_split_llm_origin(
+            candidate,
+            allowed_hosts,
+            has_api_key=has_api_key,
+            require_https=(mode == "cloud"),
+        )
+    except ValueError as exc:
+        raise ValueError("Cross-origin redirects are not allowed for LLM requests") from exc
+    if (cand_scheme, cand_host, cand_port) != (orig_scheme, orig_host, orig_port):
+        raise ValueError("Cross-origin redirects are not allowed for LLM requests")
+    if ".." in cand_path.split("/") or not _SAFE_ENDPOINT_PATH_RE.fullmatch(cand_path):
+        raise ValueError("Invalid redirect path from LLM endpoint")
+    if cand_port:
+        return f"{cand_scheme}://{cand_host}:{cand_port}{cand_path}"
+    return f"{cand_scheme}://{cand_host}{cand_path}"
+
+
+async def _send_llm_post_async(
+    client: httpx.AsyncClient,
+    origin_url: str,
+    *,
+    headers: dict[str, str],
+    json_body: dict[str, Any],
+    mode: str,
+    allowed_hosts: set[str] | None,
+    has_api_key: bool,
+    allow_schema_fallback: bool,
+) -> Any:
+    current_url = origin_url
+    for _hop in range(MAX_SAME_ORIGIN_REDIRECTS + 1):
+        request = client.build_request(
+            "POST",
+            current_url,
+            headers=headers,
+            json=json_body,
+        )
+        response = await client.send(request, stream=True)
+        try:
+            if 300 <= response.status_code < 400:
+                current_url = _validate_redirect_target(
+                    origin_url,
+                    response.status_code,
+                    response.headers.get("location", "").strip(),
+                    mode=mode,
+                    allowed_hosts=allowed_hosts,
+                    has_api_key=has_api_key,
+                )
+                continue
+            if allow_schema_fallback and response.status_code in {400, 422}:
+                return None
+            response.raise_for_status()
+            return await read_bounded_json_async(
+                response,
+                max_bytes=settings.llm_rerank_max_bytes,
+                size_error="LLM reranker response is too large",
+            )
+        finally:
+            await response.aclose()
+    raise ValueError("Too many redirects from LLM endpoint")
+
+
+def _send_llm_post_sync(
+    client: httpx.Client,
+    origin_url: str,
+    *,
+    headers: dict[str, str],
+    json_body: dict[str, Any],
+    mode: str,
+    allowed_hosts: set[str] | None,
+    has_api_key: bool,
+    allow_schema_fallback: bool,
+) -> Any:
+    current_url = origin_url
+    for _hop in range(MAX_SAME_ORIGIN_REDIRECTS + 1):
+        request = client.build_request(
+            "POST",
+            current_url,
+            headers=headers,
+            json=json_body,
+        )
+        response = client.send(request, stream=True)
+        try:
+            if 300 <= response.status_code < 400:
+                current_url = _validate_redirect_target(
+                    origin_url,
+                    response.status_code,
+                    response.headers.get("location", "").strip(),
+                    mode=mode,
+                    allowed_hosts=allowed_hosts,
+                    has_api_key=has_api_key,
+                )
+                continue
+            if allow_schema_fallback and response.status_code in {400, 422}:
+                return None
+            response.raise_for_status()
+            return read_bounded_json_sync(
+                response,
+                max_bytes=settings.llm_rerank_max_bytes,
+                size_error="LLM reranker response is too large",
+            )
+        finally:
+            response.close()
+    raise ValueError("Too many redirects from LLM endpoint")
+
+
 async def _request_llm_completion_async(
     *,
     mode: str,
@@ -1163,12 +1338,13 @@ async def _request_llm_completion_async(
     timeout: float,
     allowed_hosts: set[str] | None = None,
 ) -> str:
+    has_key = bool(api_key.strip())
     target_url = _build_validated_llm_target_url(
         api_url,
         mode=mode,
         endpoint="chat",
         allowed_hosts=allowed_hosts,
-        has_api_key=bool(api_key.strip()),
+        has_api_key=has_key,
     )
     headers = _build_headers(api_key, include_content_type=True)
     strict_body, plain_body = _build_chat_request_bodies(
@@ -1179,13 +1355,28 @@ async def _request_llm_completion_async(
         follow_redirects=False,
         trust_env=False,
     ) as client:
-        response = await client.post(target_url, headers=headers, json=strict_body)
-        if response.status_code in {400, 422}:
-            response = await client.post(target_url, headers=headers, json=plain_body)
-        if 300 <= response.status_code < 400:
-            raise ValueError("Redirects are not allowed for LLM requests")
-        response.raise_for_status()
-        return _extract_completion_text(response.json(), mode)
+        payload = await _send_llm_post_async(
+            client,
+            target_url,
+            headers=headers,
+            json_body=strict_body,
+            mode=mode,
+            allowed_hosts=allowed_hosts,
+            has_api_key=has_key,
+            allow_schema_fallback=True,
+        )
+        if payload is None:
+            payload = await _send_llm_post_async(
+                client,
+                target_url,
+                headers=headers,
+                json_body=plain_body,
+                mode=mode,
+                allowed_hosts=allowed_hosts,
+                has_api_key=has_key,
+                allow_schema_fallback=False,
+            )
+        return _extract_completion_text(payload, mode)
 
 
 def _request_llm_completion_sync(
@@ -1198,13 +1389,29 @@ def _request_llm_completion_sync(
     timeout: float,
     allowed_hosts: set[str] | None = None,
 ) -> str:
-    target_url = _build_validated_llm_target_url(
-        api_url,
-        mode=mode,
-        endpoint="chat",
-        allowed_hosts=allowed_hosts,
-        has_api_key=bool(api_key.strip()),
-    )
+    has_key = bool(api_key.strip())
+    if mode == "cloud":
+        cleaned_url = _normalize_chat_url(api_url)
+        if not cleaned_url or "\\" in cleaned_url or any(
+            ord(ch) < 33 or ord(ch) == 127 for ch in cleaned_url
+        ):
+            raise ValueError("LLM API URL contains invalid characters")
+        parsed_sync = urlparse(cleaned_url)
+        unquoted_sync_path = unquote(parsed_sync.path or "")
+        if (
+            ".." in (parsed_sync.path or "").split("/")
+            or ".." in unquoted_sync_path.split("/")
+        ):
+            raise ValueError("LLM API URL contains an invalid path")
+        target_url = validate_public_url(cleaned_url)
+    else:
+        target_url = _build_validated_llm_target_url(
+            api_url,
+            mode=mode,
+            endpoint="chat",
+            allowed_hosts=allowed_hosts,
+            has_api_key=has_key,
+        )
     headers = _build_headers(api_key, include_content_type=True)
     strict_body, plain_body = _build_chat_request_bodies(
         mode=mode, model=model, messages=messages
@@ -1216,13 +1423,28 @@ def _request_llm_completion_sync(
     if mode != "cloud":
         client_kwargs["trust_env"] = False
     with httpx.Client(**client_kwargs) as client:
-        response = client.post(target_url, headers=headers, json=strict_body)
-        if response.status_code in {400, 422}:
-            response = client.post(target_url, headers=headers, json=plain_body)
-        if 300 <= response.status_code < 400:
-            raise ValueError("Redirects are not allowed for LLM requests")
-        response.raise_for_status()
-        return _extract_completion_text(response.json(), mode)
+        payload = _send_llm_post_sync(
+            client,
+            target_url,
+            headers=headers,
+            json_body=strict_body,
+            mode=mode,
+            allowed_hosts=allowed_hosts,
+            has_api_key=has_key,
+            allow_schema_fallback=True,
+        )
+        if payload is None:
+            payload = _send_llm_post_sync(
+                client,
+                target_url,
+                headers=headers,
+                json_body=plain_body,
+                mode=mode,
+                allowed_hosts=allowed_hosts,
+                has_api_key=has_key,
+                allow_schema_fallback=False,
+            )
+        return _extract_completion_text(payload, mode)
 
 
 def _apply_parsed_payload(
@@ -1393,11 +1615,19 @@ async def discover_local_llm_models(
         follow_redirects=False,
         trust_env=False,
     ) as client:
-        response = await client.get(target_url, headers=headers)
-        if 300 <= response.status_code < 400:
-            raise ValueError("Redirects are not allowed for LLM requests")
-        response.raise_for_status()
-        payload = response.json()
+        request = client.build_request("GET", target_url, headers=headers)
+        response = await client.send(request, stream=True)
+        try:
+            if 300 <= response.status_code < 400:
+                raise ValueError("Redirects are not allowed for LLM requests")
+            response.raise_for_status()
+            payload = await read_bounded_json_async(
+                response,
+                max_bytes=settings.llm_rerank_max_bytes,
+                size_error="LLM model discovery response is too large",
+            )
+        finally:
+            await response.aclose()
 
     if not isinstance(payload, dict):
         raise ValueError("Model discovery endpoint returned an invalid JSON payload")
