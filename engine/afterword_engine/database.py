@@ -1,3 +1,4 @@
+import functools
 import json
 import sqlite3
 import threading
@@ -17,11 +18,23 @@ from .covers import (
 from .identity import book_identity, book_identity_matches, normalize_key
 from .isbn import isbn_parts_from_amazon_url
 from .secrets import unseal
-from .tenancy import profile_database_path, restore_fence_bypassed
+from .tenancy import (
+    active_restore_epoch_binding,
+    bound_restore_epoch,
+    profile_database_path,
+    restore_epoch_latch_scope,
+    restore_epoch_scope,
+    restore_fence_bypassed,
+)
 
 METADATA_PROVENANCE_MAX_BYTES = 8192
-RESTORE_QUIESCENCE_TIMEOUT_SECONDS = 5.0
 SEEDED_DEFAULT_SOURCES_KEY = "seeded_default_source_urls"
+RESTORE_EPOCH_KEY = "restore_epoch"
+RESTORE_QUIESCENCE_TIMEOUT_SECONDS = 5.0
+
+
+class RestoreEpochError(RuntimeError):
+    """Raised when a pre-restore task attempts to write after profile recovery."""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -1091,7 +1104,14 @@ class _ActiveWorkerJob:
 
 
 class _ProfileDatabaseLock:
-    """Allow concurrent connections and let backup/restore take an exclusive lock."""
+    """Coordinate shared readers, exclusive writers, and restore quiescence per profile DB.
+
+    ``shared()``, ``try_shared()``, and ``is_locked()`` allow concurrent readers
+    (including shared online backups) when idle, while refusing new readers both
+    during exclusive writer acquisition and during ``quiesce()``'s drain window
+    (``_restoring_count > 0``). ``acquire(deadline=None)`` blocks without a
+    timeout by default and raises ``BackupError`` when a restore deadline expires.
+    """
 
     def __init__(self):
         self._condition = threading.Condition()
@@ -1351,6 +1371,8 @@ _DATABASE_LOCKS_GUARD = threading.Lock()
 _DATABASE_SETUP_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = (
     weakref.WeakValueDictionary()
 )
+_RECORDED_RESTORE_EPOCHS: dict[str, int] = {}
+_RESTORE_GENERATIONS: dict[str, int] = {}
 
 
 def database_lock(path: str | Path | None = None) -> _ProfileDatabaseLock:
@@ -1359,6 +1381,28 @@ def database_lock(path: str | Path | None = None) -> _ProfileDatabaseLock:
     key = str(Path(path) if path is not None else profile_database_path())
     with _DATABASE_LOCKS_GUARD:
         return _DATABASE_LOCKS.setdefault(key, _ProfileDatabaseLock())
+
+
+def recorded_restore_epoch(path: str | Path | None = None) -> int:
+    key = str(Path(path) if path is not None else profile_database_path())
+    with _DATABASE_LOCKS_GUARD:
+        return _RECORDED_RESTORE_EPOCHS.get(key, 0)
+
+
+def record_restore_epoch(epoch: int, path: str | Path | None = None) -> int:
+    key = str(Path(path) if path is not None else profile_database_path())
+    normalized = max(0, int(epoch))
+    with _DATABASE_LOCKS_GUARD:
+        updated = max(_RECORDED_RESTORE_EPOCHS.get(key, 0), normalized)
+        _RECORDED_RESTORE_EPOCHS[key] = updated
+        _RESTORE_GENERATIONS[key] = _RESTORE_GENERATIONS.get(key, 0) + 1
+        return updated
+
+
+def profile_restore_generation(path: str | Path | None = None) -> int:
+    key = str(Path(path) if path is not None else profile_database_path())
+    with _DATABASE_LOCKS_GUARD:
+        return _RESTORE_GENERATIONS.get(key, 0)
 
 
 def _database_setup_lock(path: Path) -> threading.RLock:
@@ -1430,6 +1474,16 @@ def connect():
             con.execute("PRAGMA foreign_keys=ON")
             con.execute("PRAGMA busy_timeout=5000")
             _restrict_database_files()
+        binding = active_restore_epoch_binding(db_path)
+        if (
+            binding is not None
+            and binding.epoch is None
+            and (
+                binding.generation is None
+                or profile_restore_generation(db_path) == binding.generation
+            )
+        ):
+            binding.epoch = read_restore_epoch(con)
         return con
     except Exception:
         con.close()
@@ -1476,11 +1530,99 @@ def _backfill_source_isbns(con):
             (next_isbn13, next_isbn10, candidate["id"]),
         )
 
+def read_restore_epoch(con: sqlite3.Connection) -> int:
+    try:
+        found = con.execute(
+            "SELECT value FROM settings WHERE key=?", (RESTORE_EPOCH_KEY,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    if not found:
+        return 0
+    try:
+        return max(0, int(found[0]))
+    except (TypeError, ValueError):
+        return 0
+
+
+def current_restore_epoch() -> int:
+    db_path = profile_database_path()
+    if not db_path.is_file():
+        return recorded_restore_epoch(db_path)
+    with connect() as con:
+        return read_restore_epoch(con)
+
+
+@contextmanager
+def bind_restore_epoch(epoch: int | None = None):
+    target_path = profile_database_path()
+    existing = bound_restore_epoch(target_path)
+    if epoch is None and existing is not None:
+        yield existing
+        return
+    resolved = current_restore_epoch() if epoch is None else max(0, int(epoch))
+    with restore_epoch_scope(resolved, target_path):
+        yield resolved
+
+
+@contextmanager
+def bind_request_restore_epoch(path: str | Path | None = None):
+    target_path = Path(path) if path is not None else profile_database_path()
+    existing = active_restore_epoch_binding(target_path)
+    if existing is not None:
+        yield existing
+        return
+    with restore_epoch_latch_scope(
+        generation=profile_restore_generation(target_path),
+        path=target_path,
+    ) as binding:
+        yield binding
+
+
+def fenced_async(fn):
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        with bind_request_restore_epoch():
+            return await fn(*args, **kwargs)
+
+    return wrapper
+
+
+def scheduler_fenced(*, default=None):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with database_lock().scheduler_guard() as can_schedule:
+                if not can_schedule:
+                    return default() if callable(default) else default
+                with bind_request_restore_epoch():
+                    return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 @contextmanager
 def transaction():
     con = connect()
     try:
         con.execute("BEGIN IMMEDIATE")
+        binding = active_restore_epoch_binding()
+        if binding is not None:
+            actual_epoch = read_restore_epoch(con)
+            if (
+                binding.generation is not None
+                and profile_restore_generation() != binding.generation
+            ):
+                raise RestoreEpochError(
+                    f"Profile restore generation changed during operation (epoch -> {actual_epoch})"
+                )
+            if binding.epoch is not None and actual_epoch != binding.epoch:
+                raise RestoreEpochError(
+                    f"Profile restore epoch changed ({binding.epoch} -> {actual_epoch})"
+                )
+            binding.epoch = actual_epoch
         yield con
         con.commit()
     except Exception:
@@ -1618,6 +1760,10 @@ def initialize(*, seed_demo: bool = True):
                 raise sqlite3.DatabaseError(
                     f"Schema migration {version} failed: {exc}"
                 ) from exc
+        con.execute(
+            "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
+            (RESTORE_EPOCH_KEY, str(recorded_restore_epoch(db_path))),
+        )
         con.execute(
             "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
             ("source_sync_interval_hours", str(settings.source_sync_interval_hours)),

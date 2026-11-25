@@ -19,10 +19,14 @@ from cryptography.fernet import Fernet, InvalidToken
 from .config import settings
 from .database import (
     MIGRATIONS,
-    _LockedConnection,
-    _restrict_database_files,
     connect,
     database_lock,
+    _LockedConnection,
+    read_restore_epoch,
+    record_restore_epoch,
+    recorded_restore_epoch,
+    RESTORE_EPOCH_KEY,
+    _restrict_database_files,
     transaction,
 )
 from .decision_evidence import (
@@ -38,12 +42,13 @@ from .maintenance import (
     MAINTENANCE_LAST_RUN_KEY,
     run_storage_maintenance,
 )
-from .secrets import installation_key, installation_key_path
+from .secrets import clear_auth_registry_key_cache, installation_key, installation_key_path
 from .security import safe_error_message
 from .tenancy import (
     allow_restore_database_access,
     current_profile_id,
     profile_database_path,
+    unbind_restore_epoch,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -300,7 +305,7 @@ def _set_last_error(message: str) -> None:
                     "Skipped persisting backup status while profile database is locked"
                 )
                 return
-            with transaction() as con:
+            with unbind_restore_epoch(), transaction() as con:
                 con.execute(
                     "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,"
@@ -675,6 +680,8 @@ def _validate_auth_snapshot(path: Path) -> None:
 
 
 def _replace_auth_registry(staged: Path, live: Path, on_replace=None) -> None:
+    from .profiles import invalidate_auth_caches
+
     if live.is_file():
         checkpoint = sqlite3.connect(live, timeout=30)
         try:
@@ -685,6 +692,8 @@ def _replace_auth_registry(staged: Path, live: Path, on_replace=None) -> None:
             checkpoint.close()
     _remove_sidecars(live)
     os.replace(staged, live)
+    invalidate_auth_caches(clear_all=True)
+    clear_auth_registry_key_cache()
     if on_replace is not None:
         on_replace()
     os.chmod(live, 0o600)
@@ -1286,7 +1295,12 @@ def recover_interrupted_restore() -> bool:
     live_path = profile_database_path()
     lock = database_lock(live_path)
     try:
-        with _profile_backup_lock(live_path):
+        with (
+            _profile_backup_lock(live_path),
+            unbind_restore_epoch(),
+            lock.quiesce() as deadline,
+            lock.exclusive(deadline),
+        ):
             journal = _restore_journal_path()
             if not _has_restore_journal(journal):
                 return False
@@ -1296,26 +1310,28 @@ def recover_interrupted_restore() -> bool:
             safety_key, clear_key = _rollback_key_for_snapshot(
                 safety_path, journal, had_key_file
             )
-            with lock.quiesce() as deadline, lock.exclusive(deadline):
-                journal = _restore_journal_path()
-                if not _has_restore_journal(journal):
-                    return False
-                live_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                staged = _copy_to_stage(safety_path, live_path.parent)
-                try:
-                    if clear_key:
-                        _replace_live_database(
-                            staged,
-                            safety_key,
-                            rollback=True,
-                            clear_generated_key=True,
-                        )
-                    else:
-                        _replace_live_database(staged, safety_key, rollback=True)
-                except Exception:
+            live_parent = live_path.parent
+            live_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            staged, next_epoch = _stage_restored_database(
+                safety_path,
+                live_parent,
+                minimum_epoch=_read_file_restore_epoch(live_path),
+                migrate=True,
+            )
+            try:
+                if clear_key:
+                    _replace_live_database(
+                        staged, safety_key, rollback=True, clear_generated_key=True
+                    )
+                else:
+                    _replace_live_database(staged, safety_key, rollback=True)
+                staged = None
+            finally:
+                if staged is not None:
                     staged.unlink(missing_ok=True)
                     _remove_sidecars(staged)
-                    raise
+            record_restore_epoch(next_epoch, live_path)
+            with allow_restore_database_access():
                 _clear_restore_journal()
                 _set_last_error(
                     "An interrupted restore was rolled back to its safety backup."
@@ -1512,6 +1528,8 @@ def _replace_live_database(
                 LOGGER.exception("Failed to restore previous installation key")
         raise
     finally:
+        if key_mutated:
+            clear_auth_registry_key_cache()
         if staged_key is not None:
             staged_key.unlink(missing_ok=True)
 
@@ -1533,15 +1551,107 @@ def _copy_to_stage(source: Path, directory: Path) -> Path:
         raise
 
 
-def _finalize_staged_database(staged: Path) -> None:
-    checkpoint = sqlite3.connect(staged, timeout=30)
+def _read_file_restore_epoch(path: Path) -> int:
+    baseline = recorded_restore_epoch(path)
+    if not path.is_file():
+        return baseline
+    con = None
     try:
-        result = checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        if result and result[0] != 0:
-            raise BackupError("The staged backup could not be prepared for restore.")
+        con = sqlite3.connect(
+            path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30
+        )
+        return max(baseline, read_restore_epoch(con))
+    except (OSError, sqlite3.Error):
+        return baseline
     finally:
-        checkpoint.close()
-    _remove_sidecars(staged)
+        if con is not None:
+            con.close()
+
+
+def _stage_restored_database(
+    source: Path,
+    directory: Path,
+    *,
+    minimum_epoch: int,
+    migrate: bool = True,
+) -> tuple[Path, int]:
+    staged = _copy_to_stage(source, directory)
+    try:
+        if migrate:
+            from .database import initialize
+            from .tenancy import database_path_override
+
+            with database_path_override(staged):
+                initialize(seed_demo=False)
+        con = sqlite3.connect(staged, timeout=30)
+        try:
+            con.execute("PRAGMA foreign_keys=ON")
+            con.execute("BEGIN IMMEDIATE")
+            tables = {
+                item[0]
+                for item in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "jobs" in tables:
+                job_columns = {
+                    item[1] for item in con.execute("PRAGMA table_info(jobs)")
+                }
+                if {"started_at", "heartbeat_at", "lease_token", "attempts"} <= job_columns:
+                    con.execute(
+                        "UPDATE jobs SET status='queued', started_at=NULL, "
+                        "heartbeat_at=NULL, lease_token=NULL, "
+                        "attempts=CASE WHEN COALESCE(attempts, 0) > 0 THEN attempts - 1 ELSE 0 END "
+                        "WHERE status='running'"
+                    )
+                elif "started_at" in job_columns:
+                    con.execute(
+                        "UPDATE jobs SET status='queued', started_at=NULL "
+                        "WHERE status='running'"
+                    )
+                else:
+                    con.execute("UPDATE jobs SET status='queued' WHERE status='running'")
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS settings ("
+                "key TEXT PRIMARY KEY, value TEXT NOT NULL, "
+                "secret INTEGER NOT NULL DEFAULT 0, "
+                "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+            staged_epoch = read_restore_epoch(con)
+            next_epoch = max(minimum_epoch, staged_epoch) + 1
+            setting_columns = {
+                item[1] for item in con.execute("PRAGMA table_info(settings)")
+            }
+            if "updated_at" in setting_columns:
+                con.execute(
+                    "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,"
+                    "updated_at=CURRENT_TIMESTAMP",
+                    (RESTORE_EPOCH_KEY, str(next_epoch)),
+                )
+            else:
+                con.execute(
+                    "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0",
+                    (RESTORE_EPOCH_KEY, str(next_epoch)),
+                )
+            con.commit()
+            mode = con.execute("PRAGMA journal_mode").fetchone()
+            if mode and str(mode[0]).lower() == "wal":
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                con.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            con.close()
+        _remove_sidecars(staged)
+        os.chmod(staged, 0o600)
+        with staged.open("rb") as handle:
+            os.fsync(handle.fileno())
+        _validate_snapshot(staged)
+        return staged, next_epoch
+    except Exception:
+        staged.unlink(missing_ok=True)
+        _remove_sidecars(staged)
+        raise
 
 
 def restore_backup(backup_id: str) -> dict:
@@ -1550,17 +1660,21 @@ def restore_backup(backup_id: str) -> dict:
     safety_record = None
     staged = None
     replaced = False
+    rollback_failed = False
     had_unrecoverable_journal = False
     live_path = profile_database_path()
     lock = database_lock(live_path)
     with _profile_backup_lock(live_path):
         source = _backup_path(backup_id)
-        rollback_failed = False
         try:
             _validate_snapshot(source)
             selected_key = _restore_key_sidecar(source)
             _validate_snapshot_key(source, selected_key)
-            with lock.quiesce() as deadline, lock.exclusive(deadline):
+            with (
+                unbind_restore_epoch(),
+                lock.quiesce() as deadline,
+                lock.exclusive(deadline),
+            ):
                 try:
                     if _has_restore_journal():
                         try:
@@ -1574,19 +1688,16 @@ def restore_backup(backup_id: str) -> dict:
                     selected_key = _restore_key_sidecar(source)
                     _validate_snapshot_key(source, selected_key)
                     live_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                    staged = _copy_to_stage(source, live_path.parent)
-
-                    # Apply this release's migrations on the staged copy first.
-                    # Holding the exclusive profile lock across staging keeps live
-                    # writes waiting until cutover completes so acknowledged writes
-                    # are never discarded by replacing the live database.
-                    from .database import initialize
-                    from .tenancy import database_path_override
-
-                    with database_path_override(staged):
-                        initialize(seed_demo=False)
-                    _finalize_staged_database(staged)
-                    _validate_snapshot(staged)
+                    # Apply this release's migrations, requeue any orphaned running
+                    # jobs while keeping queued work intact, and advance
+                    # restore_epoch on the staged copy first. If staging fails,
+                    # neither the live database nor key is touched.
+                    staged, next_epoch = _stage_restored_database(
+                        source,
+                        live_path.parent,
+                        minimum_epoch=_read_file_restore_epoch(live_path),
+                        migrate=True,
+                    )
 
                     if had_unrecoverable_journal:
                         safety_backup = source
@@ -1609,6 +1720,7 @@ def restore_backup(backup_id: str) -> dict:
                         replaced = True
                         _replace_live_database(staged, selected_key)
                     staged = None
+                    record_restore_epoch(next_epoch, live_path)
                     with allow_restore_database_access():
                         with transaction() as con:
                             con.execute(
@@ -1631,11 +1743,14 @@ def restore_backup(backup_id: str) -> dict:
                                         )
                                     except BackupError:
                                         had_key_file = False
-                                rollback = _copy_to_stage(
-                                    safety_backup, live_path.parent
-                                )
                                 safety_key, clear_key = _rollback_key_for_snapshot(
                                     safety_backup, journal, had_key_file
+                                )
+                                rollback, rollback_epoch = _stage_restored_database(
+                                    safety_backup,
+                                    live_path.parent,
+                                    minimum_epoch=_read_file_restore_epoch(live_path),
+                                    migrate=True,
                                 )
                                 if clear_key:
                                     _replace_live_database(
@@ -1651,6 +1766,7 @@ def restore_backup(backup_id: str) -> dict:
                                         rollback=True,
                                     )
                                 rollback = None
+                                record_restore_epoch(rollback_epoch, live_path)
                                 _clear_restore_journal()
                             except Exception:
                                 rollback_failed = True
@@ -1698,33 +1814,31 @@ def _run_scheduled_auth_backup() -> dict | None:
     return None
 
 
-def _run_scheduled_profile_maintenance(profile_id: str) -> dict | None:
-    from .tenancy import profile_scope
-
-    with profile_scope(profile_id):
-        live_path = profile_database_path()
-        lock = database_lock(live_path)
-        with lock.scheduler_guard() as can_schedule:
-            if not can_schedule or _has_restore_journal() or lock.is_locked():
-                return None
-            if not maintenance_is_due():
-                return None
-            return run_scheduled_maintenance()
-
-
 def _run_scheduled_profile_backup(profile_id: str) -> dict | None:
     from .tenancy import profile_scope
 
     with profile_scope(profile_id):
         live_path = profile_database_path()
-        if _has_restore_journal() or database_lock(live_path).is_locked():
+        lock = database_lock(live_path)
+        if _has_restore_journal() or lock.is_locked():
             return None
+        with lock.scheduler_guard() as can_schedule:
+            if not can_schedule or _has_restore_journal() or lock.is_locked():
+                return None
+            try:
+                if maintenance_is_due():
+                    run_scheduled_maintenance()
+            except Exception:
+                LOGGER.exception(
+                    "Scheduled Bookward storage maintenance failed for profile %s",
+                    profile_id,
+                )
         with _profile_backup_lock(live_path).try_acquire() as acquired:
             if not acquired:
                 return None
             if (
                 _has_restore_journal()
-                or database_lock(live_path).is_locked()
+                or lock.is_locked()
                 or not backup_is_due()
             ):
                 return None
@@ -1751,15 +1865,6 @@ async def backup_scheduler_loop(stop: asyncio.Event) -> None:
             LOGGER.exception("Could not enumerate profiles for scheduled backups")
             active_profiles = []
         for profile_id in active_profiles:
-            if stop.is_set():
-                break
-            try:
-                await asyncio.to_thread(_run_scheduled_profile_maintenance, profile_id)
-            except Exception:
-                LOGGER.exception(
-                    "Scheduled Bookward storage maintenance failed for profile %s",
-                    profile_id,
-                )
             if stop.is_set():
                 break
             try:
