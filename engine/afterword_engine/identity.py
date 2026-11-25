@@ -443,6 +443,14 @@ def _work_match_keys(item) -> set[tuple[str, str, str]]:
     source_url = str(_row_value(item, "source_url") or "").strip()
     if not raw and _OPEN_LIBRARY_WORK.search(source_url):
         raw = source_url
+    quality_provider = (
+        str(_row_value(item, "quality_provider") or "")
+        .strip()
+        .casefold()
+        .replace(" ", "_")
+    )
+    if not raw and quality_provider == "apple_books":
+        raw = str(_row_value(item, "quality_provider_id") or "").strip()
     if not raw:
         return set()
 

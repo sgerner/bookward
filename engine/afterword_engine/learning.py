@@ -561,6 +561,7 @@ def attribute_read_outcomes() -> dict[str, int]:
                 "SELECT c.id,c.title,c.author,c.source_url,c.isbn13,c.isbn10,"
                 "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.work_id ELSE '' END AS quality_work_id,"
                 "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.provider ELSE '' END AS quality_provider,"
+                "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.provider_id ELSE '' END AS quality_provider_id,"
                 "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.isbn13 ELSE '' END AS quality_isbn13,"
                 "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.isbn10 ELSE '' END AS quality_isbn10 "
                 "FROM candidates c "

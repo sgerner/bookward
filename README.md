@@ -312,6 +312,8 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 | `BACKUP_INTERVAL_HOURS` | Scheduled SQLite snapshot cadence; set `0` to disable. Defaults to 24 hours. |
 | `BACKUP_RETENTION_COUNT` | Number of newest automatic and manual snapshots to retain. Defaults to 7. |
 | `BACKUP_DIR` | Optional backup path inside the engine container; mount it persistently when set. Defaults to `/backups`, on its own `afterword-backups` Docker volume. |
+| `RETENTION_ENABLED` | Default for scheduled background pruning of aged unattributed telemetry, dismissed/stale embeddings, and terminal operational rows (`AFTERWORD_RETENTION_ENABLED` for local engine runs); defaults conservatively to `false` and can be toggled per profile in Settings. |
+| `EVIDENCE_ROTATION_ENABLED` | Default for rotating unreferenced scoring batches and oldest unattributed replay snapshots when the 512 MiB evidence budget crosses 80% (`AFTERWORD_EVIDENCE_ROTATION_ENABLED` for local engine runs); defaults conservatively to `false` and can be toggled per profile in Settings. |
 | `LIBRARR_ALLOWED_HOSTS` | Comma-separated private hostnames allowed to receive the Librarr API key. |
 
 The engine also persists source cadence and application settings in SQLite, so changes made in the UI survive restarts.
