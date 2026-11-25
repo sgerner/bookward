@@ -4046,12 +4046,12 @@ def test_goodreads_rss_and_manual_read_replace_demo_source_preserve_already_pres
     }
 
 
-def test_migration_28_purges_stale_demo_reads_derived_rows_and_is_idempotent(
+def test_migration_29_purges_stale_demo_reads_derived_rows_and_is_idempotent(
     tmp_path, monkeypatch
 ):
     from afterword_engine.database import initialize as init_db
 
-    monkeypatch.setattr(settings, "db", str(tmp_path / "upgrade-migration-28.db"))
+    monkeypatch.setattr(settings, "db", str(tmp_path / "upgrade-migration-29.db"))
     init_db(seed_demo=True)
     piranesi_candidate_id, _run_id = _seed_demo_derived_artifacts_for_test()
 
@@ -4093,7 +4093,7 @@ def test_migration_28_purges_stale_demo_reads_derived_rows_and_is_idempotent(
 
     with transaction() as con:
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=28")
+        con.execute("DELETE FROM schema_migrations WHERE version=29")
 
     init_db(seed_demo=True)
 
@@ -4115,7 +4115,7 @@ def test_migration_28_purges_stale_demo_reads_derived_rows_and_is_idempotent(
     )
     assert "You rated a book by this author highly" not in post_upgrade_reasons
 
-    # Re-running initialize() and re-applying migration 28 must be idempotent and
+    # Re-running initialize() and re-applying migration 29 must be idempotent and
     # preserve post-upgrade real scoring batches without queuing duplicate jobs.
     with transaction() as con:
         con.execute("DELETE FROM jobs")
@@ -4124,20 +4124,20 @@ def test_migration_28_purges_stale_demo_reads_derived_rows_and_is_idempotent(
     assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 1
 
     with transaction() as con:
-        con.execute("DELETE FROM schema_migrations WHERE version=28")
+        con.execute("DELETE FROM schema_migrations WHERE version=29")
     init_db(seed_demo=True)
     assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
     assert row("SELECT COUNT(*) count FROM reads WHERE title='Dune'")["count"] == 1
     assert row("SELECT COUNT(*) count FROM scoring_batches")["count"] == 1
 
 
-def test_migration_28_purges_demo_reads_when_builtin_disabled_with_zero_real_reads(
+def test_migration_29_purges_demo_reads_when_builtin_disabled_with_zero_real_reads(
     tmp_path, monkeypatch
 ):
     from afterword_engine.database import initialize as init_db
 
     monkeypatch.setattr(
-        settings, "db", str(tmp_path / "upgrade-migration-28-disabled-builtin.db")
+        settings, "db", str(tmp_path / "upgrade-migration-29-disabled-builtin.db")
     )
     init_db(seed_demo=True)
     piranesi_candidate_id, _run_id = _seed_demo_derived_artifacts_for_test()
@@ -4165,7 +4165,7 @@ def test_migration_28_purges_demo_reads_when_builtin_disabled_with_zero_real_rea
         )
         con.execute("UPDATE sources SET enabled=0 WHERE url='builtin://upcoming'")
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=28")
+        con.execute("DELETE FROM schema_migrations WHERE version=29")
 
     init_db(seed_demo=True)
 
@@ -4188,20 +4188,20 @@ def test_migration_28_purges_demo_reads_when_builtin_disabled_with_zero_real_rea
     }
     assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score' AND status='queued'")["count"] == 1
 
-    # Re-running migration 28 when already clean is a no-op.
+    # Re-running migration 29 when already clean is a no-op.
     with transaction() as con:
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=28")
+        con.execute("DELETE FROM schema_migrations WHERE version=29")
     init_db(seed_demo=True)
     assert row("SELECT COUNT(*) count FROM jobs WHERE kind='score'")["count"] == 0
     assert row("SELECT COUNT(*) count FROM reads")["count"] == 0
 
 
-def test_migration_28_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monkeypatch):
+def test_migration_29_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monkeypatch):
     from afterword_engine.database import initialize as init_db
 
     monkeypatch.setattr(
-        settings, "db", str(tmp_path / "upgrade-migration-28-keep-demo.db")
+        settings, "db", str(tmp_path / "upgrade-migration-29-keep-demo.db")
     )
     init_db(seed_demo=True)
     assert asyncio.run(score_all("local", "hashing-768")) == 4
@@ -4210,7 +4210,7 @@ def test_migration_28_keeps_demo_only_reads_when_builtin_enabled(tmp_path, monke
 
     with transaction() as con:
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=28")
+        con.execute("DELETE FROM schema_migrations WHERE version=29")
 
     init_db(seed_demo=True)
 
@@ -4326,7 +4326,7 @@ def _seed_shared_run_with_demo_and_real_data():
     }
 
 
-def test_runtime_purge_and_migration_28_preserve_real_outcomes_and_feedback_on_shared_run(
+def test_runtime_purge_and_migration_29_preserve_real_outcomes_and_feedback_on_shared_run(
     tmp_path, monkeypatch
 ):
     from afterword_engine.database import initialize as init_db
@@ -4421,8 +4421,8 @@ def test_runtime_purge_and_migration_28_preserve_real_outcomes_and_feedback_on_s
         )
     } == {feedback_event_key, manual_event_key, real_event_key}
 
-    # 2. Migration 28 on a shared run with demo outcome + real outcome + real feedback.
-    monkeypatch.setattr(settings, "db", str(tmp_path / "shared-run-migration-28.db"))
+    # 2. Migration 29 on a shared run with demo outcome + real outcome + real feedback.
+    monkeypatch.setattr(settings, "db", str(tmp_path / "shared-run-migration-29.db"))
     init_db(seed_demo=True)
     mctx = _seed_shared_run_with_demo_and_real_data()
     mrun_id = mctx["shared_run_id"]
@@ -4439,7 +4439,7 @@ def test_runtime_purge_and_migration_28_preserve_real_outcomes_and_feedback_on_s
 
     with transaction() as con:
         con.execute("DELETE FROM jobs")
-        con.execute("DELETE FROM schema_migrations WHERE version=28")
+        con.execute("DELETE FROM schema_migrations WHERE version=29")
 
     init_db(seed_demo=True)
 

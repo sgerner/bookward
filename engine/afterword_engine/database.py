@@ -1007,15 +1007,41 @@ MIGRATIONS = [
     (
         28,
         """
-        DROP TABLE IF EXISTS temp._m28_demo_reads;
-        CREATE TEMP TABLE _m28_demo_reads (
+        CREATE INDEX IF NOT EXISTS idx_recommendation_impressions_visible
+            ON recommendation_impressions(candidate_id, visible_at)
+            WHERE visible_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_recommendation_runs_created_at
+            ON recommendation_runs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_recommendation_run_evidence_captured_at
+            ON recommendation_run_evidence(captured_at);
+        CREATE INDEX IF NOT EXISTS idx_scoring_batches_captured_at
+            ON scoring_batches(captured_at);
+        CREATE TRIGGER IF NOT EXISTS embeddings_clear_after_candidate_delete
+        AFTER DELETE ON candidates
+        BEGIN
+            DELETE FROM embeddings
+                WHERE entity_type='candidate' AND entity_id=OLD.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS embeddings_clear_after_read_delete
+        AFTER DELETE ON reads
+        BEGIN
+            DELETE FROM embeddings
+                WHERE entity_type='read' AND entity_id=OLD.id;
+        END;
+        """,
+    ),
+    (
+        29,
+        """
+        DROP TABLE IF EXISTS temp._m29_demo_reads;
+        CREATE TEMP TABLE _m29_demo_reads (
             id INTEGER PRIMARY KEY,
             title TEXT NOT NULL,
             author TEXT NOT NULL,
             isbn TEXT NOT NULL,
             openlibrary_work_id TEXT NOT NULL
         );
-        INSERT INTO temp._m28_demo_reads(id, title, author, isbn, openlibrary_work_id)
+        INSERT INTO temp._m29_demo_reads(id, title, author, isbn, openlibrary_work_id)
         SELECT id, title, author, COALESCE(isbn, ''), COALESCE(openlibrary_work_id, '')
         FROM reads
         WHERE source = 'demo'
@@ -1027,21 +1053,21 @@ MIGRATIONS = [
               )
           );
 
-        DROP TABLE IF EXISTS temp._m28_demo_events;
-        CREATE TEMP TABLE _m28_demo_events (
+        DROP TABLE IF EXISTS temp._m29_demo_events;
+        CREATE TEMP TABLE _m29_demo_events (
             event_id INTEGER,
             event_key TEXT NOT NULL,
             run_id TEXT,
             candidate_id INTEGER
         );
-        INSERT INTO temp._m28_demo_events(event_id, event_key, run_id, candidate_id)
+        INSERT INTO temp._m29_demo_events(event_id, event_key, run_id, candidate_id)
         SELECT NULL, printf('read:%08d', id), NULL, NULL
-        FROM temp._m28_demo_reads;
-        INSERT INTO temp._m28_demo_events(event_id, event_key, run_id, candidate_id)
+        FROM temp._m29_demo_reads;
+        INSERT INTO temp._m29_demo_events(event_id, event_key, run_id, candidate_id)
         SELECT e.id, e.event_key, e.run_id, e.candidate_id
         FROM recommendation_events e
         WHERE EXISTS (
-            SELECT 1 FROM temp._m28_demo_reads r
+            SELECT 1 FROM temp._m29_demo_reads r
             WHERE e.event_key = printf('read:%08d', r.id)
                OR e.event_key GLOB printf('manual-read:[0-9]*:%08d', r.id)
                OR e.event_key GLOB printf('attribution:read:%08d:*', r.id)
@@ -1058,56 +1084,56 @@ MIGRATIONS = [
                 )
             )
         );
-        INSERT INTO temp._m28_demo_events(event_id, event_key, run_id, candidate_id)
+        INSERT INTO temp._m29_demo_events(event_id, event_key, run_id, candidate_id)
         SELECT NULL, ee.event_key, ee.run_id, ee.candidate_id
         FROM recommendation_evidence_events ee
         WHERE EXISTS (
-            SELECT 1 FROM temp._m28_demo_reads r
+            SELECT 1 FROM temp._m29_demo_reads r
             WHERE ee.event_key = printf('read:%08d', r.id)
                OR ee.event_key GLOB printf('manual-read:[0-9]*:%08d', r.id)
                OR ee.event_key GLOB printf('attribution:read:%08d:*', r.id)
         )
-           OR ee.event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
-        INSERT INTO temp._m28_demo_events(event_id, event_key, run_id, candidate_id)
+           OR ee.event_key IN (SELECT DISTINCT event_key FROM temp._m29_demo_events);
+        INSERT INTO temp._m29_demo_events(event_id, event_key, run_id, candidate_id)
         SELECT NULL, eo.event_key, eo.run_id, eo.candidate_id
         FROM recommendation_evidence_outcomes eo
         WHERE EXISTS (
-            SELECT 1 FROM temp._m28_demo_reads r
+            SELECT 1 FROM temp._m29_demo_reads r
             WHERE eo.event_key = printf('read:%08d', r.id)
                OR eo.event_key GLOB printf('manual-read:[0-9]*:%08d', r.id)
                OR eo.event_key GLOB printf('attribution:read:%08d:*', r.id)
         )
-           OR eo.event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
+           OR eo.event_key IN (SELECT DISTINCT event_key FROM temp._m29_demo_events);
 
-        DROP TABLE IF EXISTS temp._m28_demo_batches;
-        CREATE TEMP TABLE _m28_demo_batches (batch_id TEXT PRIMARY KEY);
-        INSERT OR IGNORE INTO temp._m28_demo_batches(batch_id)
+        DROP TABLE IF EXISTS temp._m29_demo_batches;
+        CREATE TEMP TABLE _m29_demo_batches (batch_id TEXT PRIMARY KEY);
+        INSERT OR IGNORE INTO temp._m29_demo_batches(batch_id)
         SELECT DISTINCT batch_id
         FROM scoring_batch_reads
-        WHERE read_id IN (SELECT id FROM temp._m28_demo_reads);
+        WHERE read_id IN (SELECT id FROM temp._m29_demo_reads);
 
-        DROP TABLE IF EXISTS temp._m28_demo_runs;
-        CREATE TEMP TABLE _m28_demo_runs (run_id TEXT PRIMARY KEY);
-        INSERT OR IGNORE INTO temp._m28_demo_runs(run_id)
+        DROP TABLE IF EXISTS temp._m29_demo_runs;
+        CREATE TEMP TABLE _m29_demo_runs (run_id TEXT PRIMARY KEY);
+        INSERT OR IGNORE INTO temp._m29_demo_runs(run_id)
         SELECT i.run_id
         FROM recommendation_outcomes o
         JOIN recommendation_impressions i ON i.id = o.impression_id
-        WHERE o.read_id IN (SELECT id FROM temp._m28_demo_reads)
+        WHERE o.read_id IN (SELECT id FROM temp._m29_demo_reads)
           AND i.run_id IS NOT NULL AND i.run_id != '';
-        INSERT OR IGNORE INTO temp._m28_demo_runs(run_id)
-        SELECT run_id FROM temp._m28_demo_events
+        INSERT OR IGNORE INTO temp._m29_demo_runs(run_id)
+        SELECT run_id FROM temp._m29_demo_events
         WHERE run_id IS NOT NULL AND run_id != '';
-        INSERT OR IGNORE INTO temp._m28_demo_runs(run_id)
+        INSERT OR IGNORE INTO temp._m29_demo_runs(run_id)
         SELECT run_id FROM recommendation_run_evidence_scoring_batches
-        WHERE score_batch_id IN (SELECT batch_id FROM temp._m28_demo_batches)
+        WHERE score_batch_id IN (SELECT batch_id FROM temp._m29_demo_batches)
           AND run_id IS NOT NULL AND run_id != '';
 
         INSERT INTO jobs(id, kind, status)
-        SELECT 'migration-28-score-' || lower(hex(randomblob(8))), 'score', 'queued'
+        SELECT 'migration-29-score-' || lower(hex(randomblob(8))), 'score', 'queued'
         WHERE (
-            EXISTS (SELECT 1 FROM temp._m28_demo_reads)
-            OR EXISTS (SELECT 1 FROM temp._m28_demo_events WHERE event_id IS NOT NULL)
-            OR EXISTS (SELECT 1 FROM temp._m28_demo_batches)
+            EXISTS (SELECT 1 FROM temp._m29_demo_reads)
+            OR EXISTS (SELECT 1 FROM temp._m29_demo_events WHERE event_id IS NOT NULL)
+            OR EXISTS (SELECT 1 FROM temp._m29_demo_batches)
         )
           AND NOT EXISTS (
               SELECT 1 FROM jobs
@@ -1150,11 +1176,11 @@ MIGRATIONS = [
         WHERE status = 'read'
           AND (
               id IN (
-                  SELECT candidate_id FROM temp._m28_demo_events
+                  SELECT candidate_id FROM temp._m29_demo_events
                   WHERE candidate_id IS NOT NULL
               )
               OR EXISTS (
-                  SELECT 1 FROM temp._m28_demo_reads r
+                  SELECT 1 FROM temp._m29_demo_reads r
                   WHERE (
                       lower(trim(r.title)) = lower(trim(candidates.title))
                       AND replace(replace(lower(trim(r.author)), '.', ''), ' ', '')
@@ -1216,49 +1242,49 @@ MIGRATIONS = [
 
         UPDATE candidates
         SET score_batch_id = NULL
-        WHERE score_batch_id IN (SELECT batch_id FROM temp._m28_demo_batches);
+        WHERE score_batch_id IN (SELECT batch_id FROM temp._m29_demo_batches);
 
         DELETE FROM recommendation_run_evidence_scoring_batches
-        WHERE score_batch_id IN (SELECT batch_id FROM temp._m28_demo_batches)
-           OR run_id IN (SELECT run_id FROM temp._m28_demo_runs);
+        WHERE score_batch_id IN (SELECT batch_id FROM temp._m29_demo_batches)
+           OR run_id IN (SELECT run_id FROM temp._m29_demo_runs);
         DELETE FROM scoring_batch_vectors
-        WHERE batch_id IN (SELECT batch_id FROM temp._m28_demo_batches);
+        WHERE batch_id IN (SELECT batch_id FROM temp._m29_demo_batches);
         DELETE FROM scoring_batch_candidates
-        WHERE batch_id IN (SELECT batch_id FROM temp._m28_demo_batches);
+        WHERE batch_id IN (SELECT batch_id FROM temp._m29_demo_batches);
         DELETE FROM scoring_batch_reads
-        WHERE batch_id IN (SELECT batch_id FROM temp._m28_demo_batches);
+        WHERE batch_id IN (SELECT batch_id FROM temp._m29_demo_batches);
         DELETE FROM scoring_batches
-        WHERE id IN (SELECT batch_id FROM temp._m28_demo_batches);
+        WHERE id IN (SELECT batch_id FROM temp._m29_demo_batches);
 
         DELETE FROM recommendation_outcomes
-        WHERE read_id IN (SELECT id FROM temp._m28_demo_reads)
+        WHERE read_id IN (SELECT id FROM temp._m29_demo_reads)
            OR event_id IN (
-               SELECT event_id FROM temp._m28_demo_events WHERE event_id IS NOT NULL
+               SELECT event_id FROM temp._m29_demo_events WHERE event_id IS NOT NULL
            )
            OR event_id IN (
                SELECT id FROM recommendation_events
-               WHERE event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events)
+               WHERE event_key IN (SELECT DISTINCT event_key FROM temp._m29_demo_events)
            );
         DELETE FROM recommendation_events
         WHERE id IN (
-               SELECT event_id FROM temp._m28_demo_events WHERE event_id IS NOT NULL
+               SELECT event_id FROM temp._m29_demo_events WHERE event_id IS NOT NULL
            )
-           OR event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
+           OR event_key IN (SELECT DISTINCT event_key FROM temp._m29_demo_events);
         DELETE FROM recommendation_evidence_outcomes
-        WHERE event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
+        WHERE event_key IN (SELECT DISTINCT event_key FROM temp._m29_demo_events);
         DELETE FROM recommendation_evidence_events
-        WHERE event_key IN (SELECT DISTINCT event_key FROM temp._m28_demo_events);
+        WHERE event_key IN (SELECT DISTINCT event_key FROM temp._m29_demo_events);
         DELETE FROM recommendation_run_evidence_vectors
-        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
+        WHERE run_id IN (SELECT run_id FROM temp._m29_demo_runs);
         DELETE FROM recommendation_run_evidence_candidates
-        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
+        WHERE run_id IN (SELECT run_id FROM temp._m29_demo_runs);
         DELETE FROM recommendation_run_evidence
-        WHERE run_id IN (SELECT run_id FROM temp._m28_demo_runs);
+        WHERE run_id IN (SELECT run_id FROM temp._m29_demo_runs);
 
         DELETE FROM recommendation_evidence_vectors
         WHERE (
-            EXISTS (SELECT 1 FROM temp._m28_demo_batches)
-            OR EXISTS (SELECT 1 FROM temp._m28_demo_runs)
+            EXISTS (SELECT 1 FROM temp._m29_demo_batches)
+            OR EXISTS (SELECT 1 FROM temp._m29_demo_runs)
         )
           AND NOT EXISTS (
               SELECT 1 FROM recommendation_run_evidence_vectors r
@@ -1271,21 +1297,21 @@ MIGRATIONS = [
 
         DELETE FROM embeddings
         WHERE entity_type = 'read'
-          AND entity_id IN (SELECT id FROM temp._m28_demo_reads);
+          AND entity_id IN (SELECT id FROM temp._m29_demo_reads);
         DELETE FROM association_evidence
-        WHERE seed_read_id IN (SELECT id FROM temp._m28_demo_reads);
+        WHERE seed_read_id IN (SELECT id FROM temp._m29_demo_reads);
         DELETE FROM read_metadata
-        WHERE read_id IN (SELECT id FROM temp._m28_demo_reads);
+        WHERE read_id IN (SELECT id FROM temp._m29_demo_reads);
         DELETE FROM metadata_field_provenance
         WHERE entity_type = 'read'
-          AND entity_id IN (SELECT id FROM temp._m28_demo_reads);
+          AND entity_id IN (SELECT id FROM temp._m29_demo_reads);
         DELETE FROM reads
-        WHERE id IN (SELECT id FROM temp._m28_demo_reads);
+        WHERE id IN (SELECT id FROM temp._m29_demo_reads);
 
-        DROP TABLE temp._m28_demo_runs;
-        DROP TABLE temp._m28_demo_batches;
-        DROP TABLE temp._m28_demo_events;
-        DROP TABLE temp._m28_demo_reads;
+        DROP TABLE temp._m29_demo_runs;
+        DROP TABLE temp._m29_demo_batches;
+        DROP TABLE temp._m29_demo_events;
+        DROP TABLE temp._m29_demo_reads;
         """,
     ),
 ]
@@ -1490,6 +1516,9 @@ def connect():
         con.create_function("book_identity", 2, book_identity, deterministic=True)
         con.create_function("book_identity_matches", 4, book_identity_matches, deterministic=True)
         with _database_setup_lock(db_path):
+            page_count = int(con.execute("PRAGMA page_count").fetchone()[0] or 0)
+            if page_count == 0:
+                con.execute("PRAGMA auto_vacuum=INCREMENTAL")
             mode = con.execute("PRAGMA journal_mode").fetchone()[0]
             if str(mode).lower() != "wal":
                 con.execute("PRAGMA journal_mode=WAL")
@@ -1729,6 +1758,7 @@ def purge_demo_reads(con: sqlite3.Connection) -> int:
         dict(item)
         for item in con.execute(
             "SELECT c.*, q.work_id quality_work_id, q.provider quality_provider, "
+            "q.provider_id AS quality_provider_id, "
             "q.isbn13 quality_isbn13, q.isbn10 quality_isbn10, "
             "COALESCE(q.quality_status, 'pending') AS quality_status, "
             "COALESCE(s.enabled, 0) AS source_enabled "
