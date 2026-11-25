@@ -39,7 +39,7 @@ from .maintenance import (
     MAINTENANCE_LAST_RUN_KEY,
     run_storage_maintenance,
 )
-from .secrets import installation_key, installation_key_path
+from .secrets import clear_auth_registry_key_cache, installation_key, installation_key_path
 from .security import safe_error_message
 from .tenancy import (
     allow_restore_database_access,
@@ -623,6 +623,8 @@ def _validate_auth_snapshot(path: Path) -> None:
 
 
 def _replace_auth_registry(staged: Path, live: Path, on_replace=None) -> None:
+    from .profiles import invalidate_auth_caches
+
     if live.is_file():
         checkpoint = sqlite3.connect(live, timeout=30)
         try:
@@ -633,6 +635,8 @@ def _replace_auth_registry(staged: Path, live: Path, on_replace=None) -> None:
             checkpoint.close()
     _remove_sidecars(live)
     os.replace(staged, live)
+    invalidate_auth_caches(clear_all=True)
+    clear_auth_registry_key_cache()
     if on_replace is not None:
         on_replace()
     os.chmod(live, 0o600)
@@ -1438,6 +1442,8 @@ def _replace_live_database(
                 LOGGER.exception("Failed to restore previous installation key")
         raise
     finally:
+        if key_mutated:
+            clear_auth_registry_key_cache()
         if staged_key is not None:
             staged_key.unlink(missing_ok=True)
 
