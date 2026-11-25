@@ -19,10 +19,11 @@ from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPExcepti
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, ValidationError, field_validator
 from .config import settings
 from .database import (
     DEFAULT_DIGEST_APP_URLS,
+    DEFAULT_SOURCE_URLS,
     RestoreEpochError,
     bind_request_restore_epoch,
     connect,
@@ -50,7 +51,7 @@ from .backups import (
     recover_interrupted_restore,
     restore_backup,
 )
-from .decision_evidence import set_evidence_rotation_enabled
+from .decision_evidence import EVIDENCE_SCHEMA_VERSION, set_evidence_rotation_enabled
 from .maintenance import set_storage_retention_enabled
 from .embeddings import get_embedder
 from .covers import canonical_book_source_url, fallback_cover_url, validate_google_books_api_key
@@ -70,6 +71,14 @@ from .ingestion import (
     refresh_read_work_identities,
     refresh_missing_candidate_metadata,
     scan_source,
+)
+from .http_bounds import (
+    JSON_CONTENT_TYPES,
+    ResponseBoundsError,
+    ResponseTooLargeError,
+    iter_bounded_bytes_async,
+    stream_bytes_async,
+    stream_json_async,
 )
 from .security import safe_error_message, validate_public_url, validate_service_url
 from .jobs import enqueue_job, worker_loop
@@ -152,7 +161,7 @@ from .identity import (
 )
 from .isbn import isbn_parts
 from . import profiles as identity_store
-from .tenancy import current_profile_id, profile_scope
+from .tenancy import current_profile_id, profile_database_path, profile_scope
 import jwt
 
 SOURCE_SYNC_MIN_HOURS = 0
@@ -308,6 +317,22 @@ def active_job(kind: str):
         "SELECT 1 FROM jobs WHERE kind=? AND status IN ('queued','running') LIMIT 1",
         (kind,),
     )
+
+
+_SOURCE_SCAN_GENERATIONS: dict[tuple[str, int], int] = {}
+
+
+def _source_scan_generation_key(source_id: int) -> tuple[str, int]:
+    return (str(profile_database_path()), int(source_id))
+
+
+def _source_scan_generation(source_id: int) -> int:
+    return _SOURCE_SCAN_GENERATIONS.get(_source_scan_generation_key(source_id), 0)
+
+
+def _bump_source_scan_generation(source_id: int) -> None:
+    key = _source_scan_generation_key(source_id)
+    _SOURCE_SCAN_GENERATIONS[key] = _SOURCE_SCAN_GENERATIONS.get(key, 0) + 1
 
 
 def enqueue_followup_job(kind: str):
@@ -675,18 +700,103 @@ async def handle_job(kind: str):
             return {"skipped": "disabled", "source_id": source_id}
         if source["lifecycle"] == "one_time" and _one_time_source_completed(source):
             return {"skipped": "already_scanned", "source_id": source_id}
+        started_url = source["url"]
+        started_lifecycle = source["lifecycle"]
+        started_filters = normalize_source_filters(source.get("filters"))
+        started_last_scanned_at = source["last_scanned_at"]
+        started_last_attempted_at = source.get("last_attempted_at")
+        started_generation = _source_scan_generation(source_id)
+        queued_before = {
+            item["id"]
+            for item in rows(
+                "SELECT id FROM jobs WHERE kind=? AND status='queued'",
+                (kind,),
+            )
+        }
+
+        def _concurrent_source_state():
+            current = row("SELECT * FROM sources WHERE id=?", (source_id,))
+            if not current:
+                return None, False, False
+            queued_after = {
+                item["id"]
+                for item in rows(
+                    "SELECT id FROM jobs WHERE kind=? AND status='queued'",
+                    (kind,),
+                )
+            }
+            url_changed = current["url"] != started_url
+            lifecycle_changed = current["lifecycle"] != started_lifecycle
+            filters_changed = (
+                normalize_source_filters(current.get("filters")) != started_filters
+            )
+            reset_during_run = (
+                (
+                    started_last_scanned_at is not None
+                    and current["last_scanned_at"] is None
+                )
+                or (
+                    started_last_attempted_at is not None
+                    and current.get("last_attempted_at") is None
+                )
+                or bool(queued_after - queued_before)
+                or _source_scan_generation(source_id) != started_generation
+            )
+            return (
+                current,
+                url_changed,
+                url_changed
+                or lifecycle_changed
+                or filters_changed
+                or reset_during_run,
+            )
+
         try:
             collected = await scan_source(source)
         except RestoreEpochError:
             raise
         except Exception as exc:
             message = safe_error_message(exc)
+            current, url_changed, needs_rescan = _concurrent_source_state()
             with transaction() as con:
-                con.execute(
-                    "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (f"error:{message}", source_id),
-                )
+                if not url_changed:
+                    con.execute(
+                        "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (f"error:{message}", source_id),
+                    )
+                    if needs_rescan and current and current["lifecycle"] == "one_time":
+                        con.execute(
+                            "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL WHERE id=?",
+                            (source_id,),
+                        )
+                else:
+                    con.execute(
+                        "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL, last_status=NULL WHERE id=?",
+                        (source_id,),
+                    )
+            if (
+                needs_rescan
+                and current
+                and current["enabled"]
+                and current["kind"] not in {"builtin", "association"}
+            ):
+                enqueue_followup_job(kind)
             raise
+        current, url_changed, needs_rescan = _concurrent_source_state()
+        if needs_rescan and current:
+            with transaction() as con:
+                if url_changed:
+                    con.execute(
+                        "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL, last_status=NULL WHERE id=?",
+                        (source_id,),
+                    )
+                elif current["lifecycle"] == "one_time":
+                    con.execute(
+                        "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL WHERE id=?",
+                        (source_id,),
+                    )
+            if current["enabled"] and current["kind"] not in {"builtin", "association"}:
+                enqueue_followup_job(kind)
         metadata = await refresh_missing_candidate_metadata()
         if candidate_metadata_refresh_remaining():
             enqueue_job("metadata", dedupe=True)
@@ -1434,9 +1544,28 @@ class SourceIn(BaseModel):
 
 
 class SourceUpdateIn(BaseModel):
-    url: HttpUrl | None = None
+    name: str | None = None
+    url: str | None = None
     filters: SourceFilters | None = None
     lifecycle: Literal["permanent", "one_time"] | None = None
+
+
+_HTTP_URL_ADAPTER = TypeAdapter(HttpUrl)
+
+
+def _is_custom_source(source: dict[str, Any] | sqlite3.Row) -> bool:
+    return bool(
+        source["kind"] == "web"
+        and not source["is_default"]
+        and source["url"] not in DEFAULT_SOURCE_URLS
+    )
+
+
+def _serialize_source(source: dict[str, Any] | sqlite3.Row) -> dict[str, Any]:
+    item = dict(source)
+    item["filters"] = normalize_source_filters(item.get("filters"))
+    item["is_custom"] = _is_custom_source(item)
+    return item
 
 
 class SourceScheduleIn(BaseModel):
@@ -1784,9 +1913,17 @@ def _prepare_tracked_recommendations(
     recommendations = None
     interaction_events: list[dict[str, Any]] = []
     cached_vectors: dict[int, Any] = {}
+    visible_day_counts: dict[int, int] = {}
+    fatigue_settings = {
+        "enabled": bool(settings.impression_fatigue_enabled),
+        "window_days": int(settings.impression_fatigue_window_days),
+        "grace_days": int(settings.impression_fatigue_grace_days),
+        "penalty_per_day": float(settings.impression_fatigue_penalty_per_day),
+        "max_penalty": float(settings.impression_fatigue_max_penalty),
+    }
     read_rows: list[dict[str, Any]] = []
     llm_events: list[dict[str, Any]] = []
-    llm_cfg = {"enabled": False, "provider": "", "api_url": "", "api_key": "", "model": ""}
+    llm_cfg: dict[str, Any] = {}
     llm_active = False
     discovery_metadata = empty_discovery_slate_diagnostics("not_discovery_request")
     learning_metadata: dict[str, Any] = {
@@ -1861,8 +1998,12 @@ def _prepare_tracked_recommendations(
             has_recommended = any(item.get("status") == "recommended" for item in ranked)
             if not is_filtered and has_recommended:
                 try:
-                    llm_cfg = effective_llm_rerank_settings(connection, private)
-                    llm_active = bool(llm_cfg["enabled"] and llm_cfg["api_key"].strip())
+                    llm_cfg = {
+                        **effective_llm_rerank_settings(connection, private),
+                        "top_k": settings.llm_rerank_top_k,
+                        "max_delta": settings.llm_rerank_max_delta,
+                    }
+                    llm_active = bool(llm_cfg["enabled"] and str(llm_cfg["api_key"]).strip())
                     if llm_active:
                         read_rows, llm_events = _load_llm_rerank_inputs(
                             connection, interaction_events
@@ -1880,6 +2021,9 @@ def _prepare_tracked_recommendations(
             fallback_triggered = True
             base_pool = personalized_pool = None
             ranked = None
+            visible_day_counts = {}
+            llm_cfg = {}
+            llm_active = False
             if pool_summary is not None:
                 fallback_recommended = _recommendation_rows(
                     connection,
@@ -1947,6 +2091,8 @@ def _prepare_tracked_recommendations(
         "recommendations": recommendations,
         "interaction_events": interaction_events,
         "cached_vectors": cached_vectors,
+        "visible_day_counts": visible_day_counts,
+        "fatigue_settings": fatigue_settings,
         "learning_metadata": learning_metadata,
         "discovery_metadata": discovery_metadata,
         "llm_active": llm_active,
@@ -1978,8 +2124,12 @@ def _complete_tracked_recommendations(
     recommendations = prepared["recommendations"]
     interaction_events = prepared["interaction_events"]
     cached_vectors = prepared["cached_vectors"]
+    visible_day_counts = prepared["visible_day_counts"]
+    fatigue_settings = prepared["fatigue_settings"]
     learning_metadata = prepared["learning_metadata"]
     discovery_metadata = prepared["discovery_metadata"]
+    llm_cfg = prepared["llm_cfg"]
+    llm_rerank_output: dict[str, Any] | None = None
     final_pool = None
 
     if can_personalize and not prepared["fallback_triggered"] and ranked is not None:
@@ -2013,7 +2163,12 @@ def _complete_tracked_recommendations(
                         )
                         recommended = unreranked_recommended
                         llm_diag = {"applied": False, "reason": "fallback"}
-                    learning_metadata["llm_rerank"] = llm_diag
+                    llm_rerank_output = llm_diag
+                    learning_metadata["llm_rerank"] = {
+                        key: value
+                        for key, value in llm_diag.items()
+                        if key not in {"adjustments", "rankings"}
+                    }
                 # Apply bounded anti-redundancy swaps after LLM score adjustments.
                 diversified, discovery_metadata = diversify_discovery_slate(
                     recommended, cached_vectors
@@ -2061,6 +2216,7 @@ def _complete_tracked_recommendations(
                 "Post-personalization slate assembly failed; serving base ranking"
             )
             base_pool = personalized_pool = final_pool = None
+            llm_rerank_output = None
             if pool_summary is not None:
                 fallback_recommended = _recommendation_rows(
                     connection,
@@ -2111,7 +2267,7 @@ def _complete_tracked_recommendations(
         )
     if is_filtered:
         decision_evidence = {
-            "schema_version": 1,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
             "capture_status": "incomplete",
             "reason": "filtered_query",
             "captured_at": ranking_at.isoformat(),
@@ -2136,10 +2292,14 @@ def _complete_tracked_recommendations(
                 "exploration_epsilon": settings.exploration_epsilon,
                 "exploration_stable_top_k": settings.exploration_stable_top_k,
             },
+            visible_day_counts=visible_day_counts,
+            impression_fatigue_settings=fatigue_settings,
+            llm_rerank_settings=llm_cfg,
+            llm_rerank_output=llm_rerank_output,
         )
     else:
         decision_evidence = {
-            "schema_version": 1,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
             "capture_status": "incomplete",
             "reason": "base_ranker_fallback" if can_personalize else "non_ranking_request",
             "captured_at": ranking_at.isoformat(),
@@ -2211,11 +2371,6 @@ def overview_payload(
     recommendation_limit: int | None = None,
     decision_limit: int = 24,
 ):
-    def source_payload(source):
-        item = dict(source)
-        item["filters"] = normalize_source_filters(item.get("filters"))
-        return item
-
     deferred_prepared = None
     recommendations = None
     run_id = None
@@ -2227,27 +2382,20 @@ def overview_payload(
         }
         identity_context = _recommendation_identity_context(connection)
         private = private_settings(connection)
-        llm_cfg = effective_llm_rerank_settings(connection, private)
-        llm_active = bool(llm_cfg["enabled"] and llm_cfg["api_key"].strip())
-        if llm_active:
-            deferred_prepared = _prepare_tracked_recommendations(
-                connection=connection,
-                limit=recommendation_limit or 100,
-                recommended_limit=recommendation_limit,
-                identity_context=identity_context,
-                include_imported=True,
-                private=private,
-                pool_summary=pool_summary,
-            )
+        prepared = _prepare_tracked_recommendations(
+            connection=connection,
+            limit=recommendation_limit or 100,
+            recommended_limit=recommendation_limit,
+            identity_context=identity_context,
+            include_imported=True,
+            private=private,
+            pool_summary=pool_summary,
+        )
+        if prepared["llm_active"]:
+            deferred_prepared = prepared
         else:
-            recommendations, run_id = tracked_recommendations(
-                connection=connection,
-                limit=recommendation_limit or 100,
-                recommended_limit=recommendation_limit,
-                identity_context=identity_context,
-                include_imported=True,
-                private=private,
-                pool_summary=pool_summary,
+            recommendations, run_id = _complete_tracked_recommendations(
+                prepared, connection=connection
             )
         all_decision_rows = _recommendation_rows(
             connection,
@@ -2262,7 +2410,7 @@ def overview_payload(
             for item in all_decision_rows[:decision_limit]
         ]
         sources_list = [
-            source_payload(item)
+            _serialize_source(item)
             for item in connection.execute(
                 "SELECT * FROM sources ORDER BY is_default DESC,name"
             ).fetchall()
@@ -3252,10 +3400,23 @@ async def import_librarr(candidate_id: int, payload: LibrarrImportIn | None = Bo
         validate_service_url(config["librarr_url"], allowed)
         async with httpx.AsyncClient(timeout=15, follow_redirects=False, trust_env=False) as client:
             media_type = normalize_media_type(config.get("librarr_media_type"))
-            response = await client.post(f"{config['librarr_url'].rstrip('/')}/api/wishlist", headers={"X-Api-Key":config["librarr_api_key"],"Idempotency-Key":key}, json={"title":candidate["title"],"author":candidate["author"],"media_type":media_type})
-            response.raise_for_status()
-            try: data = response.json()
-            except ValueError: data = {}
+            _response, body = await stream_bytes_async(
+                client,
+                "POST",
+                f"{config['librarr_url'].rstrip('/')}/api/wishlist",
+                headers={"X-Api-Key": config["librarr_api_key"], "Idempotency-Key": key},
+                json={"title": candidate["title"], "author": candidate["author"], "media_type": media_type},
+                max_bytes=settings.librarr_max_bytes,
+                allowed_content_types=JSON_CONTENT_TYPES,
+                allow_missing_content_type=True,
+                content_type_error="Librarr returned an unsupported wishlist content type",
+                size_error="Librarr wishlist response is too large",
+            )
+            try:
+                parsed_body = json.loads(body) if body.strip() else {}
+                data = parsed_body if isinstance(parsed_body, dict) else {}
+            except ValueError:
+                data = {}
         remote_id = str(data.get("id", "imported"))
         with transaction() as con:
             con.execute("INSERT INTO librarr_imports(candidate_id,idempotency_key,status,remote_id) VALUES(?,?, 'complete',?) ON CONFLICT(idempotency_key) DO UPDATE SET status='complete',remote_id=excluded.remote_id,updated_at=CURRENT_TIMESTAMP", (candidate_id, key, remote_id))
@@ -3278,10 +3439,10 @@ async def search_librarr(q: str = Query(min_length=2, max_length=200), media_typ
         media = normalize_media_type(media_type)
         config = {**private_settings(), "librarr_allowed_hosts": settings.librarr_allowed_hosts}
         return await librarr_search(config, q, media)
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
 
 
 @app.get("/api/librarr/search/stream")
@@ -3297,18 +3458,30 @@ async def stream_librarr_search(
         client, upstream = await librarr_open_search_stream(config, q, media)
     except StreamingUnsupportedError as exc:
         raise HTTPException(501, safe_error_message(exc)) from exc
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr search failed: {safe_error_message(exc)}") from exc
 
     assert client is not None and upstream is not None
 
     async def stream_bytes():
         try:
-            async for chunk in upstream.aiter_bytes():
-                if chunk:
-                    yield chunk
+            async for chunk in iter_bounded_bytes_async(
+                upstream,
+                max_bytes=settings.librarr_stream_max_bytes,
+                size_error="Librarr search stream is too large",
+            ):
+                yield chunk
+        except ResponseTooLargeError:
+            LOGGER.warning(
+                "Aborted Librarr SSE stream after exceeding %d bytes",
+                settings.librarr_stream_max_bytes,
+            )
+            error_payload = json.dumps(
+                {"message": "Librarr search stream exceeded the maximum response size."}
+            )
+            yield f"\n\nevent: error\ndata: {error_payload}\n\n".encode("utf-8")
         finally:
             await upstream.aclose()
             await client.aclose()
@@ -3368,10 +3541,10 @@ async def download_librarr(payload: LibrarrDownloadIn):
                     )
             response["candidate"] = {"id": candidate["id"], "status": status}
         return response
+    except (httpx.HTTPError, ResponseBoundsError) as exc:
+        raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
     except ValueError as exc:
         raise HTTPException(400, safe_error_message(exc)) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Librarr download failed: {safe_error_message(exc)}") from exc
 
 @fenced_async
 async def _import_csv_upload(file: UploadFile):
@@ -3486,6 +3659,14 @@ def _reject_inline_nyt_key(url: str):
             "Store NYT credentials in encrypted NYT API settings instead of the source URL.",
         )
 
+@app.get("/api/sources")
+def list_sources():
+    return [
+        _serialize_source(source)
+        for source in rows("SELECT * FROM sources ORDER BY is_default DESC,name")
+    ]
+
+
 @app.post("/api/sources")
 def add_source(payload: SourceIn):
     _reject_inline_nyt_key(str(payload.url))
@@ -3537,11 +3718,11 @@ def toggle_source(source_id:int):
         source = con.execute("SELECT enabled,kind,lifecycle FROM sources WHERE id=?", (source_id,)).fetchone()
         if not source: raise HTTPException(404,"Source not found")
         became_enabled = _toggle_source_row(con, source_id, source)
-    job_id = (
-        enqueue_job(f"source:{source_id}", dedupe=True)
-        if became_enabled and source["kind"] not in {"builtin", "association"}
-        else None
-    )
+    if became_enabled and source["kind"] not in {"builtin", "association"}:
+        _bump_source_scan_generation(source_id)
+        job_id = enqueue_followup_job(f"source:{source_id}")
+    else:
+        job_id = None
     return {"id":source_id, "job_id":job_id}
 
 
@@ -3827,101 +4008,211 @@ def _normalize_models_dev_catalog(raw: dict) -> list[dict]:
 
 @app.get("/api/llm/models")
 async def llm_models_catalog():
+    """Return the cached models.dev provider catalog for the Settings picker.
+
+    Refreshes connect directly with ``follow_redirects=False`` and
+    ``trust_env=False`` (matching public source and catalog fetches so ambient
+    ``HTTP_PROXY``/``HTTPS_PROXY``/``ALL_PROXY`` and ``SSL_CERT_*`` variables
+    are ignored). Deployments that require an outbound HTTP proxy receive HTTP
+    502 here and should configure the LLM reranker endpoint URL and model ID
+    directly in Settings.
+    """
+
     now = time.monotonic()
     cached = _MODELS_DEV_CACHE.get("providers") or []
     if cached and now < float(_MODELS_DEV_CACHE.get("expires_at") or 0.0):
         return {"providers": cached, "cached": True}
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            resp = await client.get("https://models.dev/api.json")
-            resp.raise_for_status()
-            providers = _normalize_models_dev_catalog(resp.json())
+        async with httpx.AsyncClient(
+            timeout=12.0,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            _resp, raw_catalog = await stream_json_async(
+                client,
+                "GET",
+                "https://models.dev/api.json",
+                max_bytes=settings.models_dev_max_bytes,
+                size_error="models.dev catalog response is too large",
+            )
+        if not isinstance(raw_catalog, dict):
+            raise ValueError("models.dev catalog must be a JSON object")
+        providers = _normalize_models_dev_catalog(raw_catalog)
         _MODELS_DEV_CACHE["providers"] = providers
         _MODELS_DEV_CACHE["expires_at"] = now + 3600.0
         return {"providers": providers, "cached": False}
     except Exception as exc:
         if cached:
             return {"providers": cached, "cached": True, "stale": True}
-        raise HTTPException(502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}") from exc
+        raise HTTPException(
+            502, f"Unable to fetch models.dev catalog: {safe_error_message(exc)}"
+        ) from exc
+
+
+def _validate_source_update_guardrails(source: dict[str, Any] | sqlite3.Row, payload: SourceUpdateIn):
+    if source["kind"] in {"builtin", "association"} or source["is_default"]:
+        if payload.name is not None:
+            raise HTTPException(400, "This source name cannot be changed")
+        if payload.url is not None:
+            raise HTTPException(400, "This source URL cannot be changed")
+        if payload.filters is not None:
+            raise HTTPException(
+                400,
+                "The built-in source cannot be filtered"
+                if source["kind"] == "builtin"
+                else "This source cannot be filtered",
+            )
+        if payload.lifecycle is not None:
+            raise HTTPException(400, "This source lifecycle cannot be changed")
+    if payload.url is not None and source["url"] in DEFAULT_SOURCE_URLS:
+        raise HTTPException(400, "Default source URLs cannot be changed")
+
+
+def _source_integrity_conflict_detail(exc: sqlite3.IntegrityError) -> str:
+    detail = str(exc).lower()
+    if "sources.name" in detail or detail.endswith(".name") or "(name)" in detail:
+        return "A source with that name already exists"
+    if "sources.url" in detail or detail.endswith(".url") or "(url)" in detail:
+        return "A source with that URL already exists"
+    return "Source already exists"
 
 
 @app.put("/api/sources/{source_id}")
 def update_source(source_id: int, payload: SourceUpdateIn):
-    next_url: str | None = None
+    initial = row(
+        "SELECT id,name,url,enabled,kind,is_default,lifecycle,filters,last_status,last_scanned_at,last_attempted_at "
+        "FROM sources WHERE id=?",
+        (source_id,),
+    )
+    if not initial:
+        raise HTTPException(404, "Source not found")
+    _validate_source_update_guardrails(initial, payload)
+
+    cleaned_name: str | None = None
+    if payload.name is not None:
+        cleaned_name = payload.name.strip()
+        if len(cleaned_name) < 2 or len(cleaned_name) > 100:
+            raise HTTPException(400, "Source name must be between 2 and 100 characters")
+
+    normalized_url: str | None = None
     if payload.url is not None:
-        next_url = str(payload.url)
-        _reject_inline_nyt_key(next_url)
+        raw_url = payload.url.strip()
+        if not raw_url or len(raw_url) > 2048:
+            raise HTTPException(400, "Invalid public URL")
+        _reject_inline_nyt_key(raw_url)
         try:
-            validate_public_url(next_url)
+            validate_public_url(raw_url)
         except ValueError as exc:
             raise HTTPException(400, safe_error_message(exc)) from exc
-    updates = []
-    values = []
+        try:
+            normalized_url = str(_HTTP_URL_ADAPTER.validate_python(raw_url))
+        except ValidationError as exc:
+            raise HTTPException(400, "Invalid public URL") from exc
+
     with transaction() as con:
         source = con.execute(
-            "SELECT id,url,enabled,kind,is_default,lifecycle,filters,last_status,last_scanned_at,last_attempted_at "
+            "SELECT id,name,url,enabled,kind,is_default,lifecycle,filters,last_status,last_scanned_at,last_attempted_at "
             "FROM sources WHERE id=?",
             (source_id,),
         ).fetchone()
         if not source:
             raise HTTPException(404, "Source not found")
-        if next_url is not None:
-            if source["is_default"] or source["kind"] in {"builtin", "association"}:
-                raise HTTPException(400, "This source URL cannot be changed")
+        _validate_source_update_guardrails(source, payload)
+
+        updates: list[str] = []
+        values: list[object] = []
+        url_changed = False
+        existing_filters = normalize_source_filters(source["filters"])
+
+        if cleaned_name is not None:
+            updates.append("name=?")
+            values.append(cleaned_name)
+        if normalized_url is not None:
             updates.append("url=?")
-            values.append(next_url)
+            values.append(normalized_url)
+            url_changed = normalized_url != source["url"]
         if payload.filters is not None:
-            if source["kind"] == "builtin":
-                raise HTTPException(400, "The built-in source cannot be filtered")
             updates.append("filters=?")
             values.append(json.dumps(payload.filters.model_dump()))
-        if payload.lifecycle is not None:
-            if source["kind"] in {"builtin", "association"}:
-                raise HTTPException(400, "This source lifecycle cannot be changed")
+        effective_lifecycle = payload.lifecycle or source["lifecycle"]
+        lifecycle_changed = (
+            payload.lifecycle is not None
+            and payload.lifecycle != source["lifecycle"]
+        )
+        if lifecycle_changed:
             updates.append("lifecycle=?")
             values.append(payload.lifecycle)
-        effective_lifecycle = payload.lifecycle or source["lifecycle"]
-        if effective_lifecycle == "one_time" and (
-            next_url is not None or payload.filters is not None
+        if url_changed:
+            updates.append("last_scanned_at=NULL")
+            updates.append("last_attempted_at=NULL")
+            updates.append("last_status=NULL")
+        elif effective_lifecycle == "one_time" and (
+            payload.filters is not None
+            or (lifecycle_changed and payload.lifecycle == "one_time")
         ):
             updates.append("last_scanned_at=NULL")
             updates.append("last_attempted_at=NULL")
+
         if updates:
+            values.append(source_id)
             try:
                 con.execute(
-                    f"UPDATE sources SET {','.join(updates)} WHERE id=?",
-                    (*values, source_id),
+                    f"UPDATE sources SET {','.join(updates)} WHERE id=?", values
                 )
             except sqlite3.IntegrityError as exc:
-                raise HTTPException(409, "Source already exists") from exc
+                raise HTTPException(
+                    409, _source_integrity_conflict_detail(exc)
+                ) from exc
+
     filters = (
         payload.filters.model_dump()
         if payload.filters is not None
-        else normalize_source_filters(source["filters"])
+        else existing_filters
     )
-    should_queue = bool(
-        updates
+    needs_source_scan = (
+        url_changed
+        or payload.filters is not None
+        or lifecycle_changed
+    )
+    job_id = None
+    if (
+        needs_source_scan
         and source["enabled"]
         and source["kind"] not in {"builtin", "association"}
-        and not (
-            effective_lifecycle == "one_time"
-            and next_url is None
-            and payload.filters is None
-            and _one_time_source_completed(source)
-        )
-    )
-    job_id = (
-        enqueue_job(f"source:{source_id}", dedupe=True)
-        if should_queue
-        else None
-    )
+    ):
+        _bump_source_scan_generation(source_id)
+        job_id = enqueue_followup_job(f"source:{source_id}")
     return {
         "id": source_id,
-        "url": next_url or source["url"],
+        "name": cleaned_name if cleaned_name is not None else source["name"],
+        "url": normalized_url if normalized_url is not None else source["url"],
         "filters": filters,
         "lifecycle": effective_lifecycle,
         "job_id": job_id,
     }
+
+
+@app.post("/api/sources/{source_id}/refresh")
+def refresh_source(source_id: int):
+    with transaction() as con:
+        source = con.execute(
+            "SELECT id,enabled,kind,is_default,lifecycle FROM sources WHERE id=?",
+            (source_id,),
+        ).fetchone()
+        if not source:
+            raise HTTPException(404, "Source not found")
+        if source["kind"] in {"builtin", "association"} or source["is_default"]:
+            raise HTTPException(400, "Only web sources can be refreshed")
+        if not source["enabled"]:
+            raise HTTPException(400, "Enable this source before refreshing it")
+        if source["lifecycle"] == "one_time":
+            con.execute(
+                "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL WHERE id=?",
+                (source_id,),
+            )
+    _bump_source_scan_generation(source_id)
+    job_id = enqueue_followup_job(f"source:{source_id}")
+    return {"id": source_id, "job_id": job_id}
 
 
 def _save_digest_settings(updates: dict):
@@ -4233,7 +4524,7 @@ async def preview_google_book_associations():
     try:
         associations = await provider.collect(rows("SELECT * FROM reads ORDER BY id"))
     except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(502, f"Google Books preview failed: {exc}") from exc
+        raise HTTPException(502, f"Google Books preview failed: {safe_error_message(exc)}") from exc
     return {
         "provider": provider.provider,
         "count": len(associations),
@@ -4617,10 +4908,7 @@ async def api_import_librarr(candidate_id: int, payload: LibrarrImportIn | None 
 
 @api_v1.get("/sources")
 def api_sources():
-    return [
-        {**source, "filters": normalize_source_filters(source.get("filters"))}
-        for source in rows("SELECT * FROM sources ORDER BY is_default DESC,name")
-    ]
+    return list_sources()
 
 
 @api_v1.post("/sources/preview")
@@ -4646,6 +4934,11 @@ def api_update_source_schedule(payload: SourceScheduleIn):
 @api_v1.put("/sources/{source_id}")
 def api_update_source(source_id: int, payload: SourceUpdateIn):
     return update_source(source_id, payload)
+
+
+@api_v1.post("/sources/{source_id}/refresh")
+def api_refresh_source(source_id: int):
+    return refresh_source(source_id)
 
 
 @api_v1.post("/import/goodreads/rss")
