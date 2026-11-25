@@ -96,6 +96,7 @@ from .digest import (
     send_digest,
     validate_digest_config,
 )
+from .decision_evidence import retract_recommendation_outcome_evidence
 from .learning import (
     EVENT_TYPES,
     create_recommendation_run,
@@ -106,6 +107,7 @@ from .learning import (
     _impression_precedes,
     _read_label,
     _read_time,
+    _validate_identifier,
 )
 from .interaction_personalization import (
     load_interaction_events,
@@ -2808,10 +2810,30 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         "read_source": str(read["source"] or "unknown")[:32],
         "time_precision": "day" if day_precision else "timestamp",
     }
+    read_event_key = f"read:{int(read['id']):08d}"
+    candidate_read_event_key = f"read:{int(read['id']):08d}:{int(candidate['id'])}"
+    existing_read_event = con.execute(
+        "SELECT event_key,candidate_id FROM recommendation_events "
+        "WHERE event_key IN (?,?) ORDER BY id",
+        (read_event_key, candidate_read_event_key),
+    ).fetchall()
+    matched_existing_key = next(
+        (
+            str(item["event_key"])
+            for item in existing_read_event
+            if int(item["candidate_id"]) == int(candidate["id"])
+        ),
+        None,
+    )
+    event_key = (
+        matched_existing_key
+        if matched_existing_key is not None
+        else f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}"
+    )
     try:
         record_event_in_connection(
             con,
-            event_key=f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}",
+            event_key=event_key,
             candidate_id=int(candidate["id"]),
             event_type="read",
             value=saved_rating,
@@ -2827,6 +2849,47 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return read, existing is not None
+
+
+def _clear_explicit_feedback_outcomes(
+    con,
+    candidate_id: int,
+    *,
+    event_type: str,
+    source: str = "ui",
+    event_key: str | None = None,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    if event_key is not None:
+        con.execute(
+            "DELETE FROM recommendation_outcomes "
+            "WHERE label_kind='explicit_feedback' AND event_id=("
+            "SELECT id FROM recommendation_events WHERE event_key=?)",
+            (event_key,),
+        )
+        retract_recommendation_outcome_evidence(
+            con,
+            candidate_id=candidate_id,
+            event_type=event_type,
+            source=source,
+            occurred_at=now,
+            event_key=event_key,
+        )
+        return
+    con.execute(
+        "DELETE FROM recommendation_outcomes "
+        "WHERE label_kind='explicit_feedback' AND ("
+        "event_id IN (SELECT id FROM recommendation_events WHERE candidate_id=?) "
+        "OR impression_id IN (SELECT id FROM recommendation_impressions WHERE candidate_id=?))",
+        (candidate_id, candidate_id),
+    )
+    retract_recommendation_outcome_evidence(
+        con,
+        candidate_id=candidate_id,
+        event_type=event_type,
+        source=source,
+        occurred_at=now,
+    )
 
 
 @app.post("/api/recommendations/{candidate_id}/feedback")
@@ -2849,6 +2912,13 @@ def feedback(candidate_id: int, payload: FeedbackIn):
             "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
             (candidate_id, payload.action, previous_status),
         ).lastrowid
+        if payload.action in {"restore", "maybe_later"}:
+            _clear_explicit_feedback_outcomes(
+                con,
+                candidate_id,
+                event_type=payload.action,
+                source="ui",
+            )
         label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
         try:
             record_event_in_connection(
@@ -2922,11 +2992,6 @@ def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
         "UPDATE feedback SET undone_at=CURRENT_TIMESTAMP WHERE id=?",
         (decision_id,),
     )
-    con.execute(
-        "DELETE FROM recommendation_outcomes WHERE event_id=("
-        "SELECT id FROM recommendation_events WHERE event_key=?)",
-        (f"feedback:{decision_id}",),
-    )
     compensation = (
         "librarr_import" if previous_status == "imported"
         else "save" if previous_status == "saved"
@@ -2934,6 +2999,20 @@ def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
         else "maybe_later" if previous_status == "maybe_later"
         else "restore"
     )
+    _clear_explicit_feedback_outcomes(
+        con,
+        candidate_id,
+        event_type=compensation,
+        source="ui_undo",
+        event_key=f"feedback:{decision_id}",
+    )
+    if compensation in {"restore", "maybe_later"}:
+        _clear_explicit_feedback_outcomes(
+            con,
+            candidate_id,
+            event_type=compensation,
+            source="ui_undo",
+        )
     try:
         record_event_in_connection(
             con,
@@ -3003,22 +3082,51 @@ def bulk_feedback(payload: BulkFeedbackIn):
     ids = list(dict.fromkeys(payload.ids))
     decisions = []
     with transaction() as con:
+        if payload.run_id is not None:
+            try:
+                _validate_identifier(payload.run_id, "recommendation run")
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
         placeholders = ",".join("?" for _ in ids)
-        found = {
+        candidate_rows = {
             int(item["id"]): str(item["status"])
             for item in con.execute(
-                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})", ids
+                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})",
+                ids,
             ).fetchall()
         }
-        for candidate_id in ids:
-            if candidate_id not in found:
-                continue
-            previous_status = found[candidate_id]
-            con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, candidate_id))
+        found = [candidate_id for candidate_id in ids if candidate_id in candidate_rows]
+        run_candidate_ids: set[int] = set()
+        if payload.run_id is not None and found:
+            run_placeholders = ",".join("?" for _ in found)
+            run_candidate_ids = {
+                int(item["candidate_id"])
+                for item in con.execute(
+                    f"SELECT candidate_id FROM recommendation_impressions "
+                    f"WHERE run_id=? AND candidate_id IN ({run_placeholders})",
+                    (payload.run_id, *found),
+                ).fetchall()
+            }
+        for candidate_id in found:
+            previous_status = candidate_rows[candidate_id]
+            con.execute(
+                "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, candidate_id),
+            )
             feedback_id = con.execute(
                 "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
                 (candidate_id, payload.action, previous_status),
             ).lastrowid
+            if payload.action == "restore":
+                _clear_explicit_feedback_outcomes(
+                    con,
+                    candidate_id,
+                    event_type="restore",
+                    source="ui",
+                )
+            candidate_run_id = (
+                payload.run_id if candidate_id in run_candidate_ids else None
+            )
             label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
             try:
                 record_event_in_connection(
@@ -3026,11 +3134,11 @@ def bulk_feedback(payload: BulkFeedbackIn):
                     event_key=f"feedback:{feedback_id}",
                     candidate_id=candidate_id,
                     event_type=payload.action,
-                    run_id=payload.run_id,
+                    run_id=candidate_run_id,
                     source="ui",
                     label=label,
                     label_kind="explicit_feedback" if label is not None else None,
-                    confidence=0.8 if payload.run_id and label is not None else 0.5,
+                    confidence=0.8 if candidate_run_id and label is not None else 0.5,
                 )
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
