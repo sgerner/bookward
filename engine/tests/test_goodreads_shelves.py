@@ -497,7 +497,7 @@ def test_import_storygraph_csv_populates_shelves_skips_dnf_and_clears_completed_
     ]
 
 
-def test_migration_28_recovers_hidden_rows_preserving_user_feedback_dedupes_shelves_and_isolates_profiles(
+def test_migration_29_recovers_hidden_rows_preserving_user_feedback_dedupes_shelves_and_isolates_profiles(
     tmp_path: Path, monkeypatch
 ) -> None:
     root_db = tmp_path / "afterword.db"
@@ -633,7 +633,7 @@ def test_migration_28_recovers_hidden_rows_preserving_user_feedback_dedupes_shel
         assert migrated_statuses[54] == ("new", 0.0)
 
         asyncio.run(score_all())
-        # Second initialize() call verifies idempotency without re-running Migration 28.
+        # Second initialize() call verifies idempotency without re-running Migration 29.
         initialize(seed_demo=False)
         con_a = sqlite3.connect(profile_a_db)
         try:
@@ -662,7 +662,7 @@ def test_migration_28_recovers_hidden_rows_preserving_user_feedback_dedupes_shel
     assert b_shelves == [("currently-reading", "goodreads_csv", "Isolated Book", "Other Author")]
 
 
-def test_migration_28_preserves_csv_only_rows_with_rss_residue_and_clears_scheduled_date_on_disconnect(
+def test_migration_29_preserves_csv_only_rows_with_rss_residue_and_clears_scheduled_date_on_disconnect(
     tmp_path: Path, monkeypatch
 ) -> None:
     db_path = tmp_path / "v26_csv_with_rss_residue.db"
@@ -767,7 +767,7 @@ def test_migration_28_preserves_csv_only_rows_with_rss_residue_and_clears_schedu
     ]
 
 
-def test_migration_28_csv_plus_rss_on_v26_db_preserves_csv_across_disconnects_and_cleans_on_csv_reimport(
+def test_migration_29_csv_plus_rss_on_v26_db_preserves_csv_across_disconnects_and_cleans_on_csv_reimport(
     tmp_path: Path, monkeypatch
 ) -> None:
     db_path = tmp_path / "v26_csv_plus_rss.db"
@@ -844,7 +844,7 @@ def test_migration_28_csv_plus_rss_on_v26_db_preserves_csv_across_disconnects_an
     }
 
     # 1) HTTP 404 private-shelf disconnect path deletes 'goodreads_rss' on to-read
-    #    without deleting pre-v28 'legacy' CSV rows.
+    #    without deleting pre-v29 'legacy' CSV rows.
     async def private_to_read_fetch(url: str, **kwargs):
         if "shelf=to-read" in url:
             req = httpx.Request("GET", url)
@@ -907,10 +907,10 @@ def test_migration_28_csv_plus_rss_on_v26_db_preserves_csv_across_disconnects_an
     ]
 
 
-def test_migration_28_table_rebuild_preserves_extra_columns_via_pragma_table_info(
+def test_migration_29_table_rebuild_preserves_extra_columns_via_pragma_table_info(
     tmp_path: Path, monkeypatch
 ) -> None:
-    db_path = tmp_path / "v27_with_extra_shelf_columns.db"
+    db_path = tmp_path / "v28_with_extra_shelf_columns.db"
     monkeypatch.setattr(settings, "db", str(db_path))
 
     con = sqlite3.connect(db_path)
@@ -919,7 +919,7 @@ def test_migration_28_table_rebuild_preserves_extra_columns_via_pragma_table_inf
             "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
         for version, script in MIGRATIONS:
-            if version >= 28:
+            if version >= 29:
                 continue
             _execute_migration_script(con, script)
             con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
