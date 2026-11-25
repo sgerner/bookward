@@ -1,13 +1,23 @@
 <script lang="ts">
 	import RadioGroup from './RadioGroup.svelte';
+	import { starButtonLabel } from '#lib/reading-history-ratings.js';
 
 	type Props = {
-		value?: number;
+		value?: number | null;
 		max?: number;
 		label?: string;
 		labelledBy?: string;
 		clearLabel?: string;
-		onchange?: (rating: number) => void;
+		size?: 'sm' | 'md';
+		busy?: boolean;
+		disabled?: boolean;
+		selectOnMove?: boolean;
+		groupKey?: string;
+		onchange?: (
+			rating: number | null,
+			trigger: HTMLElement | null,
+			clearedViaButton: boolean,
+		) => void;
 	};
 
 	let {
@@ -16,63 +26,130 @@
 		label = 'Optional book rating',
 		labelledBy,
 		clearLabel = 'Clear rating',
+		size,
+		busy,
+		disabled = false,
+		selectOnMove,
+		groupKey,
 		onchange,
 	}: Props = $props();
 
 	const fallbackLabelId = $props.id();
 	const resolvedLabelledBy = $derived(labelledBy ?? fallbackLabelId);
+	const resolvedSize = $derived(size ?? (groupKey ? 'sm' : 'md'));
+	const resolvedSelectOnMove = $derived(selectOnMove ?? onchange === undefined);
 	const ratings = $derived(Array.from({ length: max }, (_, index) => index + 1));
+	const normalizedValue = $derived(
+		typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= max
+			? value
+			: null,
+	);
 
 	let ratingGroup = $state<{ focusFirst: () => void } | null>(null);
+	let lastRadioTrigger: HTMLElement | null = null;
+	let clearToNull = $state(value === null);
 
-	function selectRating(next: number) {
-		value = next;
-		onchange?.(next);
+	$effect(() => {
+		if (value === null) {
+			clearToNull = true;
+		} else if (value === 0) {
+			clearToNull = false;
+		}
+	});
+
+	export function focusFirst() {
+		ratingGroup?.focusFirst();
 	}
 
-	function clearRating() {
-		selectRating(0);
-		ratingGroup?.focusFirst();
+	function resolveRadioTrigger(): HTMLElement | null {
+		if (lastRadioTrigger) {
+			const trigger = lastRadioTrigger;
+			lastRadioTrigger = null;
+			return trigger;
+		}
+		if (typeof document !== 'undefined' && document.activeElement instanceof HTMLElement) {
+			return document.activeElement;
+		}
+		return null;
+	}
+
+	function selectRating(next: number, trigger: HTMLElement | null) {
+		value = next;
+		onchange?.(next, trigger, false);
+	}
+
+	function clearFromRadio(trigger: HTMLElement | null) {
+		if (normalizedValue === null) {
+			lastRadioTrigger = null;
+			return;
+		}
+		value = clearToNull ? null : 0;
+		onchange?.(null, trigger, false);
+	}
+
+	function clearFromButton(trigger: HTMLElement) {
+		if (onchange) {
+			onchange(null, trigger, true);
+			value = clearToNull ? null : 0;
+		} else {
+			value = clearToNull ? null : 0;
+			ratingGroup?.focusFirst();
+		}
 	}
 </script>
 
-<div class="mt-3 flex flex-wrap items-center gap-2">
+<div
+	class={`flex flex-wrap items-center ${resolvedSize === 'sm' ? 'gap-1.5' : 'mt-3 gap-2'}`}
+	aria-busy={busy}
+	data-rating-group={groupKey}
+>
 	{#if !labelledBy}
 		<span id={fallbackLabelId} class="sr-only">{label}</span>
 	{/if}
 	<RadioGroup
 		bind:this={ratingGroup}
 		items={ratings}
-		value={value > 0 ? value : null}
+		value={normalizedValue}
 		labelledBy={resolvedLabelledBy}
 		columns={1}
-		selectOnMove
+		selectOnMove={resolvedSelectOnMove}
 		clearable
-		class="flex flex-wrap items-center gap-2"
-		onSelect={(rating) => selectRating(rating)}
-		onClear={() => selectRating(0)}
+		class={`flex flex-wrap items-center ${resolvedSize === 'sm' ? 'gap-1.5' : 'gap-2'}`}
+		onSelect={(rating) => selectRating(rating, resolveRadioTrigger())}
+		onClear={() => clearFromRadio(resolveRadioTrigger())}
 	>
 		{#snippet item(rating, radio)}
-			{@const active = value >= rating}
+			{@const active = (normalizedValue ?? 0) >= rating}
 			<button
 				type="button"
 				role="radio"
-				class="star-rating-btn grid size-11 place-items-center rounded-xl text-xl"
+				{disabled}
+				class={`star-rating-btn grid place-items-center disabled:cursor-not-allowed disabled:opacity-60 ${
+					resolvedSize === 'sm' ? 'size-9 rounded-lg text-base' : 'size-11 rounded-xl text-xl'
+				}`}
+				data-rating-star={groupKey ? `${groupKey}-${rating}` : undefined}
 				data-active={active ? 'true' : 'false'}
-				aria-label={`${rating} ${rating === 1 ? 'star' : 'stars'}`}
+				aria-label={starButtonLabel(rating)}
 				aria-checked={radio.checked}
 				tabindex={radio.tabIndex}
-				onclick={radio.select}
+				onclick={(event) => {
+					lastRadioTrigger = event.currentTarget;
+					radio.select();
+				}}
 			>
 				<span aria-hidden="true">{active ? '★' : '☆'}</span>
 			</button>
 		{/snippet}
 	</RadioGroup>
-	{#if value > 0}
+	{#if normalizedValue !== null}
 		<button
 			type="button"
-			class="star-rating-clear btn btn-sm ml-1 min-h-10 preset-tonal-surface"
-			onclick={clearRating}
+			{disabled}
+			data-rating-clear={groupKey}
+			class={`star-rating-clear btn btn-sm ml-1 preset-tonal-surface ${
+				resolvedSize === 'sm' ? 'min-h-9 text-xs' : 'min-h-10'
+			}`}
+			onclick={(event) => clearFromButton(event.currentTarget)}
 		>
 			{clearLabel}
 		</button>
@@ -92,7 +169,7 @@
 			box-shadow 160ms ease;
 	}
 
-	.star-rating-btn:hover {
+	.star-rating-btn:hover:not(:disabled) {
 		transform: translateY(-2px);
 		border-color: var(--star-active-border);
 		color: var(--star-active-fg);
@@ -122,7 +199,7 @@
 			transition: none;
 		}
 
-		.star-rating-btn:hover {
+		.star-rating-btn:hover:not(:disabled) {
 			transform: none;
 		}
 	}

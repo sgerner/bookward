@@ -27,9 +27,11 @@ from .database import (
     bind_request_restore_epoch,
     connect,
     database_lock,
+    demote_orphaned_recommended_candidates,
     fenced_async,
     initialize,
     normalize_key,
+    recompute_candidate_sources,
     row,
     rows,
     scheduler_fenced,
@@ -95,16 +97,19 @@ from .digest import (
     send_digest,
     validate_digest_config,
 )
+from .decision_evidence import retract_recommendation_outcome_evidence
 from .learning import (
     EVENT_TYPES,
     create_recommendation_run,
     build_decision_evidence,
     record_event_in_connection,
     record_events,
+    sync_read_rating_in_connection,
     validate_candidate_run_id,
     _impression_precedes,
     _read_label,
     _read_time,
+    _validate_identifier,
 )
 from .interaction_personalization import (
     load_interaction_events,
@@ -122,7 +127,10 @@ from .association_sources.google_books import GoogleBooksAssociatedProvider
 from .quality import (
     QUALITY_AUDIT_BATCH_SIZE,
     audit_candidates,
+    configure_candidate_quality_sweep,
+    finish_candidate_quality_batch,
     has_candidate_quality_audit_candidates,
+    prepare_candidate_quality_batch,
     quality_summary,
 )
 from . import llm_reranker
@@ -180,6 +188,11 @@ class AccountCreateIn(BaseModel):
 
 class AccountPasswordIn(BaseModel):
     password: str = Field(min_length=12, max_length=1024)
+
+
+class CandidateAuditIn(BaseModel):
+    mode: Literal["incremental", "full"] | None = None
+    retry: bool = False
 
 
 def _ensure_profile_database(profile_id: str):
@@ -325,7 +338,11 @@ def _queue_due_enrichment_retries():
     """Schedule bounded retry jobs without performing provider requests here."""
 
     queued = {}
-    if not active_job("candidate_quality_recovery") and has_candidate_quality_audit_candidates():
+    if (
+        not active_job("candidate_quality")
+        and not active_job("candidate_quality_recovery")
+        and has_candidate_quality_audit_candidates()
+    ):
         queued["candidate_quality_recovery"] = enqueue_job("candidate_quality_recovery", dedupe=True)
     if not active_job("metadata") and candidate_metadata_refresh_remaining():
         queued["metadata"] = enqueue_job("metadata", dedupe=True)
@@ -595,15 +612,43 @@ async def handle_job(kind: str):
             enqueue_followup_job("metadata")
         return {"metadata": metadata, "remaining": remaining, "score_job_id": score_job_id}
     if kind == "candidate_quality":
-        quality = await audit_candidates(only_pending=False)
-        enqueue_job("read_work_identities", dedupe=True)
-        scored = await score_all(
-            config.get("embedding_backend"),
-            config.get("embedding_model"),
-            config.get("embedding_url"),
-            config.get("embedding_api_key"),
+        mode, started_at = prepare_candidate_quality_batch()
+        quality = await audit_candidates(
+            only_pending=(mode != "full"),
+            limit=QUALITY_AUDIT_BATCH_SIZE,
+            audited_before=started_at,
         )
-        return {**quality, "scored": scored}
+        stopped = bool(quality.get("stopped"))
+        remaining = finish_candidate_quality_batch(
+            mode=mode,
+            started_at=started_at,
+            stopped=stopped,
+        )
+        changed = bool(
+            quality.get("status_changed")
+            or quality.get("deduped")
+            or quality.get("enriched")
+        )
+        is_final_batch = remaining == 0 and not stopped
+        score_job_id = (
+            enqueue_followup_job("score")
+            if (changed or is_final_batch)
+            else None
+        )
+        followup_job_id = (
+            enqueue_followup_job("candidate_quality")
+            if remaining > 0
+            else None
+        )
+        if quality.get("audited") or is_final_batch:
+            enqueue_job("read_work_identities", dedupe=True)
+        return {
+            **quality,
+            "mode": mode,
+            "remaining": remaining,
+            "followup_job_id": followup_job_id,
+            "score_job_id": score_job_id,
+        }
     if kind == "candidate_quality_recovery":
         quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
         _enqueue_candidate_quality_followup()
@@ -733,7 +778,7 @@ async def lifespan(app):
         try:
             with profile_scope(profile_id):
                 enqueue_job("metadata", dedupe=True)
-                if has_candidate_quality_audit_candidates():
+                if not active_job("candidate_quality") and has_candidate_quality_audit_candidates():
                     enqueue_job("candidate_quality_recovery", dedupe=True)
                 enqueue_job("read_work_identities", dedupe=True)
                 enqueue_job("read_metadata", dedupe=True)
@@ -1450,6 +1495,33 @@ class MarkReadIn(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
     )
+
+
+class ReadingHistoryRatingIn(BaseModel):
+    rating: int | None
+
+    @field_validator("rating", mode="before")
+    @classmethod
+    def validate_whole_star_rating(cls, value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+        if isinstance(value, int):
+            if 1 <= value <= 5:
+                return value
+            raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed == "":
+                raise HTTPException(
+                    400,
+                    "Rating must be a whole number between 1 and 5, or null for unrated",
+                )
+            if trimmed in {"1", "2", "3", "4", "5"}:
+                return int(trimmed)
+            raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+        raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
 
 
 class TelemetryEventIn(BaseModel):
@@ -2440,6 +2512,51 @@ def reading_history():
     return items
 
 
+@app.put("/api/reading-history/{read_id}")
+def update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn):
+    """Set, change, or clear a whole-star rating on an existing read entry."""
+    if read_id <= 0:
+        raise HTTPException(404, "Read entry not found")
+    with transaction() as con:
+        existing = con.execute(
+            "SELECT * FROM reads WHERE id=?",
+            (read_id,),
+        ).fetchone()
+        if not existing:
+            raise HTTPException(404, "Read entry not found")
+        con.execute(
+            "UPDATE reads SET rating=? WHERE id=?",
+            (payload.rating, read_id),
+        )
+        updated = dict(
+            con.execute(
+                "SELECT * FROM reads WHERE id=?",
+                (read_id,),
+            ).fetchone()
+        )
+        try:
+            sync_read_rating_in_connection(con, updated)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    job_id = enqueue_followup_job("score")
+    raw_rating = updated.get("rating")
+    normalized_rating = (
+        int(raw_rating)
+        if raw_rating is not None and float(raw_rating).is_integer()
+        else raw_rating
+    )
+    return {
+        "id": int(updated["id"]),
+        "title": updated["title"],
+        "author": updated["author"],
+        "rating": normalized_rating,
+        "read_at": updated.get("read_at"),
+        "source": updated.get("source") or "",
+        "created_at": updated.get("created_at"),
+        "job_id": job_id,
+    }
+
+
 @app.get("/api/reading-history/scores")
 async def reading_history_scores(
     offset: int = Query(default=0, ge=0),
@@ -2848,10 +2965,30 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
         "read_source": str(read["source"] or "unknown")[:32],
         "time_precision": "day" if day_precision else "timestamp",
     }
+    read_event_key = f"read:{int(read['id']):08d}"
+    candidate_read_event_key = f"read:{int(read['id']):08d}:{int(candidate['id'])}"
+    existing_read_event = con.execute(
+        "SELECT event_key,candidate_id FROM recommendation_events "
+        "WHERE event_key IN (?,?) ORDER BY id",
+        (read_event_key, candidate_read_event_key),
+    ).fetchall()
+    matched_existing_key = next(
+        (
+            str(item["event_key"])
+            for item in existing_read_event
+            if int(item["candidate_id"]) == int(candidate["id"])
+        ),
+        None,
+    )
+    event_key = (
+        matched_existing_key
+        if matched_existing_key is not None
+        else f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}"
+    )
     try:
         record_event_in_connection(
             con,
-            event_key=f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}",
+            event_key=event_key,
             candidate_id=int(candidate["id"]),
             event_type="read",
             value=saved_rating,
@@ -2867,6 +3004,47 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return read, existing is not None
+
+
+def _clear_explicit_feedback_outcomes(
+    con,
+    candidate_id: int,
+    *,
+    event_type: str,
+    source: str = "ui",
+    event_key: str | None = None,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    if event_key is not None:
+        con.execute(
+            "DELETE FROM recommendation_outcomes "
+            "WHERE label_kind='explicit_feedback' AND event_id=("
+            "SELECT id FROM recommendation_events WHERE event_key=?)",
+            (event_key,),
+        )
+        retract_recommendation_outcome_evidence(
+            con,
+            candidate_id=candidate_id,
+            event_type=event_type,
+            source=source,
+            occurred_at=now,
+            event_key=event_key,
+        )
+        return
+    con.execute(
+        "DELETE FROM recommendation_outcomes "
+        "WHERE label_kind='explicit_feedback' AND ("
+        "event_id IN (SELECT id FROM recommendation_events WHERE candidate_id=?) "
+        "OR impression_id IN (SELECT id FROM recommendation_impressions WHERE candidate_id=?))",
+        (candidate_id, candidate_id),
+    )
+    retract_recommendation_outcome_evidence(
+        con,
+        candidate_id=candidate_id,
+        event_type=event_type,
+        source=source,
+        occurred_at=now,
+    )
 
 
 @app.post("/api/recommendations/{candidate_id}/feedback")
@@ -2889,6 +3067,13 @@ def feedback(candidate_id: int, payload: FeedbackIn):
             "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
             (candidate_id, payload.action, previous_status),
         ).lastrowid
+        if payload.action in {"restore", "maybe_later"}:
+            _clear_explicit_feedback_outcomes(
+                con,
+                candidate_id,
+                event_type=payload.action,
+                source="ui",
+            )
         label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
         try:
             record_event_in_connection(
@@ -2962,11 +3147,6 @@ def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
         "UPDATE feedback SET undone_at=CURRENT_TIMESTAMP WHERE id=?",
         (decision_id,),
     )
-    con.execute(
-        "DELETE FROM recommendation_outcomes WHERE event_id=("
-        "SELECT id FROM recommendation_events WHERE event_key=?)",
-        (f"feedback:{decision_id}",),
-    )
     compensation = (
         "librarr_import" if previous_status == "imported"
         else "save" if previous_status == "saved"
@@ -2974,6 +3154,20 @@ def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
         else "maybe_later" if previous_status == "maybe_later"
         else "restore"
     )
+    _clear_explicit_feedback_outcomes(
+        con,
+        candidate_id,
+        event_type=compensation,
+        source="ui_undo",
+        event_key=f"feedback:{decision_id}",
+    )
+    if compensation in {"restore", "maybe_later"}:
+        _clear_explicit_feedback_outcomes(
+            con,
+            candidate_id,
+            event_type=compensation,
+            source="ui_undo",
+        )
     try:
         record_event_in_connection(
             con,
@@ -3043,22 +3237,51 @@ def bulk_feedback(payload: BulkFeedbackIn):
     ids = list(dict.fromkeys(payload.ids))
     decisions = []
     with transaction() as con:
+        if payload.run_id is not None:
+            try:
+                _validate_identifier(payload.run_id, "recommendation run")
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
         placeholders = ",".join("?" for _ in ids)
-        found = {
+        candidate_rows = {
             int(item["id"]): str(item["status"])
             for item in con.execute(
-                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})", ids
+                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})",
+                ids,
             ).fetchall()
         }
-        for candidate_id in ids:
-            if candidate_id not in found:
-                continue
-            previous_status = found[candidate_id]
-            con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, candidate_id))
+        found = [candidate_id for candidate_id in ids if candidate_id in candidate_rows]
+        run_candidate_ids: set[int] = set()
+        if payload.run_id is not None and found:
+            run_placeholders = ",".join("?" for _ in found)
+            run_candidate_ids = {
+                int(item["candidate_id"])
+                for item in con.execute(
+                    f"SELECT candidate_id FROM recommendation_impressions "
+                    f"WHERE run_id=? AND candidate_id IN ({run_placeholders})",
+                    (payload.run_id, *found),
+                ).fetchall()
+            }
+        for candidate_id in found:
+            previous_status = candidate_rows[candidate_id]
+            con.execute(
+                "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, candidate_id),
+            )
             feedback_id = con.execute(
                 "INSERT INTO feedback(candidate_id,action,previous_status) VALUES(?,?,?)",
                 (candidate_id, payload.action, previous_status),
             ).lastrowid
+            if payload.action == "restore":
+                _clear_explicit_feedback_outcomes(
+                    con,
+                    candidate_id,
+                    event_type="restore",
+                    source="ui",
+                )
+            candidate_run_id = (
+                payload.run_id if candidate_id in run_candidate_ids else None
+            )
             label = 1.0 if payload.action == "save" else 0.0 if payload.action == "reject" else None
             try:
                 record_event_in_connection(
@@ -3066,11 +3289,11 @@ def bulk_feedback(payload: BulkFeedbackIn):
                     event_key=f"feedback:{feedback_id}",
                     candidate_id=candidate_id,
                     event_type=payload.action,
-                    run_id=payload.run_id,
+                    run_id=candidate_run_id,
                     source="ui",
                     label=label,
                     label_kind="explicit_feedback" if label is not None else None,
-                    confidence=0.8 if payload.run_id and label is not None else 0.5,
+                    confidence=0.8 if candidate_run_id and label is not None else 0.5,
                 )
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
@@ -3440,13 +3663,9 @@ def _toggle_source_row(con, source_id: int, source) -> bool:
         "WHERE id=?",
         (source_id,),
     )
+    recompute_candidate_sources(con, source_id=source_id)
     if not became_enabled:
-        con.execute(
-            "UPDATE candidates SET status='new', score=0, explanation='[]', "
-            "score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP "
-            "WHERE source_id=? AND status='recommended'",
-            (source_id,),
-        )
+        demote_orphaned_recommended_candidates(con, source_id=source_id)
     return became_enabled
 
 
@@ -4202,12 +4421,12 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
                     "q.isbn13 quality_isbn13,"
                     "q.isbn10 quality_isbn10 "
                     "FROM candidates c "
-                    "LEFT JOIN sources s ON s.id=c.source_id "
+                    "JOIN sources s ON s.id=c.source_id "
                     "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
                     f"WHERE c.id IN ({placeholders}) "
                     "AND c.status='recommended' "
                     "AND q.quality_status='accepted' "
-                    "AND COALESCE(s.enabled,1)=1",
+                    "AND s.enabled=1",
                     ids,
                 ).fetchall()
             }
@@ -4268,10 +4487,12 @@ async def score():
     return {"job_id":enqueue_job("score", dedupe=True)}
 
 @app.post("/api/candidates/audit")
-async def candidate_audit():
-    """Queue a full catalog identity and quality audit."""
+async def candidate_audit(payload: CandidateAuditIn | None = Body(default=None)):
+    """Queue a bounded incremental or full catalog identity and quality audit."""
 
-    return {"job_id": enqueue_job("candidate_quality", dedupe=True)}
+    mode = payload.mode if isinstance(payload, CandidateAuditIn) else None
+    retry = bool(payload.retry) if isinstance(payload, CandidateAuditIn) else False
+    return configure_candidate_quality_sweep(mode=mode, retry=retry)
 
 @app.get("/api/candidates/quality")
 def candidate_quality():
@@ -4702,6 +4923,8 @@ def api_root():
         "documentation": "GET /openapi.json or /docs on the engine",
         "endpoints": {
             "overview": "GET /api/v1/overview",
+            "reading_history": "GET /api/v1/reading-history",
+            "reading_history_rating": "PUT /api/v1/reading-history/{id}",
             "recommendations": "GET /api/v1/recommendations",
             "feedback": "POST /api/v1/recommendations/{id}/feedback",
             "undo": "POST /api/v1/recommendations/{id}/undo",
@@ -4725,6 +4948,16 @@ def api_me(request: Request):
 @api_v1.get("/overview")
 def api_overview():
     return overview_payload(include_api_tokens=False)
+
+
+@api_v1.get("/reading-history")
+def api_reading_history():
+    return reading_history()
+
+
+@api_v1.put("/reading-history/{read_id}")
+def api_update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn):
+    return update_reading_history_rating(read_id, payload)
 
 
 @api_v1.get("/settings")
