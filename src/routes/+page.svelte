@@ -499,8 +499,16 @@
   const effectiveReadCount = $derived(data.readCount + localReadBookIds.size);
   const activeDigestReviewBooks = $derived.by(() => {
     if (Array.isArray(data.digestReview.books)) {
+      const clientById = clientDiscoverBooks
+        ? new Map(clientDiscoverBooks.map((book) => [book.id, book]))
+        : null;
       return data.digestReview.books
-        .map(withStatusOverride)
+        .map((book) => {
+          const freshRunId = clientById?.get(book.id)?.recommendation_run_id;
+          return withStatusOverride(
+            freshRunId ? { ...book, recommendation_run_id: freshRunId } : book,
+          );
+        })
         .filter((book) => book.status === "recommended");
     }
     return allBooks.filter(
@@ -1459,9 +1467,19 @@
         if (hasActiveDiscoverFilter) reloadFilteredDiscover();
         if (isQueriedDecisionMode) reloadQueriedDecisions();
       },
-      onRefreshDiscoverIfOffView: async () => {
-        if (activeView !== "discover") {
+      onRefreshDiscoverRun: async () => {
+        if (activeView === "discover") {
           await startOrRefreshDiscoverRun(true);
+        } else {
+          activeRunIdOverride = null;
+          discoverSessionInitializedOverride = false;
+          clientDiscoverBooks = null;
+          additionalDiscoverBooks = [];
+          sessionBooksById = {};
+          discoverLoadedCountOverride = null;
+          discoverHasMoreOverride = null;
+          bookStatusOverrides = {};
+          committedBookStatuses = {};
         }
       },
     });
@@ -1754,7 +1772,7 @@
         .map((value) => Number(value))
         .filter((id) => Number.isInteger(id)),
     )];
-    const changes = ids.map((id) => optimisticBookStatus(id, "saved", true)).filter(Boolean) as OptimisticChange[];
+    const changes = ids.map((id) => optimisticBookStatus(id, "saved")).filter(Boolean) as OptimisticChange[];
     return {
       commit: (result) => {
         changes.forEach((change) => change.commit?.(result));
@@ -2039,7 +2057,7 @@
         bookStatusOverrides = {};
         committedBookStatuses = {};
       }
-      activeRunIdOverride = nextRunId;
+      activeRunIdOverride = nextRunId || null;
       discoverSessionInitializedOverride = true;
     } catch (error) {
       discoverLoadError =
@@ -3249,7 +3267,7 @@
         {#if activeView === "discover" || activeView === "saved" || activeView === "sources"}<form
             method="POST"
             action="?/runSync"
-            use:enhance={setPending("sync", undefined, { refreshDiscoverIfOffView: true })}
+            use:enhance={setPending("sync", undefined, { refreshDiscoverRun: true })}
             in:fade={{ duration: motionDuration(180) }}
             out:fade={{ duration: motionDuration(120) }}
           >
@@ -3767,7 +3785,7 @@
                   <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{view === "saved" && shortlistTotalCount === 0 ? "Shortlist a recommendation when one catches your eye." : view === "saved" && viewHasFilter ? "Change the shortlist search or genre filter to see your saved books." : viewHasFilter ? "Change the search or genre filter to see more books." : view === "decisions" && decisionFilter === "maybe_later" ? "Books you set aside with Maybe later will appear here." : view === "decisions" && decisionFilter === "rejected" ? "Books you pass on will appear here." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestRequested ? "You have already acted on the books from this digest, or open View all to browse Discover." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
                 </div>
                 {#if view === "saved" && shortlistTotalCount === 0}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn btn-reflow preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
-                {#if view === "discover" && !viewHasFilter && !digestVisible && !effectiveDiscoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync")}>
+                {#if view === "discover" && !viewHasFilter && !digestVisible && !effectiveDiscoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync", undefined, { refreshDiscoverRun: true })}>
                   <ProfileField profileId={data.user?.profile_id} />
                   <button type="submit" class="btn btn-reflow preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
                     {#if isPending("sync")}<RefreshCw size={15} class="animate-spin" />{:else}<RefreshCw size={15} />{/if} Refresh recommendations
@@ -4725,7 +4743,7 @@
                     <h3 class="font-semibold text-surface-950-50">Restore a backup</h3>
                     <p class="mt-1 text-sm leading-6 text-surface-700-300">Restoring replaces the current database. Bookward first creates a safety backup of the current state.</p>
                     {#if data.backupStatus.backups.length}
-                      <form class="mt-4 space-y-3" method="POST" action="?/restoreBackup" use:enhance={setPending("restore-backup")}>
+                      <form class="mt-4 space-y-3" method="POST" action="?/restoreBackup" use:enhance={setPending("restore-backup", undefined, { refreshDiscoverRun: true })}>
                         <ProfileField profileId={data.user?.profile_id} />
                         <label class="block min-w-0 text-sm font-medium text-surface-800-200">Backup<select class="select mt-2 w-full" name="backupId" required>
                           {#each data.backupStatus.backups as backup (backup.id)}
@@ -5063,7 +5081,7 @@
                   <form
                     method="POST"
                     action="?/rebuildEmbeddings"
-                    use:enhance={setPending("rebuild-embeddings", undefined, { refreshDiscoverIfOffView: true })}
+                    use:enhance={setPending("rebuild-embeddings", undefined, { refreshDiscoverRun: true })}
                     class="w-full"
                   >
                     <ProfileField profileId={data.user?.profile_id} />

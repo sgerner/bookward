@@ -3018,4 +3018,135 @@ describe("page actions", () => {
       "http://127.0.0.1:8000/api/sources/default/toggle",
     );
   });
+
+  it("gates load run tracking on client invalidations and non-refresh POST fallbacks while allowing SSR Discover and no-JS refresh POSTs", async () => {
+    const overview = {
+      recommendation_run_id: "run-ssr-1",
+      recommendations: [],
+      decisions: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const fetchMock = vi.fn().mockImplementation(
+      () =>
+        new Response(JSON.stringify(overview), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    // 1. Shallow-routed client invalidation via query param on `/` must pass track_run=false
+    await load({
+      url: new URL("http://afterword.test/?x-sveltekit-invalidated=01"),
+      request: new Request("http://afterword.test/__data.json?x-sveltekit-invalidated=01"),
+      locals: { user: null },
+    } as never);
+
+    // 2. Client invalidation via header on `/` must pass track_run=false
+    await load({
+      url: new URL("http://afterword.test/"),
+      request: new Request("http://afterword.test/", {
+        headers: { "x-sveltekit-invalidated": "1" },
+      }),
+      locals: { user: null },
+    } as never);
+
+    // 3. Non-refresh no-JS POST fallback on `/` (e.g. ?/decide) must pass track_run=false
+    await load({
+      url: new URL("http://afterword.test/?/decide"),
+      request: new Request("http://afterword.test/?/decide", { method: "POST" }),
+      locals: { user: null },
+    } as never);
+
+    // 4. Initial SSR GET on `/` tracks Discover run (no track_run=false)
+    await load({
+      url: new URL("http://afterword.test/"),
+      request: new Request("http://afterword.test/", { method: "GET" }),
+      locals: { user: null },
+    } as never);
+
+    // 5. No-JS POST fallback for ?/runSync on `/` tracks fresh Discover run
+    await load({
+      url: new URL("http://afterword.test/?/runSync"),
+      request: new Request("http://afterword.test/?/runSync", { method: "POST" }),
+      locals: { user: null },
+    } as never);
+
+    const overviewCalls = fetchMock.mock.calls
+      .map(([input]) => String(input))
+      .filter((calledUrl) => calledUrl.includes("/api/overview"));
+    expect(overviewCalls).toHaveLength(5);
+    expect(overviewCalls[0]).toContain("track_run=false");
+    expect(overviewCalls[1]).toContain("track_run=false");
+    expect(overviewCalls[2]).toContain("track_run=false");
+    expect(overviewCalls[3]).not.toContain("track_run=false");
+    expect(overviewCalls[4]).not.toContain("track_run=false");
+  });
+
+  it("passes track_run=false when configureSourceFilters looks up an existing source without a submitted URL", async () => {
+    const overviewWithBuiltin = {
+      recommendations: [],
+      decisions: [],
+      history: [],
+      sources: [
+        {
+          id: 3,
+          label: "Built-in Picks",
+          url: "builtin://default",
+          kind: "builtin",
+          enabled: 1,
+        },
+      ],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(overviewWithBuiltin), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 3, job_id: "job-filter-3" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.set("id", "3");
+    body.set("includeGenres", "Science Fiction");
+    const result = await actions.configureSourceFilters!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toMatchObject({
+      message: "Source filters updated; a fresh scan is queued.",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/overview?recommendation_limit=1&decision_limit=1&track_run=false",
+    );
+  });
 });

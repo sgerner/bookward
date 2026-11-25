@@ -443,6 +443,20 @@ describe("+page.svelte UI form wiring & multi-click Discover session flow", () =
     expect(source.slice(importForms[0].start, importForms[0].end)).toContain(
       "use:enhance={setPending(",
     );
+
+    const refreshForms = forms.filter(
+      (form) =>
+        form.action === "?/runSync" ||
+        form.action === "?/rebuildEmbeddings" ||
+        form.action === "?/restoreBackup",
+    );
+    expect(refreshForms.length).toBe(4);
+    for (const form of refreshForms) {
+      expect(source.slice(form.start, form.end)).toContain(
+        "refreshDiscoverRun: true",
+      );
+    }
+    expect(source).not.toMatch(/optimisticBookStatus\([^)]*,\s*true\s*\)/);
   });
 
   it("executes a 5-click Discover triage + pagination + undo + Shortlist Librarr reload flow within 1 recommendation run", async () => {
@@ -838,8 +852,9 @@ describe("+page.svelte UI form wiring & multi-click Discover session flow", () =
     expect(loadCalls).toBe(1);
     expect(getAllBooks().find((b) => b.id === 26)?.status).toBe("recommended");
 
-    // Navigate to Shortlist (?view=saved) and submit `importLibrar` (non-localOnly -> triggers reload!)
-    currentViewUrl = new URL("http://afterword.test/?view=saved");
+    // Shallow-navigate via pushState to Shortlist (?view=saved) and submit `importLibrar`:
+    // SvelteKit keeps `current.url` at `/` and appends `?x-sveltekit-invalidated=01` when `update()` runs!
+    currentViewUrl = new URL("http://afterword.test/?x-sveltekit-invalidated=01");
     const importFd = new FormData();
     importFd.set("id", "1");
     importFd.set("run_id", "run-session-1");
@@ -862,8 +877,9 @@ describe("+page.svelte UI form wiring & multi-click Discover session flow", () =
         } as never),
     });
 
-    // Shortlist reload ran with track_run=false: STILL only 1 recommendation run total,
-    // overrides are clean, server "imported" status is authoritative, and Discover slice 26..32 survives!
+    // Shallow-routed Shortlist reload ran against `/?x-sveltekit-invalidated=01` with track_run=false:
+    // STILL only 1 recommendation run total, overrides are clean, server "imported" status is authoritative,
+    // and Discover slice 26..32 survives!
     expect(overviewRunCreations).toBe(1);
     expect(loadCalls).toBe(2);
     expect(state.bookStatusOverrides).toEqual({});
@@ -915,5 +931,45 @@ describe("+page.svelte UI form wiring & multi-click Discover session flow", () =
       data: { message: "Book added to the Librarr wishlist." },
     });
     expect(committedWithoutStatus).toEqual([]);
+  });
+
+  it("strips locally-read books from preserved Discover slices and resets localReadBookIds/localRecentReads on track_run=false reloads so readCount never double-counts", () => {
+    const initialBooks = [
+      { id: 1, status: "recommended", recommendation_run_id: "run-read-1" },
+      { id: 2, status: "recommended", recommendation_run_id: "run-read-1" },
+    ];
+    const state: DiscoverSessionState<(typeof initialBooks)[number]> = {
+      activeRunIdOverride: "run-read-1",
+      discoverSessionInitializedOverride: true,
+      clientDiscoverBooks: initialBooks,
+      additionalDiscoverBooks: [
+        { id: 25, status: "recommended", recommendation_run_id: "run-read-1" },
+      ],
+      sessionBooksById: {},
+      bookStatusOverrides: {},
+      committedBookStatuses: { 2: "read" },
+      localReadBookIds: new Set([2, 25]),
+      localRecentReads: [
+        { id: 501, title: "Read Two", author: "Author B", rating: 5 },
+      ],
+      discoverLoadedCountOverride: 25,
+      discoverHasMoreOverride: false,
+      discoverLoadError: "",
+    };
+
+    const reconciled = reconcileOverviewBooksReload({
+      state,
+      previousBooksSnapshot: initialBooks,
+      priorRunId: "run-read-1",
+      nextBooks: [{ id: 1, status: "recommended", recommendation_run_id: "" }],
+      nextDecisions: [],
+      nextRunId: "",
+    });
+
+    expect(reconciled).not.toBeNull();
+    expect(reconciled!.clientDiscoverBooks?.map((b) => b.id)).toEqual([1]);
+    expect(reconciled!.additionalDiscoverBooks).toEqual([]);
+    expect(reconciled!.localReadBookIds.size).toBe(0);
+    expect(reconciled!.localRecentReads).toEqual([]);
   });
 });

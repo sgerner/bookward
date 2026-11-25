@@ -23,6 +23,7 @@ export type OptimisticFactory = (formData: FormData) => OptimisticChange | void;
 
 export type PendingOptions = {
   localOnly?: boolean;
+  refreshDiscoverRun?: boolean;
   refreshDiscoverIfOffView?: boolean;
 };
 
@@ -316,6 +317,8 @@ export function reconcileOverviewBooksReload<T extends ReconcilableBook>(params:
       sessionBooksById: nextSessionBooks,
       bookStatusOverrides: {},
       committedBookStatuses: {},
+      localReadBookIds: new Set(),
+      localRecentReads: [],
       discoverLoadedCountOverride: nextLoadedCount,
     };
   }
@@ -436,6 +439,7 @@ export function createPendingSubmit(deps: {
   onResetReadingHistory?: () => void;
   onResetClientPagination?: () => void;
   onReloadFilteredLists?: () => void;
+  onRefreshDiscoverRun?: () => Promise<void>;
   onRefreshDiscoverIfOffView?: () => Promise<void>;
 }): SubmitFunction {
   const {
@@ -449,6 +453,7 @@ export function createPendingSubmit(deps: {
     onResetReadingHistory,
     onResetClientPagination,
     onReloadFilteredLists,
+    onRefreshDiscoverRun,
     onRefreshDiscoverIfOffView,
   } = deps;
 
@@ -487,7 +492,7 @@ export function createPendingSubmit(deps: {
         } else {
           await update({ reset: succeeded, navigate: false });
         }
-        if (succeeded && key === "sync") {
+        if (succeeded && (key === "sync" || key === "restore-backup")) {
           onResetClientPagination?.();
         }
         if (
@@ -496,7 +501,8 @@ export function createPendingSubmit(deps: {
             key.startsWith("shortlist-read-") ||
             key === "goodreads-rss" ||
             key === "csv-import" ||
-            key === "goodreads-csv")
+            key === "goodreads-csv" ||
+            key === "restore-backup")
         ) {
           onResetReadingHistory?.();
         }
@@ -505,6 +511,7 @@ export function createPendingSubmit(deps: {
           if (
             key === "sync" ||
             key === "rebuild-embeddings" ||
+            key === "restore-backup" ||
             key === "goodreads-rss" ||
             key === "csv-import" ||
             key === "goodreads-csv" ||
@@ -514,8 +521,8 @@ export function createPendingSubmit(deps: {
           ) {
             onReloadFilteredLists?.();
           }
-          if (options?.refreshDiscoverIfOffView) {
-            await onRefreshDiscoverIfOffView?.();
+          if (options?.refreshDiscoverRun || options?.refreshDiscoverIfOffView) {
+            await (onRefreshDiscoverRun ?? onRefreshDiscoverIfOffView)?.();
           }
         }
       } catch (error) {

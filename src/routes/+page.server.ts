@@ -194,7 +194,7 @@ const distinctGenres = (items: Array<{ genres: string[] }>) => {
   return [...seen.values()].sort((left, right) => left.localeCompare(right));
 };
 
-export const load: PageServerLoad = async ({ url, locals }) => {
+export const load: PageServerLoad = async ({ url, request, locals }) => {
   if (locals?.engineUnavailable) {
     throw httpError(503, "Bookward's recommendation engine is unavailable.");
   }
@@ -234,7 +234,16 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     recommendation_limit: "24",
     decision_limit: "24",
   });
-  if (!isDiscover) overviewParams.set("track_run", "false");
+  const isClientInvalidation =
+    url.searchParams.has("x-sveltekit-invalidated") ||
+    Boolean(request?.headers?.get("x-sveltekit-invalidated"));
+  const isPostFallbackWithoutRefresh =
+    request?.method === "POST" &&
+    !url.searchParams.has("/runSync") &&
+    !url.searchParams.has("/rebuildEmbeddings");
+  const shouldTrackRun =
+    isDiscover && !isClientInvalidation && !isPostFallbackWithoutRefresh;
+  if (!shouldTrackRun) overviewParams.set("track_run", "false");
   if (isDiscover && validDigestPeriod) {
     overviewParams.set("digest_period", validDigestPeriod);
   }
@@ -903,7 +912,7 @@ export const actions: Actions = {
     try {
       if (!targetUrl) {
         const overview = await engine<Overview>(
-          "/api/overview?recommendation_limit=1&decision_limit=1",
+          "/api/overview?recommendation_limit=1&decision_limit=1&track_run=false",
         );
         const existing = overview.sources.find((item) => item.id === id.data);
         if (!existing) return fail(404, { message: "Source not found." });

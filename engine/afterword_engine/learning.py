@@ -1144,15 +1144,25 @@ def sync_read_rating_in_connection(con, read: dict[str, Any]) -> dict[str, int]:
                 if run_id is not None
                 else None
             )
+            if impression is not None and not is_discovery_run_metadata(
+                impression["run_metadata"]
+            ):
+                impression = None
             if impression is None:
                 impression = con.execute(
-                    "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at "
+                    "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at,"
+                    "r.metadata AS run_metadata "
                     "FROM recommendation_outcomes o "
                     "JOIN recommendation_impressions i ON i.id=o.impression_id "
+                    "LEFT JOIN recommendation_runs r ON r.id=i.run_id "
                     "WHERE o.event_id=? AND o.read_id=? "
                     "ORDER BY o.id DESC LIMIT 1",
                     (event_id, read_id),
                 ).fetchone()
+                if impression is not None and not is_discovery_run_metadata(
+                    impression["run_metadata"]
+                ):
+                    impression = None
             existing_value = ev.get("value")
             value_changed = (existing_value is None) != (rating_value is None) or (
                 existing_value is not None
