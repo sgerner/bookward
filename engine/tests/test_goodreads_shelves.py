@@ -754,7 +754,8 @@ def test_migration_32_recovers_hidden_rows_preserving_user_feedback_dedupes_shel
             con_a.close()
         assert rescored[50][0] == "recommended" and rescored[50][1] > 0
         assert rescored[51] == ("rejected", 79.5)
-        assert rescored[52] == ("maybe_later", 81.0)
+        # #309 rescores deferred candidates; the migration must only preserve the user status.
+        assert rescored[52][0] == "maybe_later"
         assert rescored[53] == ("hidden", 0.0)
         assert rescored[54][0] == "recommended" and rescored[54][1] > 0
 
