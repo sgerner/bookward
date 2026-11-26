@@ -23,6 +23,7 @@ from .tenancy import ProfileDeletedError
 LOGGER = logging.getLogger(__name__)
 JOB_LEASE_SECONDS = 300
 JOB_HEARTBEAT_SECONDS = 30
+JOB_DEFERRED_HEARTBEAT_RETRY_SECONDS = 1.0
 JOB_REAPER_SECONDS = 30
 JOB_MAX_ATTEMPTS = 3
 PROFILE_RETRY_SECONDS = 60
@@ -147,6 +148,7 @@ def enqueue_job(kind: str, dedupe: bool = False):
         con.execute("INSERT INTO jobs(id,kind,status) VALUES(?,?,'queued')", (job_id, kind))
         return job_id
 
+
 def _claim_profile_job(
     profile_id: str,
     current: float,
@@ -163,6 +165,8 @@ def _claim_profile_job(
 
     with profile_scope(profile_id):
         lock = database_lock()
+        if lock.is_deleted:
+            raise ProfileDeletedError("Profile has been deleted")
         if lock.is_locked():
             return ("busy", None, None, None)
         recovered = False
@@ -262,16 +266,25 @@ def _fail_claimed_job(
 
 def _requeue_aborted_job(
     profile_id: str, job_id: str, lease_token: str, epoch: int
-) -> None:
+) -> bool:
+    """Return a cancelled job to ``queued`` without waiting on an exclusive lock."""
+
     from .tenancy import profile_scope
 
-    with profile_scope(profile_id), bind_restore_epoch(epoch), transaction() as con:
-        con.execute(
-            "UPDATE jobs SET status='queued',started_at=NULL,heartbeat_at=NULL,"
-            "lease_token=NULL,attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END "
-            "WHERE id=? AND status='running' AND lease_token=?",
-            (job_id, lease_token),
-        )
+    with (
+        profile_scope(profile_id),
+        database_lock().try_shared(allow_during_quiesce=True) as acquired,
+    ):
+        if not acquired:
+            return False
+        with bind_restore_epoch(epoch), transaction() as con:
+            updated = con.execute(
+                "UPDATE jobs SET status='queued',started_at=NULL,heartbeat_at=NULL,"
+                "lease_token=NULL,attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END "
+                "WHERE id=? AND status='running' AND lease_token=?",
+                (job_id, lease_token),
+            ).rowcount
+        return bool(updated)
 
 
 async def worker_loop(handler, stop):
@@ -317,12 +330,18 @@ async def worker_loop(handler, stop):
                         reset_profile_ready(profile_id)
                         profile_retry_after.pop(profile_id, None)
                         fenced_profiles.discard(profile_id)
-                    if current < profile_retry_after.get(profile_id, 0):
-                        if profile_id in fenced_profiles and not has_restore_journal(profile_id):
+                if current < profile_retry_after.get(profile_id, 0):
+                    if profile_id in fenced_profiles:
+                        has_journal = await asyncio.to_thread(
+                            has_restore_journal, profile_id
+                        )
+                        if not has_journal:
                             profile_retry_after.pop(profile_id, None)
                             fenced_profiles.discard(profile_id)
                         else:
                             continue
+                    else:
+                        continue
                 status, job, lease_token, epoch = await asyncio.to_thread(
                     _claim_profile_job,
                     profile_id,
@@ -338,6 +357,7 @@ async def worker_loop(handler, stop):
                     continue
                 worked = True
                 assert job is not None and lease_token is not None and epoch is not None
+                lease_started_monotonic = time.monotonic()
                 with profile_scope(profile_id), bind_restore_epoch(epoch):
                     heartbeat_stop = Event()
                     job_aborted = Event()
@@ -366,6 +386,9 @@ async def worker_loop(handler, stop):
                                     cancel_handler,
                                     epoch,
                                 ),
+                                kwargs={
+                                    "lease_started_monotonic": lease_started_monotonic,
+                                },
                                 name=f"job-heartbeat-{job['id'][:8]}",
                                 daemon=True,
                             )
@@ -384,12 +407,14 @@ async def worker_loop(handler, stop):
                                     reset_profile_ready(profile_id)
                             except asyncio.CancelledError:
                                 outer = asyncio.current_task()
-                                if not job_aborted.is_set() or (
-                                    outer is not None and outer.cancelling()
-                                ):
+                                outer_cancelling = (
+                                    outer is not None and outer.cancelling() > 0
+                                )
+                                if not job_aborted.is_set() or outer_cancelling:
                                     handler_task.cancel()
-                                    await asyncio.gather(handler_task, return_exceptions=True)
-                                    raise
+                                    await asyncio.gather(
+                                        handler_task, return_exceptions=True
+                                    )
                                 reset_profile_ready(profile_id)
                                 try:
                                     await asyncio.to_thread(
@@ -403,6 +428,17 @@ async def worker_loop(handler, stop):
                                     raise
                                 except RestoreEpochError:
                                     pass
+                                except asyncio.CancelledError:
+                                    if not outer_cancelling:
+                                        raise
+                                except Exception:
+                                    LOGGER.debug(
+                                        "Could not immediately requeue cancelled job %s",
+                                        job["id"],
+                                        exc_info=True,
+                                    )
+                                if not job_aborted.is_set() or outer_cancelling:
+                                    raise
                             except ProfileDeletedError:
                                 raise
                             except RestoreEpochError:
@@ -425,11 +461,15 @@ async def worker_loop(handler, stop):
                                     reset_profile_ready(profile_id)
                             finally:
                                 heartbeat_stop.set()
-                                try:
-                                    await asyncio.to_thread(heartbeat.join)
-                                except asyncio.CancelledError:
+                                outer = asyncio.current_task()
+                                if outer is not None and outer.cancelling() > 0:
                                     heartbeat.join(timeout=1.0)
-                                    raise
+                                else:
+                                    try:
+                                        await asyncio.to_thread(heartbeat.join)
+                                    except asyncio.CancelledError:
+                                        heartbeat.join(timeout=1.0)
+                                        raise
                     finally:
                         _ACTIVE_JOB_CONTEXT.reset(job_token)
             except ProfileDeletedError:
@@ -441,7 +481,13 @@ async def worker_loop(handler, stop):
                 reset_profile_ready(profile_id)
             except Exception:
                 reset_profile_ready(profile_id)
-                if has_restore_journal(profile_id):
+                try:
+                    has_journal = await asyncio.to_thread(
+                        has_restore_journal, profile_id
+                    )
+                except Exception:
+                    has_journal = False
+                if has_journal:
                     fenced_profiles.add(profile_id)
                 profile_retry_after[profile_id] = current + PROFILE_RETRY_SECONDS
                 LOGGER.exception("Worker skipped unavailable profile %s", profile_id)
@@ -457,18 +503,61 @@ def _heartbeat(
     stop: Event,
     on_lost_lease=None,
     expected_epoch: int | None = None,
+    *,
+    lease_started_monotonic: float | None = None,
 ) -> None:
-    """Keep a live job leased so another worker cannot mistake it for a crash."""
+    """Keep a live job leased so another worker cannot mistake it for a crash.
+
+    When an exclusive profile lock defers renewal, ``try_shared()`` avoids
+    piling up blocked SQLite connections and retries every
+    ``JOB_DEFERRED_HEARTBEAT_RETRY_SECONDS`` so normal restores renew as soon
+    as cutover finishes.  If the lock outlives ``JOB_LEASE_SECONDS``, the lease
+    can no longer be guaranteed against ``_reap_abandoned_jobs()``, so
+    ``on_lost_lease`` cancels the in-flight handler before another worker can
+    execute a duplicate copy.
+    """
 
     from .tenancy import profile_scope
 
-    while not stop.wait(JOB_HEARTBEAT_SECONDS):
+    last_renewed_monotonic = (
+        time.monotonic()
+        if lease_started_monotonic is None
+        else lease_started_monotonic
+    )
+    last_deferred_log_monotonic: float | None = None
+    wait_seconds: float = min(JOB_HEARTBEAT_SECONDS, max(0.0, JOB_LEASE_SECONDS))
+
+    while not stop.wait(wait_seconds):
         try:
             with profile_scope(profile_id), database_lock().try_shared() as acquired:
                 if not acquired:
-                    LOGGER.info(
-                        "Deferred lease renewal for job %s while profile database lock is held",
-                        job_id,
+                    now_monotonic = time.monotonic()
+                    if now_monotonic - last_renewed_monotonic >= JOB_LEASE_SECONDS:
+                        LOGGER.warning(
+                            "Lease expired for job %s while profile database lock was held; cancelling active handler",
+                            job_id,
+                        )
+                        if on_lost_lease is not None:
+                            on_lost_lease()
+                        return
+                    if (
+                        last_deferred_log_monotonic is None
+                        or now_monotonic - last_deferred_log_monotonic
+                        >= JOB_HEARTBEAT_SECONDS
+                    ):
+                        LOGGER.info(
+                            "Deferred lease renewal for job %s while profile database lock is held",
+                            job_id,
+                        )
+                        last_deferred_log_monotonic = now_monotonic
+                    remaining_lease = max(
+                        0.0,
+                        JOB_LEASE_SECONDS - (now_monotonic - last_renewed_monotonic),
+                    )
+                    wait_seconds = min(
+                        JOB_HEARTBEAT_SECONDS,
+                        JOB_DEFERRED_HEARTBEAT_RETRY_SECONDS,
+                        remaining_lease,
                     )
                     continue
                 with bind_restore_epoch(expected_epoch), transaction() as con:
@@ -482,9 +571,26 @@ def _heartbeat(
                 on_lost_lease()
             return
         except Exception:
+            now_monotonic = time.monotonic()
+            if now_monotonic - last_renewed_monotonic >= JOB_LEASE_SECONDS:
+                LOGGER.warning(
+                    "Lease expired for job %s after renewal errors; cancelling active handler",
+                    job_id,
+                )
+                if on_lost_lease is not None:
+                    on_lost_lease()
+                return
             LOGGER.exception("Could not renew lease for job %s", job_id)
+            wait_seconds = min(
+                JOB_HEARTBEAT_SECONDS,
+                JOB_DEFERRED_HEARTBEAT_RETRY_SECONDS,
+                max(0.0, JOB_LEASE_SECONDS - (now_monotonic - last_renewed_monotonic)),
+            )
             continue
         if not updated:
             if on_lost_lease is not None:
                 on_lost_lease()
             return
+        last_renewed_monotonic = time.monotonic()
+        last_deferred_log_monotonic = None
+        wait_seconds = min(JOB_HEARTBEAT_SECONDS, max(0.0, JOB_LEASE_SECONDS))

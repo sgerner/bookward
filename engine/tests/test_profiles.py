@@ -1663,6 +1663,522 @@ def test_exclusive_profile_lock_waits_for_open_connections(identity_store):
         restore.result(timeout=2)
 
 
+def test_event_loop_timer_stays_responsive_during_exclusive_profile_lock(
+    identity_store, monkeypatch
+):
+    monkeypatch.setattr("afterword_engine.main.SCHEDULER_INITIAL_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr("afterword_engine.main.SCHEDULER_POLL_SECONDS", 0.1)
+    alice = profiles.create_account("timer-alice", "timer-alice-password-long")
+    bob = profiles.create_account("timer-bob", "timer-bob-password-long")
+    for account, kind in ((alice, "alice_job"), (bob, "bob_job")):
+        with profile_scope(account["profile_id"]):
+            initialize(seed_demo=False)
+            enqueue_job(kind)
+
+    alice_path = profile_database_path(alice["profile_id"])
+    lock_acquired = Event()
+    release_lock = Event()
+
+    def hold_exclusive_lock():
+        with database_lock(alice_path):
+            lock_acquired.set()
+            release_lock.wait(timeout=5)
+
+    def contended_alice_read():
+        with profile_scope(alice["profile_id"]), connect() as con:
+            return con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+    from afterword_engine.main import (
+        digest_scheduler_loop,
+        goodreads_rss_scheduler_loop,
+        source_scheduler_loop,
+    )
+
+    handled: list[tuple[str | None, str]] = []
+    bob_done = asyncio.Event()
+    alice_done = asyncio.Event()
+    stop = asyncio.Event()
+
+    async def handler(kind: str):
+        owner = current_profile_id()
+        handled.append((owner, kind))
+        if kind == "bob_job":
+            bob_done.set()
+        elif kind == "alice_job":
+            alice_done.set()
+            stop.set()
+        return {"kind": kind}
+
+    async def run_scenario():
+        lock_thread = Thread(target=hold_exclusive_lock, daemon=True)
+        lock_thread.start()
+        assert await asyncio.to_thread(lock_acquired.wait, 2)
+
+        tick_durations: list[float] = []
+        measure_ticks = True
+
+        async def timer_probe():
+            loop = asyncio.get_running_loop()
+            while measure_ticks:
+                started_at = loop.time()
+                await asyncio.sleep(0.05)
+                tick_durations.append(loop.time() - started_at)
+
+        background_tasks = [
+            asyncio.create_task(worker_loop(handler, stop)),
+            asyncio.create_task(source_scheduler_loop(stop)),
+            asyncio.create_task(digest_scheduler_loop(stop)),
+            asyncio.create_task(goodreads_rss_scheduler_loop(stop)),
+            asyncio.create_task(backups.backup_scheduler_loop(stop)),
+        ]
+        probe_task = asyncio.create_task(timer_probe())
+        alice_read_task = asyncio.create_task(asyncio.to_thread(contended_alice_read))
+        try:
+            await asyncio.wait_for(bob_done.wait(), timeout=2)
+            # Hold the exclusive lock across at least one full 0.5s worker poll.
+            await asyncio.sleep(0.65)
+            assert not alice_done.is_set()
+            assert not alice_read_task.done()
+            assert len(tick_durations) >= 10
+            assert max(tick_durations) < 0.25
+
+            release_lock.set()
+            # Locked profiles must skip without PROFILE_RETRY_SECONDS (60s) backoff.
+            await asyncio.wait_for(alice_done.wait(), timeout=2)
+            assert await asyncio.wait_for(alice_read_task, timeout=2) >= 1
+        finally:
+            release_lock.set()
+            measure_ticks = False
+            stop.set()
+            await asyncio.gather(probe_task, *background_tasks, return_exceptions=True)
+            await asyncio.to_thread(lock_thread.join, 2)
+
+    asyncio.run(run_scenario())
+    assert [
+        item for item in handled if item[1] in {"bob_job", "alice_job"}
+    ] == [
+        (bob["profile_id"], "bob_job"),
+        (alice["profile_id"], "alice_job"),
+    ]
+
+
+def test_try_shared_releases_condition_before_yielding(identity_store):
+    alice = profiles.create_account("try-shared-alice", "try-shared-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+    alice_path = profile_database_path(alice["profile_id"])
+    lock = database_lock(alice_path)
+
+    with lock.try_shared() as acquired:
+        assert acquired is True
+        assert not lock._condition._is_owned()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(lock.is_locked).result(timeout=2) is False
+
+    lock_held = Event()
+    release_lock = Event()
+
+    def hold_exclusive():
+        with lock:
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    holder = Thread(target=hold_exclusive, daemon=True)
+    holder.start()
+    try:
+        assert lock_held.wait(timeout=2)
+        with lock.try_shared() as acquired:
+            assert acquired is False
+            assert not lock._condition._is_owned()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                assert executor.submit(lock.is_locked).result(timeout=2) is True
+    finally:
+        release_lock.set()
+        holder.join(timeout=2)
+
+
+def test_worker_heartbeat_logs_deferred_lease_renewal_when_profile_locked(
+    identity_store, monkeypatch, caplog
+):
+    import logging
+
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    alice = profiles.create_account("hb-alice", "hb-alice-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("read_metadata")
+
+    status, claimed_job, lease_token, claimed_epoch = jobs._claim_profile_job(
+        alice["profile_id"],
+        time.monotonic(),
+        {alice["profile_id"]},
+        {alice["profile_id"]: 0},
+        {},
+        {alice["profile_id"]: time.monotonic()},
+        {},
+        set(),
+    )
+    assert (
+        status == "claimed"
+        and claimed_job is not None
+        and lease_token is not None
+        and claimed_epoch == 0
+    )
+    assert claimed_job["id"] == job_id
+
+    alice_path = profile_database_path(alice["profile_id"])
+    lock_held = Event()
+    release_lock = Event()
+    hb_stop = Event()
+
+    def hold_exclusive():
+        with database_lock(alice_path):
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    holder = Thread(target=hold_exclusive, daemon=True)
+    holder.start()
+    heartbeat = Thread(
+        target=jobs._heartbeat,
+        args=(alice["profile_id"], job_id, lease_token, hb_stop),
+        daemon=True,
+    )
+    try:
+        assert lock_held.wait(timeout=2)
+        with caplog.at_level(logging.INFO, logger="afterword_engine.jobs"):
+            heartbeat.start()
+            deadline = time.monotonic() + 2.0
+            while (
+                f"Deferred lease renewal for job {job_id}" not in caplog.text
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            hb_stop.set()
+            heartbeat.join(timeout=2)
+    finally:
+        hb_stop.set()
+        release_lock.set()
+        holder.join(timeout=2)
+
+    assert (
+        f"Deferred lease renewal for job {job_id} while profile database lock is held"
+        in caplog.text
+    )
+
+
+def test_deferred_heartbeat_cancels_live_job_at_lease_expiry_before_duplicate_reap(
+    identity_store, monkeypatch, caplog
+):
+    import logging
+
+    monkeypatch.setattr(jobs, "JOB_LEASE_SECONDS", 0.12)
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    monkeypatch.setattr(jobs, "JOB_DEFERRED_HEARTBEAT_RETRY_SECONDS", 0.02)
+    monkeypatch.setattr(jobs, "JOB_REAPER_SECONDS", 0.02)
+
+    alice = profiles.create_account("hb-bound-alice", "hb-bound-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("lease_bound_check")
+
+    alice_path = profile_database_path(alice["profile_id"])
+    first_started = Event()
+    first_cancelled = Event()
+    lock_held = Event()
+    release_lock = Event()
+    stop = asyncio.Event()
+    active_count = 0
+    max_concurrent = 0
+    attempts_seen = 0
+
+    def hold_long_exclusive_lock():
+        with database_lock(alice_path):
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    async def handler(kind: str):
+        nonlocal active_count, max_concurrent, attempts_seen
+        assert kind == "lease_bound_check"
+        attempts_seen += 1
+        active_count += 1
+        max_concurrent = max(max_concurrent, active_count)
+        try:
+            if attempts_seen == 1:
+                first_started.set()
+                await asyncio.Event().wait()
+            stop.set()
+            return {"attempt": attempts_seen}
+        except asyncio.CancelledError:
+            first_cancelled.set()
+            raise
+        finally:
+            active_count -= 1
+
+    async def run_scenario():
+        worker = asyncio.create_task(worker_loop(handler, stop))
+        holder = Thread(target=hold_long_exclusive_lock, daemon=True)
+        try:
+            assert await asyncio.to_thread(first_started.wait, 2)
+            holder.start()
+            assert await asyncio.to_thread(lock_held.wait, 2)
+            # Hold the lock past JOB_LEASE_SECONDS (0.12s); _heartbeat must
+            # cancel the live handler before releasing the lock so the reaper
+            # can never start a second copy concurrently.
+            assert await asyncio.to_thread(first_cancelled.wait, 2)
+            with profile_scope(alice["profile_id"]):
+                assert database_lock(alice_path).is_locked()
+            release_lock.set()
+            await asyncio.to_thread(holder.join, 2)
+            await asyncio.wait_for(worker, timeout=3)
+        finally:
+            release_lock.set()
+            stop.set()
+            await asyncio.gather(worker, return_exceptions=True)
+            if holder.is_alive():
+                await asyncio.to_thread(holder.join, 2)
+
+    with caplog.at_level(logging.WARNING, logger="afterword_engine.jobs"):
+        asyncio.run(run_scenario())
+
+    assert (
+        f"Lease expired for job {job_id} while profile database lock was held; cancelling active handler"
+        in caplog.text
+    )
+    assert max_concurrent == 1
+    assert attempts_seen == 2
+    with profile_scope(alice["profile_id"]), connect() as con:
+        final_job = con.execute(
+            "SELECT status,attempts,result FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert final_job["status"] == "complete"
+    assert final_job["attempts"] == 2
+    assert final_job["result"] == '{"attempt": 2}'
+
+
+def test_quiesce_requeues_active_worker_job_and_times_out_on_stuck_connection(
+    identity_store,
+):
+    alice = profiles.create_account("quiesce-alice", "quiesce-alice-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("quiesce_job")
+
+    alice_path = profile_database_path(alice["profile_id"])
+    lock = database_lock(alice_path)
+    job_started = Event()
+    job_cancelled = Event()
+    quiesced_and_locked = Event()
+    stop = asyncio.Event()
+
+    async def blocking_async_handler(kind: str):
+        assert kind == "quiesce_job"
+        job_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            job_cancelled.set()
+            raise
+
+    def run_quiesce_and_exclusive():
+        with lock.quiesce(timeout=2.0) as deadline, lock.exclusive(deadline):
+            quiesced_and_locked.set()
+
+    async def run_quiesce_scenario():
+        worker = asyncio.create_task(worker_loop(blocking_async_handler, stop))
+        try:
+            assert await asyncio.to_thread(job_started.wait, 2)
+            # Pause worker from re-claiming once restore finishes so we can inspect the row.
+            stop.set()
+            await asyncio.to_thread(run_quiesce_and_exclusive)
+            assert job_cancelled.is_set()
+            assert quiesced_and_locked.is_set()
+            await asyncio.wait_for(worker, timeout=2)
+        finally:
+            stop.set()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    asyncio.run(run_quiesce_scenario())
+    with profile_scope(alice["profile_id"]), connect() as con:
+        requeued = con.execute(
+            "SELECT status,attempts,lease_token FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert requeued["status"] == "queued"
+    assert requeued["attempts"] == 0
+    assert requeued["lease_token"] is None
+
+    # A stuck open connection must cause lock.exclusive(deadline) to fail with BackupError
+    # after the quiescence timeout and leave the profile lock cleanly released.
+    with profile_scope(alice["profile_id"]):
+        stuck = connect()
+        try:
+            with pytest.raises(
+                backups.BackupError, match="could not be safely closed for restore"
+            ):
+                with lock.quiesce(timeout=0.05) as deadline, lock.exclusive(deadline):
+                    pass
+            assert not lock.is_locked()
+            assert not lock.is_restoring()
+        finally:
+            stuck.close()
+
+
+def test_real_handle_job_offloads_sync_db_work_and_supports_cancellation(
+    identity_store, monkeypatch
+):
+    from afterword_engine.main import handle_job
+
+    alice = profiles.create_account("real-job-alice", "real-job-alice-password-long")
+    bob = profiles.create_account("real-job-bob", "real-job-bob-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,?,?,?)",
+                (
+                    "The Left Hand of Darkness",
+                    "Ursula K. Le Guin",
+                    5,
+                    "9780441478125",
+                    "test",
+                ),
+            )
+        alice_job_id = enqueue_job("read_metadata")
+
+    with profile_scope(bob["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,?,?,?)",
+                ("Kindred", "Octavia E. Butler", 5, "9780807083697", "test"),
+            )
+        bob_job_id = enqueue_job("read_metadata")
+
+    alice_path = profile_database_path(alice["profile_id"])
+    alice_lookup_entered = Event()
+    release_alice_lookup = asyncio.Event()
+    cancel_lookup_entered = Event()
+    lock_acquired = Event()
+    release_lock = Event()
+    pause_cancel_lookup = False
+
+    async def fake_resolve_book_metadata(title, author, **_kwargs):
+        if title == "The Left Hand of Darkness":
+            alice_lookup_entered.set()
+            await release_alice_lookup.wait()
+        elif pause_cancel_lookup and title == "Parable of the Sower":
+            cancel_lookup_entered.set()
+            await asyncio.Event().wait()
+        return {}
+
+    monkeypatch.setattr(
+        "afterword_engine.ingestion.resolve_book_metadata",
+        fake_resolve_book_metadata,
+    )
+
+    def hold_exclusive_lock():
+        with database_lock(alice_path):
+            lock_acquired.set()
+            release_lock.wait(timeout=5)
+
+    def job_status(profile_id: str, job_id: str) -> str:
+        with profile_scope(profile_id), connect() as con:
+            found = con.execute(
+                "SELECT status FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            return str(found["status"]) if found else ""
+
+    async def run_real_worker():
+        nonlocal pause_cancel_lookup
+        stop = asyncio.Event()
+        worker = asyncio.create_task(worker_loop(handle_job, stop))
+        tick_durations: list[float] = []
+        measure_ticks = True
+
+        async def timer_probe():
+            loop = asyncio.get_running_loop()
+            while measure_ticks:
+                started_at = loop.time()
+                await asyncio.sleep(0.05)
+                tick_durations.append(loop.time() - started_at)
+
+        probe_task = asyncio.create_task(timer_probe())
+        lock_thread = Thread(target=hold_exclusive_lock, daemon=True)
+        try:
+            assert await asyncio.to_thread(alice_lookup_entered.wait, 3)
+            # Lock Alice's DB while handle_job("read_metadata") is mid-HTTP lookup,
+            # then let the lookup return so _persist_read_metadata_attempt hits
+            # database_lock(alice_path). It must wait in a worker thread rather
+            # than blocking the event loop.
+            lock_thread.start()
+            assert await asyncio.to_thread(lock_acquired.wait, 2)
+            release_alice_lookup.set()
+
+            await asyncio.sleep(0.35)
+            assert len(tick_durations) >= 5
+            assert max(tick_durations) < 0.25
+
+            release_lock.set()
+            await asyncio.to_thread(lock_thread.join, 2)
+
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                alice_state = await asyncio.to_thread(
+                    job_status, alice["profile_id"], alice_job_id
+                )
+                bob_state = await asyncio.to_thread(
+                    job_status, bob["profile_id"], bob_job_id
+                )
+                if alice_state == "complete" and bob_state == "complete":
+                    break
+                await asyncio.sleep(0.05)
+            assert alice_state == "complete"
+            assert bob_state == "complete"
+
+            # Verify cancelling an in-flight worker task cancels handle_job cleanly
+            # and immediately returns the interrupted job to queued without waiting
+            # for the 300s lease reaper.
+            pause_cancel_lookup = True
+            with profile_scope(bob["profile_id"]):
+                with transaction() as con:
+                    con.execute(
+                        "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,?,?,?)",
+                        (
+                            "Parable of the Sower",
+                            "Octavia E. Butler",
+                            5,
+                            "9780446675505",
+                            "test",
+                        ),
+                    )
+                cancelled_job_id = enqueue_job("read_metadata")
+
+            assert await asyncio.to_thread(cancel_lookup_entered.wait, 3)
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+            with profile_scope(bob["profile_id"]), connect() as con:
+                cancelled_row = con.execute(
+                    "SELECT status,attempts,lease_token FROM jobs WHERE id=?",
+                    (cancelled_job_id,),
+                ).fetchone()
+            assert cancelled_row["status"] == "queued"
+            assert cancelled_row["attempts"] == 0
+            assert cancelled_row["lease_token"] is None
+        finally:
+            release_lock.set()
+            release_alice_lookup.set()
+            measure_ticks = False
+            stop.set()
+            if not worker.done():
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+            await asyncio.gather(probe_task, return_exceptions=True)
+            if lock_thread.is_alive():
+                await asyncio.to_thread(lock_thread.join, 2)
+
+    asyncio.run(run_real_worker())
+
+
 def test_heartbeat_zero_row_update_cancels_handler_and_resets_ready_profiles_on_restore(
     identity_store, monkeypatch
 ):

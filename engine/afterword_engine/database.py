@@ -1969,7 +1969,7 @@ class _ProfileDatabaseLock:
             self.release_connection(owner)
 
     @contextmanager
-    def try_shared(self):
+    def try_shared(self, *, allow_during_quiesce: bool = False):
         owner = threading.get_ident()
         with self._condition:
             if self._deleted:
@@ -1977,8 +1977,13 @@ class _ProfileDatabaseLock:
             owns_connection = self._connections_by_thread.get(owner, 0) > 0
             if self._closing_for_delete and self._writer != owner and not owns_connection:
                 raise ProfileDeletedError("Profile has been deleted")
+            restoring_blocked = (
+                self._restoring_count > 0
+                and self._writer != owner
+                and not allow_during_quiesce
+            )
             if (
-                (self._restoring_count > 0 and self._writer != owner)
+                restoring_blocked
                 or self._writer not in (None, owner)
                 or (
                     self._waiting_writers
