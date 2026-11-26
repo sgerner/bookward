@@ -691,4 +691,57 @@ describe("batched reading-history score buffering and sorting", () => {
       [20, 20],
     ]);
   });
+
+  it("keeps dated reads ahead of undated past reads under recent, oldest, and pending score sorts", () => {
+    const items = [
+      {
+        id: 10,
+        title: "Undated Newer Import",
+        rating: null,
+        read_at: null,
+        created_at: "2026-06-01T12:00:00Z",
+        algorithm_score: null,
+      },
+      {
+        id: 11,
+        title: "Dated Older Read",
+        rating: 4,
+        read_at: "2024-02-10",
+        created_at: "2026-01-01T00:00:00Z",
+        algorithm_score: null,
+      },
+      {
+        id: 12,
+        title: "Dated Newer Read",
+        rating: 5,
+        read_at: "2025-09-15",
+        created_at: "2026-01-02T00:00:00Z",
+        algorithm_score: null,
+      },
+      {
+        id: 13,
+        title: "Undated Older Import",
+        rating: 3,
+        read_at: "",
+        created_at: "2026-05-01T12:00:00Z",
+        algorithm_score: null,
+      },
+    ];
+
+    expect(sortReadingHistory(items, "recent").map((item) => item.id)).toEqual([
+      12,
+      11,
+      10,
+      13,
+    ]);
+    expect(sortReadingHistory(items, "oldest").map((item) => item.id)).toEqual([
+      11,
+      12,
+      13,
+      10,
+    ]);
+    expect(
+      sortReadingHistory(items, "score_high", true).map((item) => item.id),
+    ).toEqual([12, 11, 10, 13]);
+  });
 });
