@@ -1035,8 +1035,8 @@ def test_goodreads_shelf_delete_and_reset_purge_evidence_while_preserving_feedba
             [0.75, 0.35, 0.15],
         )
         con.executemany(
-            "INSERT INTO goodreads_shelf_items(shelf,title,author,isbn,added_at) "
-            "VALUES(?,?,?,?,?)",
+            "INSERT INTO goodreads_shelf_items(shelf,source,title,author,isbn,added_at) "
+            "VALUES(?,'goodreads_rss',?,?,?,?)",
             [
                 (
                     "to-read",
@@ -1175,8 +1175,8 @@ def test_goodreads_shelf_delete_and_reset_purge_evidence_while_preserving_feedba
     with transaction() as con:
         con.execute("UPDATE candidates SET status='new', score=0.0 WHERE id=?", (boosted_id,))
         con.execute(
-            "INSERT INTO goodreads_shelf_items(shelf,title,author,isbn) "
-            "VALUES('to-read','Different Edition Title','S. Shelf','9780593135204')"
+            "INSERT INTO goodreads_shelf_items(shelf,source,title,author,isbn) "
+            "VALUES('to-read','goodreads_rss','Different Edition Title','S. Shelf','9780593135204')"
         )
     assert asyncio.run(score_all(embedder=_CachedEmbedder())) == 2
     with connect() as con:
