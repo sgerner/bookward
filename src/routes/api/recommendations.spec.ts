@@ -36,9 +36,13 @@ const PAGE_BOOK_KEYS = [
   "metadata_confidence",
   "published_kind",
   "published_on",
+  "quality_status",
   "reason",
   "recommendation_run_id",
   "score",
+  "source_enabled",
+  "source_id",
+  "source_name",
   "source_url",
   "status",
   "synopsis",
@@ -97,6 +101,10 @@ describe("recommendations endpoint", () => {
           author: "A Writer",
           cover_url: "https://covers.example/book.jpg",
           source_url: "https://books.example/book",
+          source_id: 3,
+          source_name: "A source",
+          source_enabled: true,
+          quality_status: null,
           published_on: "2026-10-01",
           published_kind: "day",
           genres: ["Fantasy"],
@@ -147,6 +155,10 @@ describe("recommendations endpoint", () => {
       author: "A Writer",
       cover_url: "",
       source_url: "",
+      source_id: null,
+      source_name: "A source",
+      source_enabled: true,
+      quality_status: null,
       published_on: null,
       published_kind: "unknown",
       genres: ["Mystery"],
@@ -298,6 +310,45 @@ describe("recommendations endpoint", () => {
       Array.from({ length: 24 }, (_, index) => index + 1),
     );
     expect(payload.has_more).toBe(true);
+  });
+
+  it("maps maybe_later slice items and preserves source_enabled flags", async () => {
+    engineMock.mockResolvedValue([
+      {
+        ...recommendation(12),
+        status: "maybe_later",
+        source_enabled: false,
+      },
+      {
+        ...recommendation(13),
+        status: "maybe_later",
+        source_enabled: true,
+      },
+    ]);
+
+    const response = await GET({
+      url: new URL(
+        "http://bookward.test/api/recommendations?status=maybe_later&limit=24&offset=0",
+      ),
+    } as never);
+    const payload = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(engineMock).toHaveBeenCalledWith(
+      "/api/recommendations?status=maybe_later&limit=25&offset=0",
+    );
+    expect(payload.items).toEqual([
+      expect.objectContaining({
+        id: 12,
+        status: "maybe_later",
+        source_enabled: false,
+      }),
+      expect.objectContaining({
+        id: 13,
+        status: "maybe_later",
+        source_enabled: true,
+      }),
+    ]);
   });
 
   it("forwards trimmed search and genre filters across unread and decision statuses", async () => {
