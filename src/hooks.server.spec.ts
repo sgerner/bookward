@@ -876,6 +876,51 @@ describe('authentication boundary', () => {
 		});
 	});
 
+	it('enforces same-origin, profile_id binding, and 503 outage fail-closed on /auth/oidc/start?intent=enroll', async () => {
+		mockSessionLookup('alice-profile');
+
+		const crossSite = new Request(
+			'http://afterword.test/auth/oidc/start?intent=enroll&profile_id=alice-profile',
+			{ headers: { 'sec-fetch-site': 'cross-site' } }
+		);
+		const crossSiteResponse = await handle({
+			event: eventFor(crossSite, 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+		expect(crossSiteResponse.status).toBe(403);
+
+		const wrongProfile = new Request(
+			'http://afterword.test/auth/oidc/start?intent=enroll&profile_id=other-profile',
+			{ headers: { 'sec-fetch-site': 'same-origin' } }
+		);
+		const wrongProfileResponse = await handle({
+			event: eventFor(wrongProfile, 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+		expect(wrongProfileResponse.status).toBe(409);
+
+		const validEnroll = new Request(
+			'http://afterword.test/auth/oidc/start?intent=enroll&profile_id=alice-profile',
+			{ headers: { 'sec-fetch-site': 'same-origin' } }
+		);
+		const validResponse = await handle({
+			event: eventFor(validEnroll, 'valid-session'),
+			resolve: vi.fn(() => Promise.resolve(new Response('ok', { status: 302 })))
+		} as never);
+		expect(validResponse.status).toBe(302);
+
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+		const outageEnroll = new Request(
+			'http://afterword.test/auth/oidc/start?intent=enroll&profile_id=alice-profile',
+			{ headers: { 'sec-fetch-site': 'same-origin' } }
+		);
+		const outageResponse = await handle({
+			event: eventFor(outageEnroll, 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+		expect(outageResponse.status).toBe(503);
+	});
+
 	it('allows POST /auth/logout to clear bookward_session and redirect 303 during an engine outage', async () => {
 		vi.stubEnv('ORIGIN', 'http://afterword.test');
 		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed: ECONNREFUSED')));
