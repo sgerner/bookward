@@ -881,6 +881,8 @@ def import_csv(content: bytes) -> dict[str, int | str]:
             for name in reader.fieldnames
         ]
     source = _detect_csv_source(reader.fieldnames)
+    shelf_header = "Read Status" if source == "storygraph_csv" else "Exclusive Shelf"
+    has_shelf_column = shelf_header in (reader.fieldnames or [])
     count = 0
     batches: list[tuple[str, list[tuple]]] = []
     try:
@@ -941,16 +943,30 @@ def import_csv(content: bytes) -> dict[str, int | str]:
     except csv.Error as exc:
         raise ValueError("CSV is malformed") from exc
     from .learning import attribute_read_outcomes
+    has_shelf_rows = any(kind == "shelf" for kind, _ in batches)
     with transaction() as con:
         if count > 0:
             purge_demo_reads(con)
+        previous_shelf_rows: list[dict] = []
+        if has_shelf_rows or (has_shelf_column and count == 0):
+            previous_shelf_rows = [
+                dict(row)
+                for row in con.execute(
+                    "SELECT shelf, title, author, additional_authors, isbn, openlibrary_work_id "
+                    "FROM goodreads_shelf_items WHERE source IN ('goodreads_csv', 'legacy')"
+                ).fetchall()
+            ]
+            con.execute(
+                "DELETE FROM goodreads_shelf_items WHERE source IN ('goodreads_csv', 'legacy')"
+            )
         for kind, values in batches:
             if kind == "shelf":
                 con.executemany(
                     "INSERT INTO goodreads_shelf_items("
-                    "shelf, title, author, additional_authors, isbn, added_at"
-                    ") VALUES(?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(shelf, title, author) DO UPDATE SET "
+                    "shelf, source, title, author, additional_authors, isbn, added_at"
+                    ") VALUES(?, 'goodreads_csv', ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(source, title, author) DO UPDATE SET "
+                    "shelf=excluded.shelf, "
                     "additional_authors=COALESCE(NULLIF(excluded.additional_authors, ''), "
                     "goodreads_shelf_items.additional_authors), "
                     "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
@@ -982,6 +998,8 @@ def import_csv(content: bytes) -> dict[str, int | str]:
                 "isbn=COALESCE(excluded.isbn,reads.isbn)",
                 values,
             )
+        if previous_shelf_rows:
+            purge_deleted_shelf_evidence(con, previous_shelf_rows)
         # Importing a history is also the point at which naturally supplied
         # ratings can become outcomes for recommendations shown earlier. Import
         # lazily to keep the ingestion module independent of the telemetry
@@ -2270,6 +2288,8 @@ def goodreads_shelf_rss_url(read_rss_url: str, shelf: str) -> str:
 
 DEFAULT_GOODREADS_SHELVES: tuple[str, ...] = ("to-read", "currently-reading")
 GoodreadsShelfRow = tuple[str, str, str, str | None, str | None]
+_PRIVATE_GOODREADS_SHELF = "private_shelf"
+GoodreadsShelfFetchResult = list[GoodreadsShelfRow] | str | None
 
 
 def _parse_goodreads_shelf_rows(shelf: str, content: bytes) -> list[GoodreadsShelfRow]:
@@ -2283,7 +2303,7 @@ def _parse_goodreads_shelf_rows(shelf: str, content: bytes) -> list[GoodreadsShe
         ).strip()[:300]
         if not title:
             continue
-        isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip()[:32] or None
+        isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip('="')[:32] or None
         shelf_rows.append(
             (
                 shelf,
@@ -2300,10 +2320,15 @@ async def _fetch_goodreads_shelf(
     read_rss_url: str,
     shelf: str,
     client: httpx.AsyncClient,
-) -> list[GoodreadsShelfRow] | None:
+) -> GoodreadsShelfFetchResult:
     try:
         shelf_url = goodreads_shelf_rss_url(read_rss_url, shelf)
         content, _ = await fetch_bytes(shelf_url, allow_goodreads_http=True, client=client)
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 0
+        if status_code in {401, 403, 404, 410}:
+            return _PRIVATE_GOODREADS_SHELF
+        return None
     except Exception:
         return None
     return _parse_goodreads_shelf_rows(shelf, content)
@@ -2313,7 +2338,7 @@ async def _fetch_goodreads_shelves(
     read_rss_url: str,
     shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
     client: httpx.AsyncClient | None = None,
-) -> dict[str, list[GoodreadsShelfRow] | None]:
+) -> dict[str, GoodreadsShelfFetchResult]:
     if not shelves:
         return {}
     if client is None:
@@ -2328,8 +2353,45 @@ async def _fetch_goodreads_shelves(
     return dict(zip(shelves, fetched))
 
 
+def purge_deleted_shelf_evidence(con, previous_rows: list[dict]) -> None:
+    """Purge recommendation evidence for removed shelf rows not remaining on any shelf or in reads."""
+    if not previous_rows:
+        return
+    remaining_keys: set[tuple[str, ...]] = set()
+    for row in con.execute(
+        "SELECT shelf, title, author, additional_authors, isbn, openlibrary_work_id "
+        "FROM goodreads_shelf_items"
+    ).fetchall():
+        remaining_keys.update(book_row_identity_match_keys(dict(row)))
+    removed_rows = [
+        row
+        for row in previous_rows
+        if not set(book_row_identity_match_keys(row)).issubset(remaining_keys)
+    ]
+    if not removed_rows:
+        return
+    read_keys: set[tuple[str, ...]] = set()
+    for row in con.execute(
+        "SELECT title, author, additional_authors, isbn, openlibrary_work_id FROM reads"
+    ).fetchall():
+        read_keys.update(book_row_identity_match_keys(dict(row)))
+    # Intentional: books promoted from shelves into `reads` remain part
+    # of the user's library and retain prior batches/runs so read-outcome
+    # attribution and score provenance stay intact (erased via `read_ids`
+    # if the read row itself is later purged).
+    deleted_shelf_rows = [
+        row
+        for row in removed_rows
+        if not (set(book_row_identity_match_keys(row)) & read_keys)
+    ]
+    if deleted_shelf_rows:
+        from .decision_evidence import purge_recommendation_evidence
+
+        purge_recommendation_evidence(con, shelf_items=deleted_shelf_rows)
+
+
 def _apply_goodreads_shelves(
-    fetched_shelves: dict[str, list[GoodreadsShelfRow] | None],
+    fetched_shelves: dict[str, GoodreadsShelfFetchResult],
     shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
 ) -> dict[str, int]:
     imported: dict[str, int] = {}
@@ -2342,63 +2404,37 @@ def _apply_goodreads_shelves(
     if not updated_shelves:
         return imported
 
-    from .identity import book_row_identity_match_keys
-
     with transaction() as con:
         shelf_marks = ",".join("?" for _ in updated_shelves)
         previous_rows = [
             dict(row)
             for row in con.execute(
-                "SELECT shelf, title, author, isbn, openlibrary_work_id "
-                f"FROM goodreads_shelf_items WHERE shelf IN ({shelf_marks})",
+                "SELECT shelf, title, author, additional_authors, isbn, openlibrary_work_id "
+                f"FROM goodreads_shelf_items WHERE source='goodreads_rss' AND shelf IN ({shelf_marks})",
                 updated_shelves,
             ).fetchall()
         ]
         for shelf in updated_shelves:
-            shelf_rows = fetched_shelves[shelf] or []
-            con.execute("DELETE FROM goodreads_shelf_items WHERE shelf=?", (shelf,))
-            con.executemany(
-                "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
-                "VALUES(?, ?, ?, ?, ?) "
-                "ON CONFLICT(shelf, title, author) DO UPDATE SET "
-                "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
-                "added_at=COALESCE(excluded.added_at, goodreads_shelf_items.added_at), "
-                "updated_at=CURRENT_TIMESTAMP",
-                shelf_rows,
+            raw_rows = fetched_shelves.get(shelf)
+            shelf_rows = raw_rows if isinstance(raw_rows, list) else []
+            con.execute(
+                "DELETE FROM goodreads_shelf_items WHERE shelf=? AND source='goodreads_rss'",
+                (shelf,),
             )
+            if shelf_rows:
+                con.executemany(
+                    "INSERT INTO goodreads_shelf_items(shelf, source, title, author, isbn, added_at) "
+                    "VALUES(?, 'goodreads_rss', ?, ?, ?, ?) "
+                    "ON CONFLICT(source, title, author) DO UPDATE SET "
+                    "shelf=excluded.shelf, "
+                    "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
+                    "added_at=COALESCE(excluded.added_at, goodreads_shelf_items.added_at), "
+                    "updated_at=CURRENT_TIMESTAMP",
+                    shelf_rows,
+                )
             imported[shelf] = len(shelf_rows)
 
-        if previous_rows:
-            remaining_keys: set[tuple[str, ...]] = set()
-            for row in con.execute(
-                "SELECT shelf, title, author, isbn, openlibrary_work_id "
-                "FROM goodreads_shelf_items"
-            ).fetchall():
-                remaining_keys.update(book_row_identity_match_keys(dict(row)))
-            removed_rows = [
-                row
-                for row in previous_rows
-                if not set(book_row_identity_match_keys(row)).issubset(remaining_keys)
-            ]
-            if removed_rows:
-                read_keys: set[tuple[str, ...]] = set()
-                for row in con.execute(
-                    "SELECT title, author, isbn, openlibrary_work_id FROM reads"
-                ).fetchall():
-                    read_keys.update(book_row_identity_match_keys(dict(row)))
-                # Intentional: books promoted from shelves into `reads` remain part
-                # of the user's library and retain prior batches/runs so read-outcome
-                # attribution and score provenance stay intact (erased via `read_ids`
-                # if the read row itself is later purged).
-                deleted_shelf_rows = [
-                    row
-                    for row in removed_rows
-                    if not (set(book_row_identity_match_keys(row)) & read_keys)
-                ]
-                if deleted_shelf_rows:
-                    from .decision_evidence import purge_recommendation_evidence
-
-                    purge_recommendation_evidence(con, shelf_items=deleted_shelf_rows)
+        purge_deleted_shelf_evidence(con, previous_rows)
     return imported
 
 
@@ -2441,10 +2477,11 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
         # Shelf-to-read promotion intentionally preserves prior scoring batches and
         # serving runs so `attribute_read_outcomes()` can attach outcomes to earlier
         # exposures while the book remains in `reads`.
-        con.executemany(
-            "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
-            ((item[0], item[1]) for item in read_rows),
-        )
+        if read_rows:
+            con.executemany(
+                "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+                ((item[0], item[1]) for item in read_rows),
+            )
         con.executemany(
             "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
             "VALUES(?,?,?,?,?,'goodreads_rss') "

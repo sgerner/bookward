@@ -3913,7 +3913,8 @@ def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
     }[decision["action"]]
     if current["status"] != expected_status:
         raise HTTPException(409, "The recommendation changed after this decision")
-    previous_status = str(decision["previous_status"])
+    raw_previous_status = str(decision["previous_status"])
+    previous_status = "new" if raw_previous_status == "hidden" else raw_previous_status
     con.execute(
         "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
         (previous_status, candidate_id),
@@ -4432,11 +4433,54 @@ def update_goodreads_rss_settings(payload: GoodreadsRSSSettingsIn):
         except ValueError as exc:
             raise HTTPException(400, safe_error_message(exc)) from exc
     with transaction() as con:
+        existing_row = con.execute(
+            "SELECT value,secret FROM settings WHERE key='goodreads_rss_url'"
+        ).fetchone()
+        previous_url = ""
+        if existing_row and existing_row["value"]:
+            try:
+                previous_url = (
+                    unseal(existing_row["value"])
+                    if existing_row["secret"]
+                    else str(existing_row["value"])
+                ).strip()
+            except Exception:
+                previous_url = ""
         con.execute(
             "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_url',?,1) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1,updated_at=CURRENT_TIMESTAMP",
             (seal(url) if url else "",),
         )
+        if not url or (previous_url and previous_url != url):
+            previous_rss_shelves = [
+                dict(row)
+                for row in con.execute(
+                    "SELECT shelf, title, author, additional_authors, isbn, openlibrary_work_id "
+                    "FROM goodreads_shelf_items WHERE source='goodreads_rss'"
+                ).fetchall()
+            ]
+            con.execute(
+                "DELETE FROM goodreads_shelf_items WHERE source='goodreads_rss'"
+            )
+            ingestion.purge_deleted_shelf_evidence(con, previous_rss_shelves)
+            if not url:
+                for key, value in (
+                    ("goodreads_rss_last_sync_at", ""),
+                    ("goodreads_rss_last_status", ""),
+                    ("goodreads_rss_last_attempt_at", ""),
+                    ("goodreads_rss_last_error", ""),
+                    ("goodreads_rss_last_scheduled_date", ""),
+                ):
+                    con.execute(
+                        "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                        (key, value),
+                    )
+            else:
+                con.execute(
+                    "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_last_scheduled_date','',0) "
+                    "ON CONFLICT(key) DO UPDATE SET value='',secret=0,updated_at=CURRENT_TIMESTAMP"
+                )
     return {"saved": True, "configured": bool(url)}
 
 
