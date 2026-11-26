@@ -1725,7 +1725,7 @@ def test_migration_adds_enrichment_storage_without_changing_existing_user_data(t
     assert row("SELECT name FROM sqlite_master WHERE type='table' AND name='read_metadata'")
 
 
-def test_migration_32_decouples_work_ids_verifies_source_isbns_and_requeues_only_non_user_overlaps(tmp_path):
+def test_migration_33_decouples_work_ids_verifies_source_isbns_and_requeues_only_non_user_overlaps(tmp_path):
     from afterword_engine.database import _execute_migration_script
     from afterword_engine.identity import ReadIdentityIndex
     from afterword_engine.main import recommendation_list
@@ -2114,7 +2114,7 @@ def test_migration_32_decouples_work_ids_verifies_source_isbns_and_requeues_only
     )
 
 
-def test_upgrade_from_main_migration_28_applies_through_migration_32_columns_index_and_backfill(
+def test_upgrade_from_main_migration_28_applies_through_migration_33_columns_index_and_backfill(
     tmp_path,
 ):
     from afterword_engine.database import (

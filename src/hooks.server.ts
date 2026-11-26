@@ -217,7 +217,9 @@ export const handle: Handle = async ({ event, resolve }) => {
 				return jsonError(403, ORIGIN_ERROR_DETAIL);
 			}
 		}
-		if (session && path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link') {
+		const oidcIntent = path === '/auth/oidc/start' ? event.url.searchParams.get('intent') : null;
+		const sessionBoundOidcStart = oidcIntent === 'link' || oidcIntent === 'enroll';
+		if (session && sessionBoundOidcStart) {
 			const origin = event.request.headers.get('origin');
 			const fetchSite = event.request.headers.get('sec-fetch-site');
 			if ((origin && origin !== event.url.origin) || (!origin && fetchSite !== 'same-origin')) {
@@ -225,7 +227,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 			}
 		}
 
-		if (path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'login') {
+		if (path === '/auth/oidc/start' && oidcIntent === 'login') {
 			return withSecurityHeaders(await resolve(event));
 		}
 
@@ -270,7 +272,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 				}
 				return jsonError(503, ENGINE_UNAVAILABLE_MESSAGE);
 			}
-			if (path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link') {
+			if (sessionBoundOidcStart) {
 				return withSecurityHeaders(new Response(ENGINE_UNAVAILABLE_MESSAGE, { status: 503, headers: { 'cache-control': 'no-store' } }));
 			}
 			event.locals.engineUnavailable = true;
@@ -279,8 +281,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 			return withSecurityHeaders(response);
 		}
 		const user = lookup.user;
-		const boundProfile = event.request.headers.has('x-bookward-profile') || mutation ||
-			(path === '/auth/oidc/start' && event.url.searchParams.get('intent') === 'link');
+		const boundProfile = event.request.headers.has('x-bookward-profile') || mutation || sessionBoundOidcStart;
 		if (boundProfile) {
 			let expected = '';
 			try {

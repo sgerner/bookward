@@ -32,12 +32,58 @@ def load_unacted_visible_impression_counts(
         JOIN candidates c ON c.id = i.candidate_id
         WHERE c.status = 'recommended'
           AND i.visible_at IS NOT NULL
-          AND i.visible_at >= ?
+          AND julianday(i.visible_at) >= julianday(?)
+          AND julianday(i.visible_at) > COALESCE(
+              (
+                  SELECT MAX(reset_day)
+                  FROM (
+                      SELECT julianday(e.occurred_at) AS reset_day
+                      FROM recommendation_events e
+                      WHERE e.candidate_id = i.candidate_id
+                        AND e.event_type IN ('maybe_later', 'restore')
+                      UNION ALL
+                      SELECT julianday(f.created_at) AS reset_day
+                      FROM feedback f
+                      WHERE f.candidate_id = i.candidate_id
+                        AND f.action IN ('maybe_later', 'restore')
+                        AND f.undone_at IS NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM recommendation_events fe
+                            WHERE fe.event_key = 'feedback:' || f.id
+                        )
+                  )
+                  WHERE reset_day IS NOT NULL
+              ),
+              -1e9
+          )
           AND NOT EXISTS (
               SELECT 1
               FROM recommendation_events e
               WHERE e.candidate_id = i.candidate_id
                 AND e.event_type IN ('save', 'reject', 'librarr_import', 'read')
+                AND julianday(e.occurred_at) > COALESCE(
+                    (
+                        SELECT MAX(restore_day)
+                        FROM (
+                            SELECT julianday(r.occurred_at) AS restore_day
+                            FROM recommendation_events r
+                            WHERE r.candidate_id = i.candidate_id
+                              AND r.event_type = 'restore'
+                            UNION ALL
+                            SELECT julianday(rf.created_at) AS restore_day
+                            FROM feedback rf
+                            WHERE rf.candidate_id = i.candidate_id
+                              AND rf.action = 'restore'
+                              AND rf.undone_at IS NULL
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM recommendation_events rfe
+                                  WHERE rfe.event_key = 'feedback:' || rf.id
+                              )
+                        )
+                        WHERE restore_day IS NOT NULL
+                    ),
+                    -1e9
+                )
           )
         GROUP BY i.candidate_id
         """

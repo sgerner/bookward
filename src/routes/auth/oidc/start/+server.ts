@@ -11,7 +11,8 @@ function loginErrorLocation(next: string) {
 }
 
 export const GET: RequestHandler = async ({ url, cookies }) => {
-	const intent = url.searchParams.get('intent') === 'link' ? 'link' : 'login';
+	const rawIntent = url.searchParams.get('intent');
+	const intent = rawIntent === 'link' || rawIntent === 'enroll' ? rawIntent : 'login';
 	const next = intent === 'login' ? safeNext(url.searchParams.get('next')) : '/';
 	let result: { authorization_url: string; csrf: string };
 	try {
@@ -19,6 +20,12 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 	} catch (error) {
 		if (intent === 'link' && error instanceof EngineError && error.status === 401) {
 			throw redirect(303, '/account?reauth=1');
+		}
+		if (intent === 'enroll' && error instanceof EngineError && error.status === 401) {
+			throw redirect(303, '/login?next=%2Faccount');
+		}
+		if (intent === 'enroll' && error instanceof EngineError && error.status === 400) {
+			throw redirect(303, '/account?enroll_error=1');
 		}
 		if (intent === 'login') throw redirect(303, loginErrorLocation(next));
 		throw error;
