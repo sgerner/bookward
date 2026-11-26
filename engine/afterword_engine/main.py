@@ -206,6 +206,7 @@ class InitialAdminIn(LocalLoginIn):
 
 
 class PasswordChangeIn(BaseModel):
+    username: str | None = Field(default=None, max_length=160)
     current_password: str = Field(default="", max_length=1024)
     new_password: str = Field(min_length=12, max_length=1024)
 
@@ -330,7 +331,16 @@ def _require_recent_authentication(
 
 def _verify_account_confirmation(account: dict, current_password: str, request: Request) -> None:
     methods = identity_store.auth_methods(account["id"])
-    if methods["password_enabled"]:
+    local_username = bool(
+        methods.get(
+            "has_local_username",
+            account.get(
+                "has_local_username",
+                identity_store.has_local_username(account.get("username")),
+            ),
+        )
+    )
+    if methods["password_enabled"] and local_username:
         session_hash = account.get("session_token_hash") or hashlib.sha256(
             (request.headers.get("x-bookward-session") or "").encode()
         ).hexdigest()
@@ -352,6 +362,11 @@ def _verify_account_confirmation(account: dict, current_password: str, request: 
             raise HTTPException(401, "Current password is incorrect")
     else:
         _require_recent_authentication(account, "Sign in again to confirm this change")
+
+
+def _require_enrollment_verification(account):
+    if not identity_store.is_enrollment_verified(account.get("enrollment_verified_at")):
+        raise HTTPException(401, "Confirm with single sign-on before adding a local password")
 
 
 def _mark_private_no_store(response: Response) -> None:
@@ -1418,7 +1433,18 @@ def initial_admin_setup(payload: InitialAdminIn):
 @app.get("/auth/me")
 def auth_me(request: Request):
     account = _principal(request)
-    return {key: account[key] for key in ("id", "profile_id", "username", "display_name", "role", "must_change_password")}
+    return {
+        key: account[key]
+        for key in (
+            "id",
+            "profile_id",
+            "username",
+            "has_local_username",
+            "display_name",
+            "role",
+            "must_change_password",
+        )
+    }
 
 
 @app.post("/auth/logout")
@@ -1431,7 +1457,8 @@ def auth_logout(request: Request):
 def change_password(payload: PasswordChangeIn, request: Request):
     account = _principal(request)
     methods = identity_store.auth_methods(account["id"])
-    if methods["password_enabled"]:
+    local_username = bool(methods["has_local_username"])
+    if methods["password_enabled"] and local_username:
         session_hash = account.get("session_token_hash") or hashlib.sha256(
             (request.headers.get("x-bookward-session") or "").encode()
         ).hexdigest()
@@ -1452,15 +1479,33 @@ def change_password(payload: PasswordChangeIn, request: Request):
         if not verified or verified["id"] != account["id"]:
             raise HTTPException(401, "Current password is incorrect")
     else:
-        _require_recent_authentication(account)
-    identity_store.update_password(account["id"], payload.new_password)
-    raw, _ = identity_store.create_session(account["id"])
-    return {"changed": True, "session_token": raw, "max_age": identity_store.SESSION_IDLE_HOURS * 3600}
+        _require_enrollment_verification(account)
+    try:
+        identity_store.update_password(account["id"], payload.new_password, payload.username)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "That username is already in use") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    raw, updated = identity_store.create_session(account["id"])
+    return {
+        "changed": True,
+        "session_token": raw,
+        "max_age": identity_store.SESSION_IDLE_HOURS * 3600,
+        "username": updated["username"],
+        "has_local_username": updated["has_local_username"],
+    }
 
 
 @app.get("/auth/identities")
 def auth_identities(request: Request):
-    return identity_store.auth_methods(_principal(request)["id"])
+    account = _principal(request)
+    methods = identity_store.auth_methods(account["id"])
+    return {
+        **methods,
+        "enrollment_verified": bool(account.get("enrollment_verified")),
+    }
 
 
 @app.delete("/auth/identities/{identity_id}")
@@ -1540,7 +1585,10 @@ def admin_create_account(payload: AccountCreateIn, request: Request):
         identity_store.set_account_status(account["id"], "disabled")
         LOGGER.exception("Could not initialize profile database for account %s", account["id"])
         raise HTTPException(500, "The account was created but its profile could not be initialized") from exc
-    return {key: account[key] for key in ("id", "profile_id", "username", "display_name", "role", "status")}
+    return {
+        key: account[key]
+        for key in ("id", "profile_id", "username", "has_local_username", "display_name", "role", "status")
+    }
 
 
 @app.post("/admin/accounts/{account_id}/password")
@@ -1615,12 +1663,28 @@ def admin_delete_account(
             raise HTTPException(400, "The installation must retain an active administrator")
     if admin["id"] == account_id:
         raise HTTPException(400, "Use Account settings to delete your own account")
-    if (
-        payload is None
-        or payload.confirm_username is None
-        or payload.confirm_username.strip() != target["username"]
-    ):
-        raise HTTPException(400, f"Type {target['username']} to confirm deleting this account")
+    target_has_local = (
+        bool(target["has_local_username"])
+        if "has_local_username" in target
+        else identity_store.has_local_username(target.get("username"))
+    )
+    expected_confirm = (
+        target["username"]
+        if target_has_local
+        else (str(target.get("display_name") or "").strip() or "DELETE")
+    )
+    submitted_confirm = (
+        payload.confirm_username.strip()
+        if payload is not None and payload.confirm_username is not None
+        else ""
+    )
+    accepted_confirms = {expected_confirm}
+    if not target_has_local:
+        accepted_confirms.add(target["username"])
+    if not submitted_confirm or submitted_confirm not in accepted_confirms:
+        raise HTTPException(
+            400, f"Type {expected_confirm} to confirm deleting this account"
+        )
     _verify_account_confirmation(admin, payload.current_password, request)
     try:
         return identity_store.delete_account(
@@ -1718,23 +1782,30 @@ async def _oidc_metadata():
 
 
 @app.get("/auth/oidc/start")
-async def oidc_start(request: Request, intent: Literal["login", "link"] = "login"):
+async def oidc_start(request: Request, intent: Literal["login", "link", "enroll"] = "login"):
     account = getattr(request.state, "account", None)
     if intent == "link" and not account:
         raise HTTPException(401, "Sign in before linking an SSO identity")
+    if intent == "enroll" and not account:
+        raise HTTPException(401, "Sign in before confirming single sign-on")
     if intent == "link":
         _require_recent_authentication(account)
+    if intent == "enroll":
+        methods = identity_store.auth_methods(account["id"])
+        if not methods["oidc_identities"]:
+            raise HTTPException(400, "Link a single sign-on identity before confirming with SSO")
     issuer, redirect_uri, metadata = await _oidc_metadata()
     state = secrets.token_urlsafe(32)
     csrf = secrets.token_urlsafe(32)
     nonce = secrets.token_urlsafe(32)
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    session_bound = intent in {"link", "enroll"}
     try:
         identity_store.create_oidc_transaction(
             state=state, csrf=csrf, nonce=nonce, verifier=verifier,
-            purpose=intent, account_id=account["id"] if intent == "link" else None,
-            session_token=request.headers.get("x-bookward-session") if intent == "link" else None,
+            purpose=intent, account_id=account["id"] if session_bound else None,
+            session_token=request.headers.get("x-bookward-session") if session_bound else None,
         )
     except RuntimeError as exc:
         raise HTTPException(429, "Too many pending SSO sign-ins. Try again shortly.") from exc
@@ -1748,6 +1819,9 @@ async def oidc_start(request: Request, intent: Literal["login", "link"] = "login
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
+    if intent == "enroll":
+        query_values["prompt"] = "login"
+        query_values["max_age"] = str(identity_store.ENROLLMENT_VERIFICATION_MINUTES * 60)
     authorization_endpoint = urlparse(metadata["authorization_endpoint"])
     query = urlencode(
         {**dict(parse_qsl(authorization_endpoint.query, keep_blank_values=True)), **query_values}
@@ -1819,6 +1893,17 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
         subject = claims.get("sub")
         if not isinstance(subject, str) or not subject or len(subject) > 255:
             raise ValueError("Invalid subject")
+        if transaction_record["purpose"] == "enroll":
+            auth_time = claims.get("auth_time")
+            now_epoch = time.time()
+            max_age_seconds = identity_store.ENROLLMENT_VERIFICATION_MINUTES * 60 + 60
+            if (
+                auth_time is None
+                or isinstance(auth_time, bool)
+                or not isinstance(auth_time, (int, float))
+                or not (now_epoch - max_age_seconds <= auth_time <= now_epoch + 60)
+            ):
+                raise ValueError("Missing or stale authentication time")
     except Exception as exc:
         LOGGER.info("Rejected OIDC callback: %s", type(exc).__name__)
         raise HTTPException(401, "The SSO provider could not verify this sign-in") from exc
@@ -1836,6 +1921,16 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
         except PermissionError as exc:
             raise HTTPException(409, str(exc)) from exc
         return {"linked": True, "account": current}
+    if transaction_record["purpose"] == "enroll":
+        current = getattr(request.state, "account", None)
+        if not current or current["id"] != transaction_record["account_id"]:
+            raise HTTPException(401, "Sign in again before confirming single sign-on")
+        matched = identity_store.account_for_oidc_identity(issuer, subject)
+        if not matched or matched["id"] != current["id"]:
+            raise HTTPException(403, "Sign in with an SSO identity already linked to this account")
+        if not identity_store.mark_session_enrollment_verified(request.headers.get("x-bookward-session")):
+            raise HTTPException(401, "Sign in again before confirming single sign-on")
+        return {"enroll_verified": True, "account": current}
 
     account = identity_store.account_for_oidc_identity(issuer, subject)
     if not account and settings.oidc_auto_provision:
