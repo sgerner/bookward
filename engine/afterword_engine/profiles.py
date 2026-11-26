@@ -440,7 +440,8 @@ def initialize_auth() -> None:
                 "ALTER TABLE accounts ADD COLUMN has_local_username INTEGER NOT NULL DEFAULT 1 "
                 "CHECK(has_local_username IN (0,1))"
             )
-            _backfill_has_local_username(con)
+        # Idempotent; runs every start so a crash between ALTER and backfill self-heals.
+        _backfill_has_local_username(con)
         session_columns = {row[1] for row in con.execute("PRAGMA table_info(auth_sessions)")}
         if "enrollment_verified_at" not in session_columns:
             con.execute("ALTER TABLE auth_sessions ADD COLUMN enrollment_verified_at TEXT")
