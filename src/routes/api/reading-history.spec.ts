@@ -195,4 +195,87 @@ describe("reading-history endpoints", () => {
     expect(response.status).toBe(404);
     expect(await response.json()).toEqual({ message: "Read entry not found" });
   });
+
+  it("updates and clears completion dates via PUT on /api/reading-history/[id] and rejects blank or future dates", async () => {
+    engineMock.mockResolvedValueOnce({
+      id: 15,
+      title: "Station Eleven",
+      author: "Emily St. John Mandel",
+      rating: 4,
+      read_at: "2025-11-04",
+      source: "manual",
+      created_at: "2025-11-04T00:00:00Z",
+      job_id: "job-score-3",
+    });
+
+    const updateDateResponse = await PUT({
+      params: { id: "15" },
+      request: new Request("http://bookward.test/api/reading-history/15", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ read_at: "2025-11-04" }),
+      }),
+    } as never);
+
+    expect(updateDateResponse.status).toBe(200);
+    expect(engineMock).toHaveBeenCalledWith("/api/reading-history/15", {
+      method: "PUT",
+      body: JSON.stringify({ read_at: "2025-11-04" }),
+    });
+    expect(await updateDateResponse.json()).toEqual({
+      item: expect.objectContaining({ id: 15, read_at: "2025-11-04", source: "manual" }),
+      job_id: "job-score-3",
+    });
+
+    engineMock.mockResolvedValueOnce({
+      id: 15,
+      title: "Station Eleven",
+      author: "Emily St. John Mandel",
+      rating: 4,
+      read_at: null,
+      source: "manual_history",
+      created_at: "2025-11-04T00:00:00Z",
+      job_id: "job-score-4",
+    });
+
+    const clearDateResponse = await PUT({
+      params: { id: "15" },
+      request: new Request("http://bookward.test/api/reading-history/15", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ read_at: null }),
+      }),
+    } as never);
+
+    expect(clearDateResponse.status).toBe(200);
+    expect(engineMock).toHaveBeenLastCalledWith("/api/reading-history/15", {
+      method: "PUT",
+      body: JSON.stringify({ read_at: null }),
+    });
+    expect(await clearDateResponse.json()).toEqual({
+      item: expect.objectContaining({ id: 15, read_at: null, source: "manual_history" }),
+      job_id: "job-score-4",
+    });
+
+    for (const badDateBody of [
+      { read_at: "" },
+      { read_at: "   " },
+      { read_at: "not-a-date" },
+      { read_at: "2025-02-30" },
+      { read_at: "2099-01-01" },
+      { read_at: 12345 },
+    ]) {
+      const badDateResponse = await PUT({
+        params: { id: "15" },
+        request: new Request("http://bookward.test/api/reading-history/15", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(badDateBody),
+        }),
+      } as never);
+      expect(badDateResponse.status).toBe(400);
+    }
+
+    expect(engineMock).toHaveBeenCalledTimes(2);
+  });
 });

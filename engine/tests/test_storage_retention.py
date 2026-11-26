@@ -223,7 +223,7 @@ def test_non_ranking_recommendation_statuses_skip_run_creation_and_preserve_attr
 
         read_resp = client.post(
             f"/api/recommendations/{rec_id}/read",
-            json={"rating": 5, "read_at": "2026-11-22"},
+            json={"rating": 5},
         )
         assert read_resp.status_code == 200
 
