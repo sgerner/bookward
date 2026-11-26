@@ -225,7 +225,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         "WHEN q.quality_status='accepted' THEN 0.85 ELSE 0 END AS catalog_confidence "
         "FROM candidates c JOIN sources s ON s.id=c.source_id "
         "JOIN candidate_quality q ON q.candidate_id=c.id "
-        "WHERE c.status IN ('new','recommended') AND q.quality_status='accepted' "
+        "WHERE c.status IN ('new','recommended','maybe_later') AND q.quality_status='accepted' "
         "AND s.enabled=1"
     )
     candidates = [
@@ -299,7 +299,7 @@ async def score_all(backend=None, model=None, url=None, api_key=None, embedder=N
         to_read_written_ids: list[int] = []
         for candidate in ranked:
             cand_keys = set(book_row_identity_match_keys(candidate))
-            if cand_keys & currently_reading_keys:
+            if cand_keys & currently_reading_keys and candidate.get("status") in {"new", "recommended"}:
                 con.execute(
                     "UPDATE candidates SET status='hidden', score=0, explanation='[]', score_batch_id=NULL, "
                     "updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('new', 'recommended')",

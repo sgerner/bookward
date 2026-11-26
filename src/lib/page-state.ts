@@ -537,23 +537,34 @@ export function sortReadingHistory<
   sort: ReadingHistorySort,
   scoresPending = false,
 ): T[] {
+  const hasReadDate = (item: T) => Boolean(item.read_at && item.read_at.trim());
   const timestamps = new Map<number, number>();
   const readTimestamp = (item: T) => {
     const cached = timestamps.get(item.id);
     if (cached !== undefined) return cached;
-    const timestamp = Date.parse(item.read_at ?? item.created_at);
+    const raw = hasReadDate(item) ? item.read_at! : item.created_at;
+    const timestamp = Date.parse(raw);
     const normalized = Number.isFinite(timestamp) ? timestamp : 0;
     timestamps.set(item.id, normalized);
     return normalized;
   };
+  const compareDatedChronology = (left: T, right: T, ascending: boolean) => {
+    const leftDated = hasReadDate(left);
+    const rightDated = hasReadDate(right);
+    if (leftDated !== rightDated) return leftDated ? -1 : 1;
+    const delta = ascending
+      ? readTimestamp(left) - readTimestamp(right)
+      : readTimestamp(right) - readTimestamp(left);
+    return delta || left.title.localeCompare(right.title);
+  };
 
   return [...items].sort((left, right) => {
     if (sort === "oldest") {
-      return readTimestamp(left) - readTimestamp(right) || left.title.localeCompare(right.title);
+      return compareDatedChronology(left, right, true);
     }
     if (sort === "score_high" || sort === "score_low") {
       if (scoresPending && left.algorithm_score === null && right.algorithm_score === null) {
-        return readTimestamp(right) - readTimestamp(left) || left.title.localeCompare(right.title);
+        return compareDatedChronology(left, right, false);
       }
       if (left.algorithm_score === null) {
         return right.algorithm_score === null ? left.title.localeCompare(right.title) : 1;
@@ -571,6 +582,6 @@ export function sortReadingHistory<
     if (sort === "title") {
       return left.title.localeCompare(right.title);
     }
-    return readTimestamp(right) - readTimestamp(left) || left.title.localeCompare(right.title);
+    return compareDatedChronology(left, right, false);
   });
 }

@@ -50,9 +50,13 @@ describe("page actions", () => {
       "metadata_confidence",
       "published_kind",
       "published_on",
+      "quality_status",
       "reason",
       "recommendation_run_id",
       "score",
+      "source_enabled",
+      "source_id",
+      "source_name",
       "source_url",
       "status",
       "synopsis",
@@ -156,6 +160,10 @@ describe("page actions", () => {
         author: "First Writer",
         cover_url: "https://covers.example/recommended.jpg",
         source_url: "https://books.example/recommended",
+        source_id: 1,
+        source_name: "A source",
+        source_enabled: true,
+        quality_status: null,
         published_on: "2026-11-15",
         published_kind: "day",
         genres: ["Science Fiction"],
@@ -176,6 +184,10 @@ describe("page actions", () => {
         author: "A Writer",
         cover_url: "https://covers.example/deferred.jpg",
         source_url: "https://books.example/deferred",
+        source_id: 2,
+        source_name: "A source",
+        source_enabled: true,
+        quality_status: null,
         published_on: null,
         published_kind: "unknown",
         genres: ["Fantasy"],
@@ -2412,6 +2424,75 @@ describe("page actions", () => {
     );
   });
 
+  it("propagates HTTP 409 when restoring a candidate from a disabled source", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          detail:
+            "This book's source is disabled. Re-enable the source in Sources to return it to Discover, or use Shortlist or Mark Read here.",
+        }),
+        {
+          status: 409,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "9");
+    body.set("status", "recommended");
+    const result = (await actions.decide!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never)) as { status: number; data: { message: string } };
+
+    expect(result.status).toBe(409);
+    expect(result.data.message).toContain("source is disabled");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/recommendations/9/feedback",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ action: "restore" }),
+      }),
+    );
+  });
+
+  it("forwards historical undated Mark Read submissions and validates optional dates", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ status: "read", read_id: 12 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("id", "42");
+    body.set("historical", "true");
+    body.set("rating", "4");
+    const result = await actions.markRead!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toEqual({
+      message: "Added past read to your reading history with a 4-star rating.",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/recommendations/42/read",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ rating: 4, historical: true }),
+      }),
+    );
+
+    const futureBody = new FormData();
+    futureBody.set("id", "42");
+    futureBody.set("read_at", "2099-01-01");
+    const futureResult = (await actions.markRead!({
+      request: new Request("http://afterword.test", { method: "POST", body: futureBody }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(futureResult.status).toBe(400);
+    expect(futureResult.data.message).toContain("cannot be in the future");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
   it("loads active catalog sweep progress, remaining rows, and retry status in Settings", async () => {
     const overview = {
       recommendations: [],
