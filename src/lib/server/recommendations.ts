@@ -13,7 +13,10 @@ export type Recommendation = {
   metadata_confidence?: number | null;
   explanation: string[];
   status: string;
+  source_id?: number | null;
   source_name: string | null;
+  source_enabled?: boolean;
+  quality_status?: string | null;
 };
 
 export type PageBook = {
@@ -23,6 +26,10 @@ export type PageBook = {
   author: string;
   cover_url: string;
   source_url: string;
+  source_id: number | null;
+  source_name: string | null;
+  source_enabled: boolean;
+  quality_status: string | null;
   published_on: string | null;
   published_kind: string;
   genres: string[];
@@ -51,6 +58,10 @@ export function toPageBook(book: Recommendation): PageBook {
     author: book.author,
     cover_url: publicUrl(book.cover_url),
     source_url: publicUrl(book.source_url),
+    source_id: book.source_id ?? null,
+    source_name: book.source_name ?? null,
+    source_enabled: book.source_enabled !== false,
+    quality_status: book.quality_status ?? null,
     published_on: book.release_date,
     published_kind: book.date_kind,
     genres: book.genres,

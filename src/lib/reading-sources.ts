@@ -3,6 +3,7 @@ const READING_SOURCE_LABELS: Record<string, string> = {
   storygraph_csv: "StoryGraph CSV export",
   goodreads_rss: "Goodreads read shelf RSS",
   manual: "Added in Bookward",
+  manual_history: "Past read added in Bookward",
   demo: "Demo data",
 };
 
