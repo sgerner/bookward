@@ -775,14 +775,14 @@ def test_embeddings_rerankers_and_discord_enforce_byte_caps(database, monkeypatc
         {"id": 2, "title": "Second", "author": "B", "score": 85.0},
     ]
 
-    respx.post("https://llm-sync.example.test/v1/chat/completions").mock(
+    hop0 = respx.post(f"https://{PINNED_IP}/v1/chat/completions").mock(
         return_value=httpx.Response(
             307,
             headers={"location": "https://llm-sync.example.test/v2/chat/completions"},
             stream=sync_redirect_stream,
         )
     )
-    respx.post("https://llm-sync.example.test/v2/chat/completions").mock(
+    hop1 = respx.post(f"https://{PINNED_IP}/v2/chat/completions").mock(
         return_value=httpx.Response(200, headers={"content-type": "application/json"}, stream=sync_llm_stream)
     )
     reranked_sync, diag_sync = llm_reranker.rerank_with_llm_sync(
@@ -794,6 +794,8 @@ def test_embeddings_rerankers_and_discord_enforce_byte_caps(database, monkeypatc
     )
     assert diag_sync == {"applied": False, "reason": "fallback"}
     assert [c["id"] for c in reranked_sync] == [1, 2]
+    assert hop0.calls[-1].request.headers.get("host") == "llm-sync.example.test"
+    assert hop1.calls[-1].request.headers.get("host") == "llm-sync.example.test"
     assert sync_redirect_stream.chunks_yielded == 0
     assert sync_redirect_stream.closed is True
     assert sync_llm_stream.chunks_yielded == 3

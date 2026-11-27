@@ -287,6 +287,8 @@ docker compose -f compose.yaml -f compose.gpu.yaml \
 
 If Librarr runs in another container, put both services on the same Docker network, allow its hostname through `LIBRARR_ALLOWED_HOSTS`, and use its internal URL (usually `http://librarr:5050`) in **Settings**.
 
+For local LLM reranking and model discovery, `LLM_RERANK_ALLOWED_HOSTS` defaults to `ollama` (matching `http://ollama:11434` on the Compose network). When Ollama or an OpenAI-compatible server runs on the host machine instead, add its loopback or host entry—for example `LLM_RERANK_ALLOWED_HOSTS=ollama,localhost,127.0.0.1` for a native local run (or `host.docker.internal` from Docker)—and use that URL in **Settings** (if an API key is configured for an allowlisted `http://` host, the key is sent unencrypted over HTTP).
+
 ## Configuration at a glance
 
 Copy `.env.example` to `.env` for Docker, or export variables in the shell for a local run.
@@ -316,6 +318,7 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 | `RETENTION_ENABLED` | Default for scheduled background pruning of aged unattributed telemetry, dismissed/stale embeddings, and terminal operational rows (`AFTERWORD_RETENTION_ENABLED` for local engine runs); defaults conservatively to `false` and can be toggled per profile in Settings. |
 | `EVIDENCE_ROTATION_ENABLED` | Default for rotating unreferenced scoring batches and oldest unattributed replay snapshots when the 512 MiB evidence budget crosses 80% (`AFTERWORD_EVIDENCE_ROTATION_ENABLED` for local engine runs); defaults conservatively to `false` and can be toggled per profile in Settings. |
 | `LIBRARR_ALLOWED_HOSTS` | Comma-separated private hostnames allowed to receive the Librarr API key. |
+| `LLM_RERANK_ALLOWED_HOSTS` | Comma-separated private or loopback hostnames allowed for local Ollama or OpenAI-compatible LLM reranking and model discovery. Defaults to `ollama`; add `localhost,127.0.0.1` (or `host.docker.internal` in Docker) for a host-local server. If an API key is configured for an allowlisted `http://` host, the key is sent unencrypted over HTTP. |
 
 The engine also persists source cadence and application settings in SQLite, so changes made in the UI survive restarts.
 

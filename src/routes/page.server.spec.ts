@@ -1450,6 +1450,110 @@ describe("page actions", () => {
     });
   });
 
+  it("saves keyless Ollama reranker settings with default local URL without calling models.dev", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          saved: true,
+          llm_rerank: {
+            enabled: true,
+            mode: "ollama",
+            provider: "ollama",
+            api_url: "http://ollama:11434",
+            model: "qwen2.5:7b",
+            api_key_set: false,
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new FormData();
+    body.set("enabled", "on");
+    body.set("mode", "ollama");
+    body.set("apiUrl", "");
+    body.set("model", "qwen2.5:7b");
+    const result = await actions.configureLlmRerank!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+    expect(result).toEqual({ message: "LLM reranker verified and saved." });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/settings/llm-rerank",
+    );
+    expect(
+      JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body)),
+    ).toEqual({
+      enabled: true,
+      mode: "ollama",
+      provider: "",
+      api_url: "http://ollama:11434",
+      model: "qwen2.5:7b",
+      api_key: null,
+      clear_api_key: false,
+    });
+  });
+
+  it("saves keyless OpenAI-compatible reranker settings and surfaces 400 SSRF errors", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ saved: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            detail: "Private, loopback, and link-local addresses are not allowed",
+          }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const okBody = new FormData();
+    okBody.set("enabled", "on");
+    okBody.set("mode", "openai-compatible");
+    okBody.set("apiUrl", "http://vllm:8000/v1");
+    okBody.set("model", "Qwen/Qwen2.5-7B-Instruct");
+    await expect(
+      actions.configureLlmRerank!({
+        request: new Request("http://afterword.test", {
+          method: "POST",
+          body: okBody,
+        }),
+      } as never),
+    ).resolves.toEqual({ message: "LLM reranker verified and saved." });
+
+    const blockedBody = new FormData();
+    blockedBody.set("enabled", "on");
+    blockedBody.set("mode", "openai-compatible");
+    blockedBody.set("apiUrl", "http://127.0.0.1:8000/v1");
+    blockedBody.set("model", "Qwen/Qwen2.5-7B-Instruct");
+    const blocked = (await actions.configureLlmRerank!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: blockedBody,
+      }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(blocked.status).toBe(400);
+    expect(blocked.data.message).toContain("Private, loopback");
+
+    const invalidModeBody = new FormData();
+    invalidModeBody.set("mode", "unsupported-mode");
+    const invalidMode = (await actions.configureLlmRerank!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: invalidModeBody,
+      }),
+    } as never)) as { status: number; data: { message: string } };
+    expect(invalidMode.status).toBe(400);
+    expect(invalidMode.data.message).toBe("Choose a valid LLM reranker mode.");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("throws HTTP 503 without contacting the engine when hooks report an outage", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

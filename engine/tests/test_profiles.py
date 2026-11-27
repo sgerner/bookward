@@ -4834,3 +4834,142 @@ def test_admin_password_reset_blocks_sso_only_accounts_and_rejects_reserved_user
 
     reloaded = profiles.account_by_id(sso_reader["id"])
     assert reloaded["must_change_password"] is False
+
+
+def test_lease_expiry_cancellation_preserves_attempt_count_when_lock_releases_immediately(
+    identity_store, monkeypatch
+):
+    monkeypatch.setattr(jobs, "JOB_LEASE_SECONDS", 0.08)
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    monkeypatch.setattr(jobs, "JOB_DEFERRED_HEARTBEAT_RETRY_SECONDS", 0.02)
+    monkeypatch.setattr(jobs, "JOB_REAPER_SECONDS", 0.02)
+    monkeypatch.setattr(jobs, "JOB_MAX_ATTEMPTS", 2)
+
+    alice = profiles.create_account("hb-race-alice", "hb-race-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("lease_race_check")
+
+    alice_path = profile_database_path(alice["profile_id"])
+    first_started = Event()
+    lock_held = Event()
+    release_lock = Event()
+    stop = asyncio.Event()
+    attempts_seen = 0
+
+    def hold_exclusive_lock():
+        with database_lock(alice_path):
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    holder = Thread(target=hold_exclusive_lock, daemon=True)
+
+    async def handler(kind: str):
+        nonlocal attempts_seen
+        assert kind == "lease_race_check"
+        attempts_seen += 1
+        try:
+            if attempts_seen == 1:
+                first_started.set()
+                await asyncio.Event().wait()
+            stop.set()
+            return {"attempt": attempts_seen}
+        except asyncio.CancelledError:
+            # Release the exclusive lock *before* CancelledError unwinds to worker_loop
+            # so database_lock().try_shared() is guaranteed unlocked during cleanup.
+            release_lock.set()
+            holder.join(timeout=2)
+            raise
+
+    async def run_scenario():
+        worker = asyncio.create_task(worker_loop(handler, stop))
+        try:
+            assert await asyncio.to_thread(first_started.wait, 2)
+            holder.start()
+            assert await asyncio.to_thread(lock_held.wait, 2)
+            await asyncio.wait_for(worker, timeout=3)
+        finally:
+            release_lock.set()
+            stop.set()
+            await asyncio.gather(worker, return_exceptions=True)
+            if holder.is_alive():
+                await asyncio.to_thread(holder.join, 2)
+
+    asyncio.run(run_scenario())
+    assert attempts_seen == 2
+    with profile_scope(alice["profile_id"]), connect() as con:
+        final_job = con.execute(
+            "SELECT status,attempts,result FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert final_job["status"] == "complete"
+    assert final_job["attempts"] == 2
+    assert final_job["result"] == '{"attempt": 2}'
+
+    # Also verify JOB_MAX_ATTEMPTS exhaustion marks the job failed instead of requeuing
+    # when the lock releases immediately during lease-expiry cancellation.
+    monkeypatch.setattr(jobs, "JOB_MAX_ATTEMPTS", 1)
+    with profile_scope(alice["profile_id"]):
+        exhausted_job_id = enqueue_job("lease_exhaust_check")
+
+    exhausted_started = Event()
+    exhausted_lock_held = Event()
+    exhausted_release_lock = Event()
+    exhausted_stop = asyncio.Event()
+    exhausted_attempts = 0
+
+    def hold_second_lock():
+        with database_lock(alice_path):
+            exhausted_lock_held.set()
+            exhausted_release_lock.wait(timeout=5)
+
+    second_holder = Thread(target=hold_second_lock, daemon=True)
+
+    async def exhausting_handler(kind: str):
+        nonlocal exhausted_attempts
+        assert kind == "lease_exhaust_check"
+        exhausted_attempts += 1
+        try:
+            exhausted_started.set()
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            exhausted_release_lock.set()
+            second_holder.join(timeout=2)
+            raise
+
+    async def run_exhaustion_scenario():
+        worker = asyncio.create_task(worker_loop(exhausting_handler, exhausted_stop))
+        try:
+            assert await asyncio.to_thread(exhausted_started.wait, 2)
+            second_holder.start()
+            assert await asyncio.to_thread(exhausted_lock_held.wait, 2)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                def check_state():
+                    with profile_scope(alice["profile_id"]), connect() as con:
+                        return con.execute(
+                            "SELECT status,attempts,error FROM jobs WHERE id=?",
+                            (exhausted_job_id,),
+                        ).fetchone()
+
+                state = await asyncio.to_thread(check_state)
+                if state and state["status"] == "failed":
+                    exhausted_stop.set()
+                    break
+                await asyncio.sleep(0.02)
+            await asyncio.wait_for(worker, timeout=2)
+        finally:
+            exhausted_release_lock.set()
+            exhausted_stop.set()
+            await asyncio.gather(worker, return_exceptions=True)
+            if second_holder.is_alive():
+                await asyncio.to_thread(second_holder.join, 2)
+
+    asyncio.run(run_exhaustion_scenario())
+    assert exhausted_attempts == 1
+    with profile_scope(alice["profile_id"]), connect() as con:
+        exhausted_row = con.execute(
+            "SELECT status,attempts,error FROM jobs WHERE id=?", (exhausted_job_id,)
+        ).fetchone()
+    assert exhausted_row["status"] == "failed"
+    assert exhausted_row["attempts"] == 1
+    assert exhausted_row["error"] == "Job lease expired after maximum attempts"

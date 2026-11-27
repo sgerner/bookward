@@ -90,7 +90,7 @@ const SAFE_EXACT_5XX_MESSAGES = new Set([
 ]);
 
 const SAFE_INTEGRATION_502_PREFIX =
-  /^(?:Librarr (?:request|search|download) failed:|Unable to fetch models\.dev catalog:|The SSO provider\b|Google Books preview failed:)/;
+  /^(?:Librarr (?:request|search|download) failed:|Unable to fetch models\.dev catalog:|Unable to fetch models from (?:ollama|openai-compatible) endpoint:|The SSO provider\b|Google Books preview failed:)/;
 
 /**
  * Scrubs upstream error payloads before returning them to browsers or `/api/v1`

@@ -7,6 +7,11 @@ import {
   engineStatus,
   isPayloadTooLarge,
 } from "#lib/server/engine.js";
+import {
+  INVALID_LLM_RERANK_MODE_MESSAGE,
+  type LlmRerankMode,
+  parseLlmRerankMode,
+} from "#lib/llm-rerank.js";
 import { toPageBook } from "#lib/server/recommendations.js";
 import { z } from "zod";
 
@@ -136,6 +141,7 @@ type Overview = {
     digest: DigestSettings;
     llm_rerank?: {
       enabled: boolean;
+      mode?: LlmRerankMode;
       provider: string;
       api_url: string;
       model: string;
@@ -331,6 +337,16 @@ export const load: PageServerLoad = async ({ url, locals }) => {
       librar_url: overview.settings.librarr_url,
       librar_connected: overview.settings.librarr_api_key_set ? 1 : 0,
       ...overview.settings,
+      ...(overview.settings.llm_rerank
+        ? {
+            llm_rerank: {
+              ...overview.settings.llm_rerank,
+              mode:
+                parseLlmRerankMode(overview.settings.llm_rerank.mode, "cloud") ??
+                "cloud",
+            },
+          }
+        : {}),
       source_sync_interval_hours: overview.settings.source_sync_interval_hours ?? 24,
       digest: overview.settings.digest,
       // Keep the UI compatible while an already-running engine is being
@@ -1294,8 +1310,16 @@ export const actions: Actions = {
   configureLlmRerank: async ({ request }) => {
     const data = await request.formData();
     const enabled = data.get("enabled") === "on";
+    const mode = parseLlmRerankMode(data.get("mode"), "cloud");
+    if (!mode) {
+      return fail(400, {
+        message: INVALID_LLM_RERANK_MODE_MESSAGE,
+      });
+    }
     const provider = String(data.get("provider") || "").trim();
-    const apiUrl = String(data.get("apiUrl") || "").trim();
+    const rawApiUrl = String(data.get("apiUrl") || "").trim();
+    const apiUrl =
+      mode === "ollama" && !rawApiUrl ? "http://ollama:11434" : rawApiUrl;
     const model = String(data.get("model") || "").trim();
     const apiKey = String(data.get("apiKey") || "").trim();
     const clearApiKey = data.get("clearApiKey") === "on";
@@ -1309,6 +1333,7 @@ export const actions: Actions = {
         method: "PUT",
         body: JSON.stringify({
           enabled,
+          mode,
           provider,
           api_url: apiUrl,
           model,
@@ -1316,7 +1341,11 @@ export const actions: Actions = {
           clear_api_key: clearApiKey,
         }),
       });
-      return { message: "LLM reranker settings saved." };
+      return {
+        message: enabled
+          ? "LLM reranker verified and saved."
+          : "LLM reranker settings saved.",
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }

@@ -129,6 +129,9 @@ describe('private engine client', () => {
 		expect(sanitizeEngineMessage('Unable to fetch models.dev catalog: timed out', 502)).toBe(
 			'Unable to fetch models.dev catalog: timed out'
 		);
+		expect(
+			sanitizeEngineMessage('Unable to fetch models from ollama endpoint: connection refused', 502)
+		).toBe('Unable to fetch models from ollama endpoint: connection refused');
 		expect(sanitizeEngineMessage('The SSO provider could not be reached', 502)).toBe(
 			'The SSO provider could not be reached'
 		);

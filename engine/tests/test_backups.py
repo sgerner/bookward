@@ -2738,3 +2738,107 @@ def test_backup_scheduler_loop_runs_due_checks_off_event_loop_thread(
     assert observed_threads["profile_due"] and loop_thread_id not in observed_threads["profile_due"]
     assert alice["profile_id"] not in checked_profiles
     assert set(checked_profiles) == {"legacy", bob["profile_id"]}
+
+
+def test_list_and_prune_backups_tie_break_identical_second_and_mtime_ns(
+    database, monkeypatch
+):
+    from concurrent.futures import ThreadPoolExecutor
+    import os
+    from pathlib import Path
+
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO reads(title,author,rating,source) VALUES(?,?,?,?)",
+            ("Coarse clock book", "Author", 5, "test"),
+        )
+        con.execute(
+            "INSERT INTO settings(key,value,secret) VALUES(?,?,1)",
+            ("coarse_secret", seal("aligned-under-coarse-mtime")),
+        )
+
+    first = backups.create_backup()
+    second = backups.create_backup()
+    backup_dir = backups.backup_directory()
+    shared_second = "20261127T003000Z"
+    tied_ids = [
+        f"bookward-{shared_second}-aaaa1111",
+        f"bookward-{shared_second}-cccc3333",
+        f"bookward-{shared_second}-bbbb2222",
+    ]
+    source_bytes = (backup_dir / f"{first['id']}.sqlite3").read_bytes()
+    sidecar_bytes = (backup_dir / f"{first['id']}.secret.key").read_bytes()
+    for existing in backup_dir.glob("bookward-*"):
+        existing.unlink()
+
+    fixed_ns = 1_795_745_058_904_000_000
+    for tied_id in tied_ids:
+        db_file = backup_dir / f"{tied_id}.sqlite3"
+        key_file = backup_dir / f"{tied_id}.secret.key"
+        db_file.write_bytes(source_bytes)
+        key_file.write_bytes(sidecar_bytes)
+        os.chmod(db_file, 0o600)
+        os.chmod(key_file, 0o600)
+        os.utime(db_file, ns=(fixed_ns, fixed_ns))
+
+    listed = backups.list_backups()
+    assert [item["id"] for item in listed] == [
+        f"bookward-{shared_second}-cccc3333",
+        f"bookward-{shared_second}-bbbb2222",
+        f"bookward-{shared_second}-aaaa1111",
+    ]
+
+    # Simulate coarse VFS mtime ticks during rapid concurrent backup/restore pruning
+    # so same-tick snapshots never compare dict < dict.
+    orig_stat = Path.stat
+
+    def coarse_stat(self: Path, *args, **kwargs):
+        st = orig_stat(self, *args, **kwargs)
+        if self.suffix == ".sqlite3" and self.name.startswith("bookward-"):
+            coarse_ns = (st.st_mtime_ns // 250_000_000) * 250_000_000
+            return os.stat_result(
+                (
+                    st.st_mode,
+                    st.st_ino,
+                    st.st_dev,
+                    st.st_nlink,
+                    st.st_uid,
+                    st.st_gid,
+                    st.st_size,
+                    st.st_atime,
+                    coarse_ns / 1e9,
+                    st.st_ctime,
+                ),
+                {
+                    "st_atime_ns": st.st_atime_ns,
+                    "st_mtime_ns": coarse_ns,
+                    "st_ctime_ns": st.st_ctime_ns,
+                },
+            )
+        return st
+
+    monkeypatch.setattr(Path, "stat", coarse_stat)
+    monkeypatch.setattr(settings, "backup_retention_count", 8)
+    baseline_id = listed[0]["id"]
+
+    def worker_op(idx: int):
+        if idx % 2 == 0:
+            return backups.create_backup()["id"]
+        return backups.restore_backup(baseline_id)["restored_backup"]
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(worker_op, idx) for idx in range(4)]
+        for future in futures:
+            assert future.result(timeout=15)
+
+    monkeypatch.setattr(settings, "backup_retention_count", 2)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        prune_futures = [executor.submit(backups.create_backup) for _ in range(4)]
+        for future in prune_futures:
+            assert future.result(timeout=15)["id"]
+
+    retained = backups.list_backups()
+    assert len(retained) == 2
+    assert second["id"] != first["id"]
+    assert private_setting("coarse_secret") == "aligned-under-coarse-mtime"

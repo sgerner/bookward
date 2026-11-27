@@ -64,6 +64,10 @@
   import { tokenForView } from "#lib/api-token-ui.js";
   import { payloadErrorMessage } from "#lib/client-errors.js";
   import {
+    parseLlmRerankMode,
+    type LlmRerankMode,
+  } from "#lib/llm-rerank.js";
+  import {
     canRunDigestNow,
     canTestDigestChannel,
     hasUnsavedDigestChanges,
@@ -341,12 +345,13 @@
   let embeddingBackendOverride = $state<string | null>(null);
   let embeddingModelOverride = $state<string | null>(null);
   let embeddingUrlOverride = $state<string | null>(null);
+  type LlmModelItem = { id: string; name: string };
   type LlmCatalogProvider = {
     id: string;
     name: string;
     api: string;
     npm: string;
-    models: Array<{ id: string; name: string }>;
+    models: LlmModelItem[];
   };
   let llmCatalogProviders = $state<LlmCatalogProvider[]>([]);
   let llmCatalogLoaded = $state(false);
@@ -356,10 +361,21 @@
   let llmActiveFilter = $state<"none" | "provider" | "model">("none");
   let llmProviderSearch = $state("");
   let llmModelSearch = $state("");
+  let llmLocalModels = $state<LlmModelItem[]>([]);
+  let llmLocalModelsLoaded = $state(false);
+  let llmLocalModelsLoading = $state(false);
+  let llmLocalModelsError = $state("");
+  let llmLocalModelsImmediate = $state(false);
+  let llmLocalModelSearch = $state("");
   let llmEnabledOverride = $state<boolean | null>(null);
+  let llmModeOverride = $state<LlmRerankMode | null>(null);
   let llmProviderOverride = $state<string | null>(null);
   let llmApiUrlOverride = $state<string | null>(null);
   let llmModelOverride = $state<string | null>(null);
+  let llmApiKeyDraft = $state("");
+  let llmClearApiKey = $state(false);
+  let llmTesting = $state(false);
+  let llmTestStatus = $state<{ ok: boolean; message: string } | null>(null);
   let revokedApiTokenIds = $state(new Set<number>());
   let bookStatusOverrides = $state<Record<number, string>>({});
   let profileHeaders = $derived({ "x-bookward-profile": data.user?.profile_id ?? "" });
@@ -740,6 +756,7 @@
   const llmRerank = $derived(
     data.profile.llm_rerank ?? {
       enabled: false,
+      mode: "cloud" as LlmRerankMode,
       provider: "",
       api_url: "https://api.openai.com/v1/chat/completions",
       model: "gpt-4o-mini",
@@ -747,9 +764,88 @@
     },
   );
   const llmEnabled = $derived(llmEnabledOverride ?? llmRerank.enabled);
+  const llmMode = $derived(
+    parseLlmRerankMode(llmModeOverride ?? llmRerank.mode, "cloud") ?? "cloud",
+  );
   const llmProvider = $derived(llmProviderOverride ?? llmRerank.provider);
   const llmApiUrl = $derived(llmApiUrlOverride ?? llmRerank.api_url);
   const llmModel = $derived(llmModelOverride ?? llmRerank.model);
+  const llmModeLabel = $derived(
+    llmMode === "ollama"
+      ? "Ollama"
+      : llmMode === "openai-compatible"
+        ? "OpenAI-compatible"
+        : "Cloud",
+  );
+  function normalizedLlmEndpointKey(raw: string, mode: LlmRerankMode): string | null {
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.includes("\\")) return null;
+    try {
+      const parsed = new URL(trimmed);
+      const scheme = parsed.protocol.toLowerCase();
+      if (scheme !== "http:" && scheme !== "https:") return null;
+      if (
+        !parsed.hostname ||
+        parsed.username ||
+        parsed.password ||
+        parsed.search ||
+        parsed.hash
+      ) {
+        return null;
+      }
+      const rawPath = parsed.pathname || "";
+      if (rawPath.includes("%") || rawPath.split("/").includes("..")) return null;
+      const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
+      const port = parsed.port || (scheme === "https:" ? "443" : "80");
+      let path = rawPath.replace(/\/+$/, "");
+      if (mode === "ollama") {
+        for (const suffix of [
+          "/api/chat",
+          "/api/tags",
+          "/api/generate",
+          "/v1/chat/completions",
+          "/v1/models",
+          "/api",
+          "/v1",
+        ]) {
+          if (path.endsWith(suffix)) {
+            path = path.slice(0, -suffix.length).replace(/\/+$/, "");
+            break;
+          }
+        }
+      } else if (!path) {
+        path = "/v1/chat/completions";
+      } else if (path.endsWith("/v1") || path.endsWith("/openai")) {
+        path = `${path}/chat/completions`;
+      }
+      return `${scheme}//${host}:${port}${path}`;
+    } catch {
+      return null;
+    }
+  }
+  const effectiveLlmApiUrl = $derived(
+    llmApiUrl.trim() || (llmMode === "ollama" ? "http://ollama:11434" : ""),
+  );
+  const canReuseSavedLlmKey = $derived.by(() => {
+    if (!llmRerank.api_key_set || llmClearApiKey) return false;
+    const savedMode = (llmRerank.mode ?? "cloud") as LlmRerankMode;
+    if (llmMode !== savedMode) return false;
+    const targetEndpoint = normalizedLlmEndpointKey(effectiveLlmApiUrl, llmMode);
+    const savedEndpoint = normalizedLlmEndpointKey(
+      llmRerank.api_url ?? "",
+      savedMode,
+    );
+    return Boolean(targetEndpoint && targetEndpoint === savedEndpoint);
+  });
+  const filteredLocalLlmModels = $derived.by(() => {
+    const q = llmLocalModelSearch.trim().toLowerCase();
+    if (!q) return llmLocalModels;
+    return llmLocalModels.filter(
+      (m) =>
+        m.name.toLowerCase().includes(q) ||
+        m.id.toLowerCase().includes(q),
+    );
+  });
   const catalogQuality = $derived(
     data.catalogQuality ?? {
       statuses: [],
@@ -836,7 +932,7 @@
 
   const llmCatalogStatusMessage = $derived(
     formatLlmCatalogStatus({
-      loaded: llmCatalogLoaded,
+      loaded: llmMode === "cloud" && llmCatalogLoaded,
       loading: llmCatalogLoading,
       hasError: Boolean(llmCatalogError),
       totalProviders: llmCatalogProviders.length,
@@ -850,12 +946,88 @@
     }),
   );
 
+  const llmLocalModelsStatusMessage = $derived.by(() => {
+    if (
+      llmMode === "cloud" ||
+      llmLocalModelsLoading ||
+      Boolean(llmLocalModelsError) ||
+      !llmLocalModelsLoaded ||
+      llmLocalModels.length === 0
+    ) {
+      return "";
+    }
+    const q = llmLocalModelSearch.trim();
+    const total = llmLocalModels.length;
+    const matched = filteredLocalLlmModels.length;
+    if (q) {
+      if (matched === 0) {
+        return `No discovered models match "${q}".`;
+      }
+      return `${matched} of ${total} discovered ${total === 1 ? "model matches" : "models match"}.`;
+    }
+    return `Discovered ${total} ${total === 1 ? "model" : "models"}.`;
+  });
+
+  function handleLlmModeChange(nextMode: LlmRerankMode) {
+    llmModeOverride = nextMode;
+    llmLocalModels = [];
+    llmLocalModelsLoaded = false;
+    llmLocalModelsError = "";
+    llmLocalModelsImmediate = false;
+    llmLocalModelSearch = "";
+    llmActiveFilter = "none";
+    llmCatalogError = "";
+    llmTestStatus = null;
+    const savedMode = (llmRerank.mode ?? "cloud") as LlmRerankMode;
+    if (nextMode === "ollama") {
+      llmProviderOverride = "ollama";
+      if (savedMode === "ollama" && llmRerank.api_url) {
+        llmApiUrlOverride = llmRerank.api_url;
+      } else if (!llmApiUrl || llmApiUrl.startsWith("https://")) {
+        llmApiUrlOverride = "http://ollama:11434";
+      }
+      if (savedMode === "ollama" && llmRerank.model) {
+        llmModelOverride = llmRerank.model;
+      } else if (llmModel === "gpt-4o-mini") {
+        llmModelOverride = "";
+      }
+    } else if (nextMode === "openai-compatible") {
+      llmProviderOverride = "openai-compatible";
+      if (savedMode === "openai-compatible") {
+        llmApiUrlOverride = llmRerank.api_url;
+        llmModelOverride = llmRerank.model;
+      } else {
+        if (
+          llmApiUrl === "https://api.openai.com/v1/chat/completions" ||
+          llmApiUrl === "http://ollama:11434"
+        ) {
+          llmApiUrlOverride = "";
+        }
+        if (llmModel === "gpt-4o-mini") {
+          llmModelOverride = "";
+        }
+      }
+    } else {
+      llmProviderOverride = savedMode === "cloud" ? llmRerank.provider : "";
+      llmApiUrlOverride =
+        savedMode === "cloud" && llmRerank.api_url
+          ? llmRerank.api_url
+          : "https://api.openai.com/v1/chat/completions";
+      llmModelOverride =
+        savedMode === "cloud" && llmRerank.model
+          ? llmRerank.model
+          : "gpt-4o-mini";
+    }
+  }
+
   async function loadLlmCatalog() {
     if (llmCatalogLoading) return;
     llmCatalogLoading = true;
     llmCatalogError = "";
     try {
-      const response = await fetch("/api/llm/models");
+      const response = await fetch("/api/llm/models", {
+        headers: data.user?.profile_id ? profileHeaders : undefined,
+      });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
         llmCatalogError = payloadErrorMessage(body, "Could not load models.dev catalog.");
@@ -875,11 +1047,120 @@
     }
   }
 
+  async function loadLocalLlmModels() {
+    if (llmLocalModelsLoading) return;
+    llmLocalModelsLoading = true;
+    llmLocalModelsError = "";
+    llmTestStatus = null;
+    try {
+      const typedKey = llmApiKeyDraft.trim();
+      const targetUrl = effectiveLlmApiUrl;
+      const reuseSavedKey = !typedKey && canReuseSavedLlmKey;
+      let response: Response;
+      if (typedKey || reuseSavedKey) {
+        response = await fetch("/api/llm/models", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(data.user?.profile_id ? profileHeaders : {}),
+          },
+          body: JSON.stringify({
+            mode: llmMode,
+            api_url: targetUrl,
+            api_key: typedKey,
+            use_saved_key: reuseSavedKey,
+          }),
+        });
+      } else {
+        const params = new URLSearchParams({
+          mode: llmMode,
+        });
+        if (targetUrl) params.set("api_url", targetUrl);
+        response = await fetch(`/api/llm/models?${params.toString()}`, {
+          headers: data.user?.profile_id ? profileHeaders : undefined,
+        });
+      }
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        llmLocalModelsError = payloadErrorMessage(
+          body,
+          "Could not discover models from endpoint.",
+        );
+        return;
+      }
+      const models = Array.isArray(body?.models) ? body.models : [];
+      llmLocalModels = models;
+      llmLocalModelsLoaded = true;
+      llmLocalModelsImmediate = true;
+      if (!llmModel.trim() && models.length > 0) {
+        llmModelOverride = models[0].id;
+      }
+      if (models.length === 0) {
+        llmLocalModelsError =
+          "Connected, but no installed models were returned. Enter a model ID manually.";
+      }
+    } catch (error) {
+      llmLocalModelsError =
+        error instanceof Error
+          ? error.message
+          : "Could not discover models from endpoint.";
+    } finally {
+      llmLocalModelsLoading = false;
+    }
+  }
+
+  async function testLlmConnection() {
+    if (llmTesting) return;
+    llmTesting = true;
+    llmTestStatus = null;
+    try {
+      const typedKey = llmApiKeyDraft.trim();
+      const targetUrl = effectiveLlmApiUrl;
+      const response = await fetch("/api/llm/test", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(data.user?.profile_id ? profileHeaders : {}),
+        },
+        body: JSON.stringify({
+          mode: llmMode,
+          api_url: targetUrl,
+          model: llmModel.trim(),
+          api_key: typedKey,
+          use_saved_key: !typedKey && canReuseSavedLlmKey,
+        }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        llmTestStatus = {
+          ok: false,
+          message: payloadErrorMessage(body, "Connection check failed."),
+        };
+        return;
+      }
+      const latency =
+        typeof body?.latency_ms === "number" ? ` (${body.latency_ms} ms)` : "";
+      llmTestStatus = {
+        ok: true,
+        message: `Connected and verified JSON response from ${body?.model || llmModel}${latency}.`,
+      };
+    } catch (error) {
+      llmTestStatus = {
+        ok: false,
+        message:
+          error instanceof Error ? error.message : "Connection check failed.",
+      };
+    } finally {
+      llmTesting = false;
+    }
+  }
+
   function handleLlmProviderChange(providerId: string) {
     llmProviderOverride = providerId;
     llmModelSearch = "";
     llmActiveFilter = "none";
     llmCatalogImmediate = true;
+    llmTestStatus = null;
     const match = llmCatalogProviders.find((p) => p.id === providerId);
     if (!match) return;
     if (match.api) {
@@ -2005,6 +2286,24 @@
         embeddingBackendOverride = null;
         embeddingModelOverride = null;
         embeddingUrlOverride = null;
+      },
+    };
+  }
+
+  function optimisticLlmRerank() {
+    llmTestStatus = null;
+    return {
+      commit: () => {
+        llmEnabledOverride = null;
+        llmModeOverride = null;
+        llmProviderOverride = null;
+        llmApiUrlOverride = null;
+        llmModelOverride = null;
+        llmApiKeyDraft = "";
+        llmClearApiKey = false;
+      },
+      rollback: () => {
+        // Keep form drafts intact so the user can adjust fields on error.
       },
     };
   }
@@ -5388,125 +5687,66 @@
                       LLM reranker
                     </h2>
                   </div>
-                  <span
-                    class={`badge shrink-0 ${llmEnabled ? "preset-tonal-success" : "preset-tonal-surface"}`}
-                    >{llmEnabled ? "Enabled" : "Disabled"}</span
-                  >
+                  <div class="flex flex-wrap items-center gap-2">
+                    <span class="badge preset-tonal-surface">{llmModeLabel}</span>
+                    <span
+                      class={`badge ${llmEnabled ? "preset-tonal-success" : "preset-tonal-surface"}`}
+                      >{llmEnabled ? "Enabled" : "Disabled"}</span
+                    >
+                  </div>
                 </div>
                 <p class="text-sm leading-6 text-surface-700-300">
-                  Optionally rerank top recommendations with an OpenAI-compatible LLM. Pick a provider and model from
+                  Optionally rerank top recommendations locally with native Ollama or an OpenAI-compatible server (no API key needed), or connect a cloud provider via
                   <a
                     class="inline-flex min-h-6 items-center font-medium text-primary-600-400 underline underline-offset-2"
                     href="https://models.dev"
                     target="_blank"
                     rel="noopener noreferrer"
                     >models.dev</a
-                  >
-                  or enter an endpoint directly.
+                  >.
                 </p>
-                <div class="mt-4 min-w-0 space-y-3 border border-surface-300-700/50 p-3">
-                  <div class="flex flex-wrap items-center justify-between gap-2">
-                    <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400"
-                      >models.dev selector</span
-                    >
-                    <button
-                      type="button"
-                      class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
-                      onclick={() => void loadLlmCatalog()}
-                      disabled={llmCatalogLoading}
-                      aria-busy={llmCatalogLoading}
-                    >
-                      {#if llmCatalogLoading}<RefreshCw
-                          size={14}
-                          class="animate-spin"
-                        />{:else}<Search size={14} />{/if}
-                      {llmCatalogProviders.length ? "Refresh catalog" : "Load models.dev catalog"}
-                    </button>
-                  </div>
-                  <StatusRegion
-                    message={llmCatalogStatusMessage}
-                    immediate={llmCatalogImmediate}
-                    paused={activeView !== "settings"}
-                  />
-                  <InlineAlert message={llmCatalogError} size="sm" />
-                  {#if llmCatalogProviders.length > 0}
-                    <div class="grid min-w-0 gap-3 sm:grid-cols-2">
-                      <div class="min-w-0">
-                        <label class="block min-w-0 text-xs font-medium text-surface-700-300"
-                          >Filter provider<input
-                            class="input mt-1"
-                            type="search"
-                            bind:value={llmProviderSearch}
-                            oninput={() => {
-                              llmActiveFilter = "provider";
-                              llmCatalogImmediate = false;
-                            }}
-                            placeholder="Search OpenAI, Google, Groq…"
-                          /></label
-                        >
-                        <label class="mt-2 block min-w-0 text-xs font-medium text-surface-700-300"
-                          >Provider<select
-                            class="select mt-1"
-                            value={llmProvider}
-                            onchange={(event) =>
-                              handleLlmProviderChange(
-                                (event.currentTarget as HTMLSelectElement).value,
-                              )}
-                          >
-                            <option value="">Choose provider…</option>
-                            {#each filteredLlmProviders as provider (provider.id)}
-                              <option value={provider.id}
-                                >{provider.name} ({provider.models.length})</option
-                              >
-                            {/each}
-                          </select></label
-                        >
-                      </div>
-                      <div class="min-w-0">
-                        <label class="block min-w-0 text-xs font-medium text-surface-700-300"
-                          >Filter model<input
-                            class="input mt-1"
-                            type="search"
-                            bind:value={llmModelSearch}
-                            oninput={() => {
-                              llmActiveFilter = "model";
-                              llmCatalogImmediate = false;
-                            }}
-                            placeholder="Search model ID or name…"
-                            disabled={!selectedCatalogProvider}
-                          /></label
-                        >
-                        <label class="mt-2 block min-w-0 text-xs font-medium text-surface-700-300"
-                          >Model<select
-                            class="select mt-1"
-                            value={llmModel}
-                            disabled={!selectedCatalogProvider}
-                            onchange={(event) => {
-                              llmModelOverride = (
-                                event.currentTarget as HTMLSelectElement
-                              ).value;
-                            }}
-                          >
-                            <option value="">Choose model…</option>
-                            {#each filteredLlmModels as model (model.id)}
-                              <option value={model.id}
-                                >{model.name} ({model.id})</option
-                              >
-                            {/each}
-                          </select></label
-                        >
-                      </div>
-                    </div>
-                  {/if}
-                </div>
                 <form
-                  class="mt-4 space-y-4"
+                  class="mt-4 min-w-0 space-y-4"
                   method="POST"
                   action="?/configureLlmRerank"
-                  use:enhance={setPending("llm-rerank")}
+                  use:enhance={setPending("llm-rerank", optimisticLlmRerank)}
                 >
                   <ProfileField profileId={data.user?.profile_id} />
                   <input type="hidden" name="provider" value={llmProvider} />
+                  <StatusRegion
+                    message={llmMode === "cloud" ? llmCatalogStatusMessage : llmLocalModelsStatusMessage}
+                    immediate={llmMode === "cloud" ? llmCatalogImmediate : llmLocalModelsImmediate}
+                    contextKey={`llm-models-${llmMode}`}
+                    paused={activeView !== "settings"}
+                  />
+                  <label class="block min-w-0 text-sm font-medium text-surface-800-200"
+                    >Provider mode<select
+                      class="select mt-2"
+                      name="mode"
+                      value={llmMode}
+                      onchange={(event) =>
+                        handleLlmModeChange(
+                          (event.currentTarget as HTMLSelectElement)
+                            .value as LlmRerankMode,
+                        )}
+                    >
+                      <option
+                        value="ollama"
+                        selected={llmMode === "ollama"}
+                        >Ollama · local native</option
+                      >
+                      <option
+                        value="openai-compatible"
+                        selected={llmMode === "openai-compatible"}
+                        >OpenAI-compatible · local or custom</option
+                      >
+                      <option
+                        value="cloud"
+                        selected={llmMode === "cloud"}
+                        >Cloud catalog · models.dev</option
+                      >
+                    </select></label
+                  >
                   <label
                     class="flex min-h-11 cursor-pointer items-center gap-3 text-sm font-medium text-surface-800-200"
                     ><input
@@ -5514,65 +5754,281 @@
                       type="checkbox"
                       name="enabled"
                       checked={llmEnabled}
-                      onchange={(event) =>
-                        (llmEnabledOverride = (
+                      onchange={(event) => {
+                        llmEnabledOverride = (
                           event.currentTarget as HTMLInputElement
-                        ).checked)}
+                        ).checked;
+                        llmTestStatus = null;
+                      }}
                     />
                     Enable LLM reranking</label
                   >
-                  <label class="block text-sm font-medium text-surface-800-200"
-                    >API URL<input
+                  <label class="block min-w-0 text-sm font-medium text-surface-800-200"
+                    >{llmMode === "ollama"
+                      ? "Ollama server URL"
+                      : llmMode === "openai-compatible"
+                        ? "Server endpoint URL"
+                        : "API URL"}<input
                       class="input mt-2"
                       name="apiUrl"
                       type="url"
                       value={llmApiUrl}
-                      oninput={(event) =>
-                        (llmApiUrlOverride = (
+                      oninput={(event) => {
+                        llmApiUrlOverride = (
                           event.currentTarget as HTMLInputElement
-                        ).value)}
-                      placeholder="https://api.openai.com/v1/chat/completions"
+                        ).value;
+                        llmTestStatus = null;
+                      }}
+                      placeholder={llmMode === "ollama"
+                        ? "http://ollama:11434"
+                        : llmMode === "openai-compatible"
+                          ? "http://vllm:8000/v1"
+                          : "https://api.openai.com/v1/chat/completions"}
                     /></label
                   >
-                  <label class="block text-sm font-medium text-surface-800-200"
+                  {#if llmMode === "ollama" || llmMode === "openai-compatible"}
+                    <div class="min-w-0 space-y-3 border border-surface-300-700/50 p-3">
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400"
+                          >{llmMode === "ollama"
+                            ? "Installed Ollama models"
+                            : "Endpoint model discovery"}</span
+                        >
+                        <button
+                          type="button"
+                          class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
+                          onclick={() => void loadLocalLlmModels()}
+                          disabled={llmLocalModelsLoading}
+                          aria-busy={llmLocalModelsLoading}
+                        >
+                          {#if llmLocalModelsLoading}<RefreshCw
+                              size={14}
+                              class="animate-spin"
+                            />{:else}<Search size={14} />{/if}
+                          {llmLocalModels.length
+                            ? "Refresh models"
+                            : llmMode === "ollama"
+                              ? "Load installed models"
+                              : "Discover models"}
+                        </button>
+                      </div>
+                      <InlineAlert message={llmLocalModelsError} size="sm" />
+                      {#if llmLocalModels.length > 0}
+                        <div class="grid min-w-0 gap-3 sm:grid-cols-2">
+                          {#if llmLocalModels.length > 5}
+                            <label class="block min-w-0 text-xs font-medium text-surface-700-300"
+                              >Filter discovered models<input
+                                class="input mt-1"
+                                type="search"
+                                bind:value={llmLocalModelSearch}
+                                oninput={() => {
+                                  llmLocalModelsImmediate = false;
+                                }}
+                                placeholder="Search model name…"
+                              /></label
+                            >
+                          {/if}
+                          <label class={`block min-w-0 text-xs font-medium text-surface-700-300 ${llmLocalModels.length <= 5 ? "sm:col-span-2" : ""}`}
+                            >Available models<select
+                              class="select mt-1"
+                              value={llmModel}
+                              onchange={(event) => {
+                                llmModelOverride = (
+                                  event.currentTarget as HTMLSelectElement
+                                ).value;
+                                llmTestStatus = null;
+                              }}
+                            >
+                              <option value="">Choose discovered model…</option>
+                              {#each filteredLocalLlmModels as model (model.id)}
+                                <option value={model.id}
+                                  >{model.name === model.id
+                                    ? model.id
+                                    : `${model.name} (${model.id})`}</option
+                                >
+                              {/each}
+                            </select></label
+                          >
+                        </div>
+                      {/if}
+                    </div>
+                  {:else}
+                    <div class="min-w-0 space-y-3 border border-surface-300-700/50 p-3">
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <span class="text-xs font-semibold uppercase tracking-wide text-surface-600-400"
+                          >models.dev selector</span
+                        >
+                        <button
+                          type="button"
+                          class="btn btn-sm btn-reflow min-h-9 preset-tonal-secondary"
+                          onclick={() => void loadLlmCatalog()}
+                          disabled={llmCatalogLoading}
+                          aria-busy={llmCatalogLoading}
+                        >
+                          {#if llmCatalogLoading}<RefreshCw
+                              size={14}
+                              class="animate-spin"
+                            />{:else}<Search size={14} />{/if}
+                          {llmCatalogProviders.length ? "Refresh catalog" : "Load models.dev catalog"}
+                        </button>
+                      </div>
+                      <InlineAlert message={llmCatalogError} size="sm" />
+                      {#if llmCatalogProviders.length > 0}
+                        <div class="grid min-w-0 gap-3 sm:grid-cols-2">
+                          <div class="min-w-0">
+                            <label class="block min-w-0 text-xs font-medium text-surface-700-300"
+                              >Filter provider<input
+                                class="input mt-1"
+                                type="search"
+                                bind:value={llmProviderSearch}
+                                oninput={() => {
+                                  llmActiveFilter = "provider";
+                                  llmCatalogImmediate = false;
+                                }}
+                                placeholder="Search OpenAI, Google, Groq…"
+                              /></label
+                            >
+                            <label class="mt-2 block min-w-0 text-xs font-medium text-surface-700-300"
+                              >Provider<select
+                                class="select mt-1"
+                                value={llmProvider}
+                                onchange={(event) =>
+                                  handleLlmProviderChange(
+                                    (event.currentTarget as HTMLSelectElement).value,
+                                  )}
+                              >
+                                <option value="">Choose provider…</option>
+                                {#each filteredLlmProviders as provider (provider.id)}
+                                  <option value={provider.id}
+                                    >{provider.name} ({provider.models.length})</option
+                                  >
+                                {/each}
+                              </select></label
+                            >
+                          </div>
+                          <div class="min-w-0">
+                            <label class="block min-w-0 text-xs font-medium text-surface-700-300"
+                              >Filter model<input
+                                class="input mt-1"
+                                type="search"
+                                bind:value={llmModelSearch}
+                                oninput={() => {
+                                  llmActiveFilter = "model";
+                                  llmCatalogImmediate = false;
+                                }}
+                                placeholder="Search model ID or name…"
+                                disabled={!selectedCatalogProvider}
+                              /></label
+                            >
+                            <label class="mt-2 block min-w-0 text-xs font-medium text-surface-700-300"
+                              >Model<select
+                                class="select mt-1"
+                                value={llmModel}
+                                disabled={!selectedCatalogProvider}
+                                onchange={(event) => {
+                                  llmModelOverride = (
+                                    event.currentTarget as HTMLSelectElement
+                                  ).value;
+                                  llmTestStatus = null;
+                                }}
+                              >
+                                <option value="">Choose model…</option>
+                                {#each filteredLlmModels as model (model.id)}
+                                  <option value={model.id}
+                                    >{model.name} ({model.id})</option
+                                  >
+                                {/each}
+                              </select></label
+                            >
+                          </div>
+                        </div>
+                      {/if}
+                    </div>
+                  {/if}
+                  <label class="block min-w-0 text-sm font-medium text-surface-800-200"
                     >Model<input
                       class="input mt-2"
                       name="model"
                       value={llmModel}
-                      oninput={(event) =>
-                        (llmModelOverride = (
+                      oninput={(event) => {
+                        llmModelOverride = (
                           event.currentTarget as HTMLInputElement
-                        ).value)}
-                      placeholder="gpt-4o-mini"
+                        ).value;
+                        llmTestStatus = null;
+                      }}
+                      placeholder={llmMode === "ollama"
+                        ? "qwen2.5:7b"
+                        : llmMode === "openai-compatible"
+                          ? "Qwen/Qwen2.5-7B-Instruct"
+                          : "gpt-4o-mini"}
                     /></label
                   >
-                  <label class="block text-sm font-medium text-surface-800-200"
-                    >API key<input
+                  <label class="block min-w-0 text-sm font-medium text-surface-800-200"
+                    >{llmMode === "cloud" ? "API key" : "API key (optional)"}<input
                       class="input mt-2"
                       name="apiKey"
                       type="password"
+                      bind:value={llmApiKeyDraft}
+                      oninput={() => {
+                        llmTestStatus = null;
+                      }}
                       placeholder={llmRerank.api_key_set
-                        ? "Already configured · leave blank to keep"
-                        : "sk-…"}
+                        ? canReuseSavedLlmKey
+                          ? "Already configured · leave blank to keep"
+                          : "Mode or endpoint changed · enter a new key or clear saved key"
+                        : llmMode === "cloud"
+                          ? "sk-…"
+                          : "Optional · leave blank for keyless local servers"}
                     /></label
                   >
                   {#if llmRerank.api_key_set}
                     <label
                       class="flex min-h-10 cursor-pointer items-center gap-3 text-xs text-surface-700-300"
-                      ><input class="checkbox size-6 shrink-0" type="checkbox" name="clearApiKey" />
+                      ><input
+                        class="checkbox size-6 shrink-0"
+                        type="checkbox"
+                        name="clearApiKey"
+                        bind:checked={llmClearApiKey}
+                        onchange={() => {
+                          llmTestStatus = null;
+                        }}
+                      />
                       Clear saved LLM API key</label
                     >
                   {/if}
-                  <button
-                    class="btn btn-reflow min-h-11 w-full preset-filled-primary-500"
-                    type="submit"
-                    disabled={isPending("llm-rerank")}
-                    aria-busy={isPending("llm-rerank")}
-                    >{#if isPending("llm-rerank")}<RefreshCw
-                        size={16}
-                        class="animate-spin"
-                      />{:else}<Check size={16} />{/if} Save LLM reranker</button
-                  >
+                  <StatusRegion
+                    message={llmTestStatus?.ok ? llmTestStatus.message : ""}
+                    immediate
+                    paused={activeView !== "settings"}
+                    class={llmTestStatus?.ok ? "text-xs text-success-700-300" : "sr-only"}
+                  />
+                  {#if llmTestStatus && !llmTestStatus.ok}
+                    <InlineAlert message={llmTestStatus.message} size="sm" />
+                  {/if}
+                  <div class="grid gap-3 sm:grid-cols-2">
+                    <button
+                      class="btn btn-reflow min-h-11 w-full preset-tonal-secondary"
+                      type="button"
+                      onclick={() => void testLlmConnection()}
+                      disabled={llmTesting || isPending("llm-rerank")}
+                      aria-busy={llmTesting}
+                      >{#if llmTesting}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<Sparkles size={16} />{/if} Test connection</button
+                    >
+                    <button
+                      class="btn btn-reflow min-h-11 w-full preset-filled-primary-500"
+                      type="submit"
+                      disabled={isPending("llm-rerank")}
+                      aria-busy={isPending("llm-rerank")}
+                      >{#if isPending("llm-rerank")}<RefreshCw
+                          size={16}
+                          class="animate-spin"
+                        />{:else}<Check size={16} />{/if}
+                      {llmEnabled ? "Save and test reranker" : "Save LLM reranker"}</button
+                    >
+                  </div>
                 </form>
               </section>
               <section

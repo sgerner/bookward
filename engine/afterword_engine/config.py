@@ -47,9 +47,11 @@ class Settings(BaseSettings):
     impression_fatigue_penalty_per_day: float = 0.75
     impression_fatigue_max_penalty: float = 4.5
     llm_rerank_enabled: bool = False
+    llm_rerank_mode: str = "cloud"
     llm_rerank_api_url: str = "https://api.openai.com/v1/chat/completions"
     llm_rerank_api_key: str = ""
     llm_rerank_model: str = "gpt-4o-mini"
+    llm_rerank_allowed_hosts: str = "ollama"
     llm_rerank_top_k: int = 24
     llm_rerank_timeout_seconds: float = 25.0
     llm_rerank_max_delta: float = 1.2

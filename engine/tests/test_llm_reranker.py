@@ -982,7 +982,13 @@ def test_ssrf_validation_redirect_rejection_and_host_credential_isolation(
         def send(self, request, *, stream: bool = False, **kwargs):
             assert stream is True
             headers = request.get("headers") or {}
-            seen_requests.append((request["url"], headers.get("Authorization", "")))
+            seen_requests.append(
+                (
+                    request["url"],
+                    headers.get("Authorization", ""),
+                    headers.get("Host", ""),
+                )
+            )
 
             class RedirectResp:
                 status_code = 307
@@ -1005,7 +1011,8 @@ def test_ssrf_validation_redirect_rejection_and_host_credential_isolation(
     )
     assert fallback_diag == {"applied": False, "reason": "fallback"}
     assert len(seen_requests) == 1
-    assert seen_requests[0][0] == "https://custom-llm.example.com/v1/chat/completions"
+    assert seen_requests[0][0] == "https://93.184.216.34/v1/chat/completions"
+    assert seen_requests[0][2] == "custom-llm.example.com"
 
 
 def test_prompt_injection_guardrail_and_hostile_description_delta_clamp(monkeypatch) -> None:
@@ -1393,7 +1400,7 @@ def test_rerank_with_llm_sync_caches_clamps_timeout_and_disables_redirects(monke
     assert [c["id"] for c in r1] == [2, 1]
     assert calls[0]["timeout"] == 25.0
     assert calls[0]["follow_redirects"] is False
-    assert calls[0]["kwargs"].get("trust_env") is not False
+    assert calls[0]["kwargs"].get("trust_env") is False
 
     r2, d2 = rerank_with_llm_sync(
         reads,
@@ -1692,4 +1699,1748 @@ def test_serving_runs_llm_rerank_before_diversify_discovery_slate(
     run_meta = json.loads(row("SELECT metadata FROM recommendation_runs WHERE id=?", (run_id,))["metadata"])
     assert run_meta["interaction_learning"]["llm_rerank"]["applied"] is True
     assert run_meta["discovery_slate"]["author_repeat_swaps"] == 2
+
+
+def test_extract_llm_json_handles_think_tags_fences_and_prose() -> None:
+    from afterword_engine.llm_reranker import extract_llm_json
+    import pytest
+
+    fenced = '<think>\nEvaluating slate...\n</think>\nHere is the result:\n```json\n{"adjustments": [{"id": 10, "delta": 0.7, "reason": "Speculative match"}]}\n```'
+    assert extract_llm_json(fenced) == {
+        "adjustments": [{"id": 10, "delta": 0.7, "reason": "Speculative match"}]
+    }
+
+    embedded = 'Note: model lacks json_object flag -> {"adjustments": [{"id": 11, "delta": -0.8, "reason": "Canon"}]} trailing text'
+    assert extract_llm_json(embedded) == {
+        "adjustments": [{"id": 11, "delta": -0.8, "reason": "Canon"}]
+    }
+
+    with pytest.raises(ValueError, match="valid JSON"):
+        extract_llm_json("No structured output available here.")
+
+
+def test_ollama_mode_saves_keyless_discovers_offline_and_reranks_recommendations(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import httpx
+    import respx
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+    from afterword_engine import profiles
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize, rows, transaction
+    import afterword_engine.main as main_module
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "ollama_test.db"))
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "ollama")
+    initialize()
+    profiles.initialize_auth()
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='recommended', score=80.0 WHERE id=1")
+        con.execute("UPDATE candidates SET status='recommended', score=79.5 WHERE id=2")
+
+    main_module._MODELS_DEV_CACHE["providers"] = []
+    main_module._MODELS_DEV_CACHE["expires_at"] = 0.0
+
+    with respx.mock(assert_all_called=False) as mock_http:
+        mock_http.get("https://models.dev/api.json").mock(
+            side_effect=httpx.ConnectError("offline host")
+        )
+        tags_route = mock_http.get("http://ollama:11434/api/tags").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {"name": "qwen2.5:7b", "model": "qwen2.5:7b"},
+                        {"name": "llama3.2:3b", "model": "llama3.2:3b"},
+                    ]
+                },
+            )
+        )
+        chat_route = mock_http.post("http://ollama:11434/api/chat").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {
+                                "adjustments": [
+                                    {"id": 2, "delta": 1.1, "reason": "Strong local match"},
+                                    {"id": 1, "delta": -0.9, "reason": "Older classic"},
+                                ]
+                            }
+                        ),
+                    }
+                },
+            )
+        )
+
+        with TestClient(main_module.app, headers=authenticated_headers()) as client:
+            # Cloud catalog fails offline, but local Ollama discovery and saving still succeed
+            cloud_resp = client.get("/api/llm/models")
+            assert cloud_resp.status_code == 502
+
+            ollama_models = client.get(
+                "/api/llm/models", params={"mode": "ollama", "api_url": "http://ollama:11434"}
+            )
+            assert ollama_models.status_code == 200
+            assert [m["id"] for m in ollama_models.json()["models"]] == [
+                "llama3.2:3b",
+                "qwen2.5:7b",
+            ]
+            assert tags_route.called
+            assert "authorization" not in tags_route.calls[0].request.headers
+
+            save_resp = client.put(
+                "/api/settings/llm-rerank",
+                json={
+                    "enabled": True,
+                    "mode": "ollama",
+                    "api_url": "",
+                    "model": "qwen2.5:7b",
+                    "api_key": "",
+                },
+            )
+            assert save_resp.status_code == 200, save_resp.text
+            saved_body = save_resp.json()
+            assert saved_body["llm_rerank"]["enabled"] is True
+            assert saved_body["llm_rerank"]["mode"] == "ollama"
+            assert saved_body["llm_rerank"]["api_url"] == "http://ollama:11434"
+            assert saved_body["llm_rerank"]["api_key_set"] is False
+            assert saved_body["health"]["checked"] is True
+            assert "authorization" not in chat_route.calls[0].request.headers
+
+            overview = client.get("/api/overview")
+            assert overview.status_code == 200
+            recs = [
+                r
+                for r in overview.json()["recommendations"]
+                if r["id"] in {1, 2}
+            ]
+            assert [r["id"] for r in recs] == [2, 1]
+            assert any("Strong local match" in exp for exp in recs[0]["explanation"])
+
+
+def test_openai_compatible_mode_keyless_and_optional_key_lifecycle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import httpx
+    import respx
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+    from afterword_engine import profiles
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize, transaction
+    import afterword_engine.main as main_module
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "openai_compat.db"))
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "ollama,vllm")
+    initialize()
+    profiles.initialize_auth()
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='recommended', score=81.0 WHERE id=1")
+        con.execute("UPDATE candidates SET status='recommended', score=80.5 WHERE id=2")
+
+    with respx.mock(assert_all_called=False) as mock_http:
+        models_route = mock_http.get("http://vllm:8000/v1/models").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [{"id": "Qwen/Qwen2.5-7B-Instruct", "object": "model"}],
+                },
+            )
+        )
+        chat_route = mock_http.post("http://vllm:8000/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "adjustments": [
+                                            {"id": 2, "delta": 1.0, "reason": "Contemporary sci-fi"}
+                                        ]
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        )
+
+        with TestClient(main_module.app, headers=authenticated_headers()) as client:
+            disc = client.get(
+                "/api/llm/models",
+                params={"mode": "openai-compatible", "api_url": "http://vllm:8000/v1"},
+            )
+            assert disc.status_code == 200
+            assert disc.json()["models"] == [
+                {"id": "Qwen/Qwen2.5-7B-Instruct", "name": "Qwen/Qwen2.5-7B-Instruct"}
+            ]
+            assert "authorization" not in models_route.calls[-1].request.headers
+
+            # Keyless save & recommendation reranking omits Authorization header
+            saved = client.put(
+                "/api/settings/llm-rerank",
+                json={
+                    "enabled": True,
+                    "mode": "openai-compatible",
+                    "api_url": "http://vllm:8000",
+                    "model": "Qwen/Qwen2.5-7B-Instruct",
+                },
+            )
+            assert saved.status_code == 200
+            assert saved.json()["llm_rerank"]["api_key_set"] is False
+            assert "authorization" not in chat_route.calls[-1].request.headers
+
+            overview = client.get("/api/overview")
+            assert overview.status_code == 200
+            recs = [r for r in overview.json()["recommendations"] if r["id"] in {1, 2}]
+            assert [r["id"] for r in recs] == [2, 1]
+            assert "authorization" not in chat_route.calls[-1].request.headers
+
+            # Supply optional API key, keep it on blank save, then clear it while staying enabled
+            with_key = client.put(
+                "/api/settings/llm-rerank",
+                json={
+                    "enabled": True,
+                    "mode": "openai-compatible",
+                    "api_url": "http://vllm:8000/v1",
+                    "model": "Qwen/Qwen2.5-7B-Instruct",
+                    "api_key": "local-vllm-secret",
+                },
+            )
+            assert with_key.status_code == 200
+            assert with_key.json()["llm_rerank"]["api_key_set"] is True
+            assert (
+                chat_route.calls[-1].request.headers.get("authorization")
+                == "Bearer local-vllm-secret"
+            )
+
+            kept_key = client.put(
+                "/api/settings/llm-rerank",
+                json={
+                    "enabled": True,
+                    "mode": "openai-compatible",
+                    "api_url": "http://vllm:8000/v1",
+                    "model": "Qwen/Qwen2.5-7B-Instruct",
+                    "api_key": "",
+                },
+            )
+            assert kept_key.status_code == 200
+            assert kept_key.json()["llm_rerank"]["api_key_set"] is True
+
+            cleared_key = client.put(
+                "/api/settings/llm-rerank",
+                json={
+                    "enabled": True,
+                    "mode": "openai-compatible",
+                    "api_url": "http://vllm:8000/v1",
+                    "model": "Qwen/Qwen2.5-7B-Instruct",
+                    "clear_api_key": True,
+                },
+            )
+            assert cleared_key.status_code == 200
+            assert cleared_key.json()["llm_rerank"]["api_key_set"] is False
+            assert "authorization" not in chat_route.calls[-1].request.headers
+
+
+def test_local_reranker_plain_schema_fallback_and_unparseable_output(monkeypatch) -> None:
+    import httpx
+    import respx
+    from afterword_engine.config import settings
+    from afterword_engine.llm_reranker import clear_llm_rerank_cache
+
+    clear_llm_rerank_cache()
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "ollama,llamacpp")
+    reads = [{"title": "Dune", "author": "Frank Herbert", "rating": 5.0}]
+    candidates = [
+        {"id": 10, "title": "Classic", "score": 80.0, "explanation": []},
+        {"id": 11, "title": "Modern", "score": 79.4, "explanation": []},
+    ]
+
+    seen_payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        seen_payloads.append(body)
+        if "response_format" in body:
+            return httpx.Response(400, json={"error": "response_format is not supported"})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '<think>Checking...</think>\n```json\n{"adjustments": [{"id": 11, "delta": 1.0, "reason": "Fresh match"}]}\n```'
+                        }
+                    }
+                ]
+            },
+        )
+
+    with respx.mock:
+        respx.post("http://llamacpp:8080/v1/chat/completions").mock(side_effect=handler)
+        reranked, diag = rerank_with_llm_sync(
+            reads,
+            candidates,
+            mode="openai-compatible",
+            api_url="http://llamacpp:8080/v1",
+            model="local-gguf",
+        )
+    assert len(seen_payloads) == 2
+    assert "response_format" in seen_payloads[0]
+    assert "response_format" not in seen_payloads[1]
+    assert diag["applied"] is True
+    assert [c["id"] for c in reranked] == [11, 10]
+
+    # Unparseable output keeps base rankings safely
+    clear_llm_rerank_cache()
+    with respx.mock:
+        respx.post("http://llamacpp:8080/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "I cannot produce JSON right now."}}]},
+            )
+        )
+        fallback_items, fallback_diag = rerank_with_llm_sync(
+            reads,
+            candidates,
+            mode="openai-compatible",
+            api_url="http://llamacpp:8080/v1",
+            model="local-gguf",
+        )
+    assert fallback_diag == {"applied": False, "reason": "fallback"}
+    assert [c["id"] for c in fallback_items] == [10, 11]
+
+
+def test_ssrf_blocks_unapproved_private_loopback_and_link_local_before_socket(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import socket
+    import httpx
+    import pytest
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+    from afterword_engine import profiles
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize
+    import afterword_engine.llm_reranker as reranker_module
+    import afterword_engine.main as main_module
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "ssrf_test.db"))
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "ollama")
+    initialize()
+    profiles.initialize_auth()
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def controlled_getaddrinfo(host, port, *args, **kwargs):
+        if host == "unapproved-internal":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("172.18.0.9", port or 80))]
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", controlled_getaddrinfo)
+
+    client_init_kwargs: list[dict] = []
+
+    class GuardedAsyncClient:
+        def __init__(self, *args, **kwargs):
+            client_init_kwargs.append(kwargs)
+            raise AssertionError("Outbound AsyncClient should never be instantiated for blocked SSRF URLs")
+
+    class GuardedSyncClient:
+        def __init__(self, *args, **kwargs):
+            client_init_kwargs.append(kwargs)
+            raise AssertionError("Outbound sync Client should never be instantiated for blocked SSRF URLs")
+
+    monkeypatch.setattr(reranker_module.httpx, "AsyncClient", GuardedAsyncClient)
+    monkeypatch.setattr(reranker_module.httpx, "Client", GuardedSyncClient)
+
+    blocked_urls = [
+        "http://127.0.0.1:11434",
+        "http://localhost:11434",
+        "http://169.254.169.254/latest/meta-data",
+        "http://10.0.0.8:8000/v1",
+        "http://192.168.1.20:8080/v1",
+        "http://unapproved-internal:8000/v1",
+    ]
+
+    with TestClient(main_module.app, headers=authenticated_headers()) as client:
+        for bad_url in blocked_urls:
+            save_res = client.put(
+                "/api/settings/llm-rerank",
+                json={
+                    "enabled": True,
+                    "mode": "openai-compatible",
+                    "api_url": bad_url,
+                    "model": "test-model",
+                },
+            )
+            assert save_res.status_code == 400, (bad_url, save_res.text)
+
+            disc_res = client.get(
+                "/api/llm/models",
+                params={"mode": "ollama", "api_url": bad_url},
+            )
+            assert disc_res.status_code == 400, (bad_url, disc_res.text)
+
+            test_res = client.post(
+                "/api/llm/test",
+                json={"mode": "ollama", "api_url": bad_url, "model": "qwen2.5:7b"},
+            )
+            assert test_res.status_code == 400, (bad_url, test_res.text)
+
+            items, diag = rerank_with_llm_sync(
+                [{"title": "Dune", "author": "Frank Herbert", "rating": 5.0}],
+                [{"id": 1, "score": 80.0}, {"id": 2, "score": 79.0}],
+                mode="ollama",
+                api_url=bad_url,
+                model="qwen2.5:7b",
+            )
+            assert diag == {"applied": False, "reason": "fallback"}
+            assert [c["id"] for c in items] == [1, 2]
+
+    assert client_init_kwargs == []
+
+
+def test_outbound_clients_disable_redirects_and_env_proxies(monkeypatch) -> None:
+    import inspect
+    import socket
+    from afterword_engine.config import settings
+    import afterword_engine.llm_reranker as reranker_module
+
+    assert not hasattr(reranker_module, "_request_llm_completion_async")
+    assert not hasattr(reranker_module, "_send_llm_post_async")
+    assert not inspect.iscoroutinefunction(reranker_module.verify_llm_reranker)
+    assert not inspect.iscoroutinefunction(reranker_module.discover_local_llm_models)
+
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "ollama,vllm")
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))
+        ],
+    )
+    captured_kwargs: list[dict] = []
+
+    class InspectSyncClient:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            is_models = request["method"] == "GET"
+
+            class Resp:
+                status_code = 200
+                headers = {"content-type": "application/json"}
+
+                def raise_for_status(self):
+                    return None
+
+                def iter_bytes(self):
+                    if is_models:
+                        yield b'{"models": [{"name": "qwen2.5:7b"}]}'
+                    else:
+                        yield b'{"message": {"content": "{\\"adjustments\\": []}"}, "choices": [{"message": {"content": "{\\"adjustments\\": []}"}}]}'
+
+                def close(self):
+                    return None
+
+            return Resp()
+
+    reranker_module.clear_llm_rerank_cache()
+    monkeypatch.setattr(reranker_module.httpx, "Client", InspectSyncClient)
+    for mode, url, key in (
+        ("ollama", "http://ollama:11434", ""),
+        ("openai-compatible", "http://vllm:8000/v1", ""),
+        ("cloud", "https://api.openai.com/v1/chat/completions", "sk-cloud-test"),
+    ):
+        reranker_module.clear_llm_rerank_cache()
+        _, diag = rerank_with_llm_sync(
+            [{"title": "Dune", "author": "Frank Herbert", "rating": 5.0}],
+            [{"id": 1, "score": 80.0}, {"id": 2, "score": 79.0}],
+            mode=mode,
+            api_url=url,
+            api_key=key,
+            model="qwen2.5:7b",
+        )
+        assert diag["applied"] is True
+        assert captured_kwargs[-1]["follow_redirects"] is False
+        assert captured_kwargs[-1]["trust_env"] is False
+
+    reranker_module.verify_llm_reranker(
+        mode="cloud",
+        api_url="https://api.openai.com/v1/chat/completions",
+        api_key="sk-cloud-test",
+        model="gpt-4o-mini",
+    )
+    assert captured_kwargs[-1]["follow_redirects"] is False
+    assert captured_kwargs[-1]["trust_env"] is False
+
+    reranker_module.discover_local_llm_models(
+        mode="ollama",
+        api_url="http://ollama:11434",
+    )
+    assert captured_kwargs[-1]["follow_redirects"] is False
+    assert captured_kwargs[-1]["trust_env"] is False
+
+
+def test_existing_cloud_setup_with_encrypted_key_loads_reranks_and_clears(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import socket
+    import httpx
+    import respx
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+    from afterword_engine import profiles
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize, transaction
+    from afterword_engine.secrets import seal
+    from afterword_engine.llm_reranker import clear_llm_rerank_cache
+    import afterword_engine.main as main_module
+
+    clear_llm_rerank_cache()
+    monkeypatch.setattr(settings, "db", str(tmp_path / "cloud_compat.db"))
+    initialize()
+    profiles.initialize_auth()
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+    )
+
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='recommended', score=82.0 WHERE id=1")
+        con.execute("UPDATE candidates SET status='recommended', score=81.5 WHERE id=2")
+        # Legacy rows saved prior to llm_rerank_mode migration
+        for key, value, secret in (
+            ("llm_rerank_enabled", "1", 0),
+            ("llm_rerank_provider", "openai", 0),
+            ("llm_rerank_api_url", "https://api.openai.com/v1/chat/completions", 0),
+            ("llm_rerank_model", "gpt-4o-mini", 0),
+            ("llm_rerank_api_key", seal("sk-encrypted-cloud-key"), 1),
+        ):
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret",
+                (key, value, secret),
+            )
+
+    with respx.mock(assert_all_called=False) as mock_http:
+        cloud_route = mock_http.post("https://93.184.216.34/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {"adjustments": [{"id": 2, "delta": 1.0, "reason": "Cloud boost"}]}
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        )
+
+        with TestClient(main_module.app, headers=authenticated_headers()) as client:
+            loaded = client.get("/api/settings/llm-rerank")
+            assert loaded.status_code == 200
+            assert loaded.json() == {
+                "enabled": True,
+                "mode": "cloud",
+                "provider": "openai",
+                "api_url": "https://api.openai.com/v1/chat/completions",
+                "model": "gpt-4o-mini",
+                "api_key_set": True,
+            }
+
+            overview = client.get("/api/overview")
+            assert overview.status_code == 200
+            recs = [r for r in overview.json()["recommendations"] if r["id"] in {1, 2}]
+            assert [r["id"] for r in recs] == [2, 1]
+            assert cloud_route.calls[-1].request.headers.get("host") == "api.openai.com"
+            assert (
+                cloud_route.calls[-1].request.headers.get("authorization")
+                == "Bearer sk-encrypted-cloud-key"
+            )
+
+            # Cloud mode still rejects clearing key while enabled
+            bad_clear = client.put(
+                "/api/settings/llm-rerank",
+                json={
+                    "enabled": True,
+                    "mode": "cloud",
+                    "provider": "openai",
+                    "api_url": "https://api.openai.com/v1/chat/completions",
+                    "model": "gpt-4o-mini",
+                    "clear_api_key": True,
+                },
+            )
+            assert bad_clear.status_code == 400
+
+            # Disabling and clearing credentials succeeds
+            cleared = client.put(
+                "/api/settings/llm-rerank",
+                json={
+                    "enabled": False,
+                    "mode": "cloud",
+                    "provider": "openai",
+                    "api_url": "https://api.openai.com/v1/chat/completions",
+                    "model": "gpt-4o-mini",
+                    "clear_api_key": True,
+                },
+            )
+            assert cleared.status_code == 200
+            assert cleared.json()["llm_rerank"]["enabled"] is False
+            assert cleared.json()["llm_rerank"]["api_key_set"] is False
+
+
+def test_validated_llm_target_url_rejects_traversal_and_canonicalizes_components(
+    monkeypatch,
+) -> None:
+    import socket
+    import pytest
+    import afterword_engine.llm_reranker as llm_reranker_module
+    from afterword_engine.llm_reranker import (
+        _prepare_llm_request_target,
+        canonical_llm_endpoint_key,
+        validate_llm_api_url,
+    )
+
+    assert not hasattr(llm_reranker_module, "validate_llm_rerank_url")
+    assert not hasattr(llm_reranker_module, "_validate_and_split_llm_origin")
+    assert not hasattr(llm_reranker_module, "llm_url_origin")
+    assert not hasattr(llm_reranker_module, "_build_validated_llm_target_url")
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))
+        ],
+    )
+
+    allowed = {"ollama", "vllm"}
+    assert (
+        validate_llm_api_url("http://OLLAMA.:11434/v1", allowed, has_api_key=False)
+        == "http://ollama:11434/v1/chat/completions"
+    )
+    assert canonical_llm_endpoint_key("http://OLLAMA.:11434/api/chat", "ollama") == (
+        "http",
+        "ollama",
+        11434,
+        "",
+    )
+    assert canonical_llm_endpoint_key("http://vllm:8000", "openai-compatible") == (
+        "http",
+        "vllm",
+        8000,
+        "/v1/chat/completions",
+    )
+    assert _prepare_llm_request_target(
+        "http://OLLAMA.:11434/api/chat",
+        allowed,
+        mode="ollama",
+        endpoint="models",
+        has_api_key=False,
+    ) == ("http://ollama:11434/api/tags", {}, None)
+    assert _prepare_llm_request_target(
+        "http://ollama:11434/proxy/v1",
+        allowed,
+        mode="ollama",
+        endpoint="chat",
+        has_api_key=False,
+    ) == ("http://ollama:11434/proxy/api/chat", {}, None)
+    assert _prepare_llm_request_target(
+        "http://vllm:8000",
+        allowed,
+        mode="openai-compatible",
+        endpoint="chat",
+        has_api_key=False,
+    ) == ("http://vllm:8000/v1/chat/completions", {}, None)
+    assert _prepare_llm_request_target(
+        "http://vllm:8000/v1/chat/completions",
+        allowed,
+        mode="openai-compatible",
+        endpoint="models",
+        has_api_key=False,
+    ) == ("http://vllm:8000/v1/models", {}, None)
+    assert _prepare_llm_request_target(
+        "https://llm.example:8443/v1",
+        mode="cloud",
+        endpoint="chat",
+        has_api_key=True,
+    ) == (
+        "https://93.184.216.34:8443/v1/chat/completions",
+        {"Host": "llm.example:8443"},
+        {"sni_hostname": "llm.example"},
+    )
+
+    assert (
+        validate_llm_api_url(
+            "http://ollama:11434/v1?api-version=2024-10-21#frag",
+            allowed,
+            has_api_key=False,
+        )
+        == "http://ollama:11434/v1/chat/completions?api-version=2024-10-21"
+    )
+    assert canonical_llm_endpoint_key("http://ollama:11434/v1#frag", "ollama") is None
+    with pytest.raises(ValueError):
+        _prepare_llm_request_target(
+            "http://ollama:11434/v1#frag",
+            allowed,
+            mode="ollama",
+            endpoint="chat",
+            has_api_key=False,
+        )
+
+    malformed_urls = [
+        "http://ollama:11434/../../admin",
+        "http://ollama:11434/%2e%2e/admin",
+        "http://ollama:11434\\@127.0.0.1",
+        "http://user:secret@ollama:11434",
+        "http://ollama:11434/v1?redirect=http://127.0.0.1",
+        "http://ollama:99999/v1",
+    ]
+    for bad in malformed_urls:
+        with pytest.raises(ValueError):
+            validate_llm_api_url(bad, allowed, has_api_key=False)
+        assert canonical_llm_endpoint_key(bad, "ollama") is None
+        with pytest.raises(ValueError):
+            _prepare_llm_request_target(
+                bad, allowed, mode="ollama", endpoint="chat", has_api_key=False
+            )
+
+
+def test_saved_key_is_never_sent_to_changed_origin_or_mode_and_get_ignores_use_saved_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import socket
+    import httpx
+    import respx
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+    from afterword_engine import profiles
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize
+    import afterword_engine.main as main_module
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "saved_key_isolation.db"))
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "ollama")
+    initialize()
+    profiles.initialize_auth()
+
+    host_ips = {
+        "api.openai.com": "93.184.216.34",
+        "attacker.example": "93.184.216.35",
+    }
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                (host_ips.get(host, "93.184.216.34"), port or 443),
+            )
+        ],
+    )
+
+    with respx.mock(assert_all_called=False) as mock_http:
+        openai_chat = mock_http.post("https://93.184.216.34/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": '{"adjustments": []}'}}]},
+            )
+        )
+        openai_models = mock_http.get("https://93.184.216.34/v1/models").mock(
+            return_value=httpx.Response(
+                200,
+                json={"data": [{"id": "gpt-4o-mini"}]},
+            )
+        )
+        attacker_chat = mock_http.post("https://93.184.216.35/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": '{"adjustments": []}'}}]},
+            )
+        )
+        attacker_models = mock_http.get("https://93.184.216.35/v1/models").mock(
+            return_value=httpx.Response(
+                200,
+                json={"data": [{"id": "trap-model"}]},
+            )
+        )
+
+        with TestClient(main_module.app, headers=authenticated_headers()) as client:
+            initial = client.put(
+                "/api/settings/llm-rerank",
+                json={
+                    "enabled": True,
+                    "mode": "openai-compatible",
+                    "api_url": "https://api.openai.com/v1/chat/completions",
+                    "model": "gpt-4o-mini",
+                    "api_key": "sk-saved-secret",
+                },
+            )
+            assert initial.status_code == 200, initial.text
+            assert (
+                openai_chat.calls[-1].request.headers.get("authorization")
+                == "Bearer sk-saved-secret"
+            )
+
+            # 1. POST /api/llm/test defaults use_saved_key=False: never attaches saved key
+            default_test = client.post(
+                "/api/llm/test",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "https://attacker.example/v1/chat/completions",
+                    "model": "gpt-4o-mini",
+                },
+            )
+            assert default_test.status_code == 200
+            assert "authorization" not in attacker_chat.calls[-1].request.headers
+            attacker_chat.calls.clear()
+
+            # 1b. POST /api/llm/test with use_saved_key=True rejects changed origin or mode before calling out
+            bad_origin_test = client.post(
+                "/api/llm/test",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "https://attacker.example/v1/chat/completions",
+                    "model": "gpt-4o-mini",
+                    "use_saved_key": True,
+                },
+            )
+            assert bad_origin_test.status_code == 400
+            assert len(attacker_chat.calls) == 0
+
+            bad_mode_test = client.post(
+                "/api/llm/test",
+                json={
+                    "mode": "cloud",
+                    "api_url": "https://api.openai.com/v1/chat/completions",
+                    "model": "gpt-4o-mini",
+                    "use_saved_key": True,
+                },
+            )
+            assert bad_mode_test.status_code == 400
+
+            bad_path_test = client.post(
+                "/api/llm/test",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "https://api.openai.com/tenant-b/v1/chat/completions",
+                    "model": "gpt-4o-mini",
+                    "use_saved_key": True,
+                },
+            )
+            assert bad_path_test.status_code == 400
+
+            # Same mode + same canonical endpoint with use_saved_key=True reuses saved key
+            same_origin_test = client.post(
+                "/api/llm/test",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "https://api.openai.com:443/v1",
+                    "model": "gpt-4o-mini",
+                    "use_saved_key": True,
+                },
+            )
+            assert same_origin_test.status_code == 200
+            assert (
+                openai_chat.calls[-1].request.headers.get("authorization")
+                == "Bearer sk-saved-secret"
+            )
+
+            # 2. GET /api/llm/models ignores use_saved_key query parameter (even on saved origin)
+            get_saved_origin = client.get(
+                "/api/llm/models",
+                params={
+                    "mode": "openai-compatible",
+                    "api_url": "https://api.openai.com/v1",
+                    "use_saved_key": "true",
+                },
+            )
+            assert get_saved_origin.status_code == 200
+            assert "authorization" not in openai_models.calls[-1].request.headers
+
+            get_attacker = client.get(
+                "/api/llm/models",
+                params={
+                    "mode": "openai-compatible",
+                    "api_url": "https://attacker.example/v1",
+                    "use_saved_key": "true",
+                },
+            )
+            assert get_attacker.status_code == 200
+            assert "authorization" not in attacker_models.calls[-1].request.headers
+            attacker_models.calls.clear()
+
+            # POST /api/llm/models defaults use_saved_key=False and blocks changed origin/path when True
+            post_default_models = client.post(
+                "/api/llm/models",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "https://attacker.example/v1",
+                },
+            )
+            assert post_default_models.status_code == 200
+            assert "authorization" not in attacker_models.calls[-1].request.headers
+            attacker_models.calls.clear()
+
+            post_attacker_saved_key = client.post(
+                "/api/llm/models",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "https://attacker.example/v1",
+                    "use_saved_key": True,
+                },
+            )
+            assert post_attacker_saved_key.status_code == 400
+            assert len(attacker_models.calls) == 0
+
+            post_changed_path_saved_key = client.post(
+                "/api/llm/models",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "https://api.openai.com/tenant-b/v1",
+                    "use_saved_key": True,
+                },
+            )
+            assert post_changed_path_saved_key.status_code == 400
+
+            post_same_origin_saved_key = client.post(
+                "/api/llm/models",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "https://api.openai.com/v1",
+                    "use_saved_key": True,
+                },
+            )
+            assert post_same_origin_saved_key.status_code == 200
+            assert (
+                openai_models.calls[-1].request.headers.get("authorization")
+                == "Bearer sk-saved-secret"
+            )
+
+            # 3. PUT /api/settings/llm-rerank rejects blank key when URL origin, path, or mode changes (enabled or disabled)
+            for enabled_flag in (True, False):
+                changed_url_save = client.put(
+                    "/api/settings/llm-rerank",
+                    json={
+                        "enabled": enabled_flag,
+                        "mode": "openai-compatible",
+                        "api_url": "https://attacker.example/v1/chat/completions",
+                        "model": "gpt-4o-mini",
+                        "api_key": "",
+                    },
+                )
+                assert changed_url_save.status_code == 400
+                assert len(attacker_chat.calls) == 0
+
+                changed_path_save = client.put(
+                    "/api/settings/llm-rerank",
+                    json={
+                        "enabled": enabled_flag,
+                        "mode": "openai-compatible",
+                        "api_url": "https://api.openai.com/tenant-b/v1/chat/completions",
+                        "model": "gpt-4o-mini",
+                        "api_key": "",
+                    },
+                )
+                assert changed_path_save.status_code == 400
+
+            changed_mode_save = client.put(
+                "/api/settings/llm-rerank",
+                json={
+                    "enabled": True,
+                    "mode": "cloud",
+                    "api_url": "https://api.openai.com/v1/chat/completions",
+                    "model": "gpt-4o-mini",
+                    "api_key": "",
+                },
+            )
+            assert changed_mode_save.status_code == 400
+
+            # Saved URL remains intact after rejected attempts
+            still_intact = client.get("/api/settings/llm-rerank")
+            assert still_intact.json()["api_url"] == "https://api.openai.com/v1/chat/completions"
+            assert still_intact.json()["api_key_set"] is True
+
+            # Providing a fresh key allows switching endpoints cleanly
+            fresh_key_save = client.put(
+                "/api/settings/llm-rerank",
+                json={
+                    "enabled": True,
+                    "mode": "openai-compatible",
+                    "api_url": "https://attacker.example/v1/chat/completions",
+                    "model": "gpt-4o-mini",
+                    "api_key": "sk-fresh-endpoint-key",
+                },
+            )
+            assert fresh_key_save.status_code == 200
+            assert (
+                attacker_chat.calls[-1].request.headers.get("authorization")
+                == "Bearer sk-fresh-endpoint-key"
+            )
+
+
+def test_plain_http_rejected_when_api_key_attached_unless_host_allowlisted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import socket
+    import httpx
+    import respx
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+    from afterword_engine import profiles
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize
+    import afterword_engine.main as main_module
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "plain_http_key.db"))
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "ollama,vllm")
+    initialize()
+    profiles.initialize_auth()
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 80))
+        ],
+    )
+
+    with respx.mock(assert_all_called=False) as mock_http:
+        public_http_chat = mock_http.post("http://93.184.216.34/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": '{"adjustments": []}'}}]},
+            )
+        )
+        public_http_models = mock_http.get("http://93.184.216.34/v1/models").mock(
+            return_value=httpx.Response(200, json={"data": [{"id": "m1"}]})
+        )
+        public_https_chat = mock_http.post("https://93.184.216.34/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": '{"adjustments": []}'}}]},
+            )
+        )
+        allowlisted_http_chat = mock_http.post("http://vllm:8000/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": '{"adjustments": []}'}}]},
+            )
+        )
+
+        with TestClient(main_module.app, headers=authenticated_headers()) as client:
+            for enabled_flag in (True, False):
+                res = client.put(
+                    "/api/settings/llm-rerank",
+                    json={
+                        "enabled": enabled_flag,
+                        "mode": "openai-compatible",
+                        "api_url": "http://public-llm.example/v1/chat/completions",
+                        "model": "m1",
+                        "api_key": "sk-cleartext-attempt",
+                    },
+                )
+                assert res.status_code == 400
+                assert "HTTPS" in res.json()["detail"]
+
+            test_http = client.post(
+                "/api/llm/test",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "http://public-llm.example/v1/chat/completions",
+                    "model": "m1",
+                    "api_key": "sk-cleartext-attempt",
+                },
+            )
+            assert test_http.status_code == 400
+
+            models_http = client.post(
+                "/api/llm/models",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "http://public-llm.example/v1",
+                    "api_key": "sk-cleartext-attempt",
+                },
+            )
+            assert models_http.status_code == 400
+            assert not public_http_chat.called
+            assert not public_http_models.called
+
+            items, diag = rerank_with_llm_sync(
+                [{"title": "Dune", "author": "Frank Herbert", "rating": 5.0}],
+                [{"id": 1, "score": 80.0}, {"id": 2, "score": 79.0}],
+                mode="openai-compatible",
+                api_url="http://public-llm.example/v1/chat/completions",
+                api_key="sk-cleartext-attempt",
+                model="m1",
+            )
+            assert diag == {"applied": False, "reason": "fallback"}
+            assert [c["id"] for c in items] == [1, 2]
+            assert not public_http_chat.called
+
+            # HTTPS on public host with key succeeds
+            https_ok = client.post(
+                "/api/llm/test",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "https://public-llm.example/v1/chat/completions",
+                    "model": "m1",
+                    "api_key": "sk-tls-key",
+                },
+            )
+            assert https_ok.status_code == 200
+            assert public_https_chat.called
+
+            # Allowlisted private HTTP host with key succeeds
+            allowlisted_ok = client.post(
+                "/api/llm/test",
+                json={
+                    "mode": "openai-compatible",
+                    "api_url": "http://vllm:8000/v1/chat/completions",
+                    "model": "m1",
+                    "api_key": "local-vllm-key",
+                },
+            )
+            assert allowlisted_ok.status_code == 200
+            assert allowlisted_http_chat.called
+
+
+def test_clear_api_key_suppresses_env_llm_rerank_api_key_and_custom_urls_do_not_inherit_env_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import socket
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+    from afterword_engine import profiles
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize, transaction
+    import afterword_engine.main as main_module
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "env_key_clear.db"))
+    monkeypatch.setattr(settings, "llm_rerank_mode", "cloud")
+    monkeypatch.setattr(
+        settings, "llm_rerank_api_url", "https://api.openai.com/v1/chat/completions"
+    )
+    monkeypatch.setattr(settings, "llm_rerank_api_key", "sk-env-operator-key")
+    initialize()
+    profiles.initialize_auth()
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))
+        ],
+    )
+
+    with TestClient(main_module.app, headers=authenticated_headers()) as client:
+        # Fresh profile matching env mode/origin uses env key
+        initial = client.get("/api/settings/llm-rerank")
+        assert initial.status_code == 200
+        assert initial.json()["api_key_set"] is True
+        assert main_module.effective_llm_rerank_settings()["api_key"] == "sk-env-operator-key"
+
+        # Explicit clear_api_key=True stores an empty profile override that suppresses env key
+        cleared = client.put(
+            "/api/settings/llm-rerank",
+            json={
+                "enabled": False,
+                "mode": "cloud",
+                "api_url": "https://api.openai.com/v1/chat/completions",
+                "model": "gpt-4o-mini",
+                "clear_api_key": True,
+            },
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["llm_rerank"]["api_key_set"] is False
+        assert main_module.effective_llm_rerank_settings()["api_key"] == ""
+
+        # Even if no profile key row exists, a custom saved mode/origin never inherits the cloud env key
+        with transaction() as con:
+            con.execute("DELETE FROM settings WHERE key='llm_rerank_api_key'")
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES('llm_rerank_mode','ollama',0) "
+                "ON CONFLICT(key) DO UPDATE SET value='ollama'"
+            )
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES('llm_rerank_api_url','http://ollama:11434',0) "
+                "ON CONFLICT(key) DO UPDATE SET value='http://ollama:11434'"
+            )
+        assert main_module.effective_llm_rerank_settings()["api_key"] == ""
+        assert client.get("/api/settings/llm-rerank").json()["api_key_set"] is False
+
+
+def test_mode_allowlist_rejects_unknown_modes_with_400_and_guards_stored_reads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import pytest
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+    from afterword_engine import profiles
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize, transaction
+    from afterword_engine.llm_reranker import (
+        LLM_RERANK_MODES,
+        read_stored_llm_rerank_mode,
+    )
+    from afterword_engine.secrets import seal
+    import afterword_engine.main as main_module
+
+    assert LLM_RERANK_MODES == ("cloud", "ollama", "openai-compatible")
+    assert read_stored_llm_rerank_mode("OLLAMA") == ("ollama", True)
+    assert read_stored_llm_rerank_mode(None) == ("cloud", True)
+    assert read_stored_llm_rerank_mode("  ") == ("cloud", True)
+    assert read_stored_llm_rerank_mode("anthropic-native") == ("cloud", False)
+
+    with pytest.raises(ValueError, match="Unsupported LLM reranker mode"):
+        main_module.LLMRerankSettingsIn(mode="anthropic-native").validate_values()
+    with pytest.raises(ValueError, match="Unsupported LLM reranker mode"):
+        main_module.LLMRerankTestIn(mode="anthropic-native").validate_values()
+    with pytest.raises(ValueError, match="Unsupported LLM reranker mode"):
+        main_module.LLMModelsDiscoverIn(mode="anthropic-native").validate_values()
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "mode_allowlist.db"))
+    monkeypatch.setattr(settings, "llm_rerank_mode", "cloud")
+    monkeypatch.setattr(
+        settings, "llm_rerank_api_url", "https://api.openai.com/v1/chat/completions"
+    )
+    initialize()
+    profiles.initialize_auth()
+
+    with TestClient(main_module.app, headers=authenticated_headers()) as client:
+        bad_save = client.put(
+            "/api/settings/llm-rerank",
+            json={
+                "enabled": False,
+                "mode": "unknown-mode",
+                "api_url": "http://ollama:11434",
+                "model": "qwen2.5:7b",
+            },
+        )
+        assert bad_save.status_code == 400
+        assert "Unsupported LLM reranker mode" in bad_save.json()["detail"]
+
+        bad_test = client.post(
+            "/api/llm/test",
+            json={
+                "mode": "unknown-mode",
+                "api_url": "http://ollama:11434",
+                "model": "qwen2.5:7b",
+            },
+        )
+        assert bad_test.status_code == 400
+        assert "Unsupported LLM reranker mode" in bad_test.json()["detail"]
+
+        bad_get_models = client.get("/api/llm/models", params={"mode": "unknown-mode"})
+        assert bad_get_models.status_code == 400
+        assert "Unsupported LLM reranker mode" in bad_get_models.json()["detail"]
+
+        bad_post_models = client.post(
+            "/api/llm/models",
+            json={"mode": "unknown-mode", "api_url": "http://ollama:11434"},
+        )
+        assert bad_post_models.status_code == 400
+        assert "Unsupported LLM reranker mode" in bad_post_models.json()["detail"]
+
+        # Corrupted/unknown stored SQLite mode falls back safely without exposing or rebinding a saved key
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES('llm_rerank_mode','corrupted-mode',0) "
+                "ON CONFLICT(key) DO UPDATE SET value='corrupted-mode',secret=0"
+            )
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES('llm_rerank_api_url','https://api.openai.com/v1/chat/completions',0) "
+                "ON CONFLICT(key) DO UPDATE SET value='https://api.openai.com/v1/chat/completions',secret=0"
+            )
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES('llm_rerank_api_key',?,1) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1",
+                (seal("sk-bound-to-corrupted-mode"),),
+            )
+
+        effective = main_module.effective_llm_rerank_settings()
+        assert effective["mode"] == "cloud"
+        assert effective["api_key"] == ""
+
+        safe = client.get("/api/settings/llm-rerank")
+        assert safe.status_code == 200
+        assert safe.json()["mode"] == "cloud"
+        assert safe.json()["api_key_set"] is False
+
+        # Saving under cloud with blank key must reject reusing the corrupted-mode key unless cleared/replaced
+        rebind_attempt = client.put(
+            "/api/settings/llm-rerank",
+            json={
+                "enabled": False,
+                "mode": "cloud",
+                "api_url": "https://api.openai.com/v1/chat/completions",
+                "model": "gpt-4o-mini",
+            },
+        )
+        assert rebind_attempt.status_code == 400
+
+        # Invalid env mode also falls back safely without attaching env key
+        with transaction() as con:
+            con.execute("DELETE FROM settings WHERE key IN ('llm_rerank_mode','llm_rerank_api_key')")
+        monkeypatch.setattr(settings, "llm_rerank_mode", "invalid-env-mode")
+        monkeypatch.setattr(settings, "llm_rerank_api_key", "sk-env-should-not-leak")
+        env_effective = main_module.effective_llm_rerank_settings()
+        assert env_effective["mode"] == "cloud"
+        assert env_effective["api_key"] == ""
+
+
+def test_dns_rebinding_blocked_and_ip_pinned_across_all_llm_endpoints_and_redirect_hops(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import socket
+    from fastapi.testclient import TestClient
+    from auth_helpers import authenticated_headers
+    from afterword_engine import profiles
+    from afterword_engine.config import settings
+    from afterword_engine.database import initialize
+    import afterword_engine.llm_reranker as reranker_module
+    import afterword_engine.main as main_module
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "dns_rebind.db"))
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "ollama")
+    initialize()
+    profiles.initialize_auth()
+
+    public_ip = "93.184.216.34"
+    hop_public_ip = "93.184.216.35"
+    private_metadata_ip = "169.254.169.254"
+
+    dns_plan: list[str] = []
+    dns_calls: list[str] = []
+    connected_requests: list[dict] = []
+
+    def rebinding_getaddrinfo(host, port, *args, **kwargs):
+        dns_calls.append(host)
+        ip = dns_plan.pop(0) if dns_plan else private_metadata_ip
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_getaddrinfo)
+
+    next_responses: list[tuple[int, dict[str, str], bytes]] = []
+
+    class PinInspectingClient:
+        def __init__(self, *args, **kwargs):
+            assert kwargs.get("follow_redirects") is False
+            assert kwargs.get("trust_env") is False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def build_request(self, method: str, url: str, **kwargs):
+            return {"method": method, "url": str(url), **kwargs}
+
+        def send(self, request, *, stream: bool = False, **kwargs):
+            assert stream is True
+            url_str = request["url"]
+            assert private_metadata_ip not in url_str
+            assert "127.0.0.1" not in url_str
+            assert "rebind.example" not in url_str
+            connected_requests.append(request)
+            status_code, resp_headers, body = (
+                next_responses.pop(0)
+                if next_responses
+                else (
+                    200,
+                    {"content-type": "application/json"},
+                    b'{"choices": [{"message": {"content": "{\\"adjustments\\": []}"}}], "data": [{"id": "m1"}], "models": [{"name": "m1"}]}',
+                )
+            )
+
+            class Resp:
+                def __init__(self):
+                    self.status_code = status_code
+                    self.headers = resp_headers
+                    self.is_redirect = 300 <= status_code < 400
+
+                def raise_for_status(self):
+                    return None
+
+                def iter_bytes(self):
+                    yield body
+
+                def close(self):
+                    return None
+
+            return Resp()
+
+    monkeypatch.setattr(reranker_module.httpx, "Client", PinInspectingClient)
+
+    reads = [{"title": "Dune", "author": "Frank Herbert", "rating": 5.0}]
+    candidates = [
+        {"id": 1, "title": "First", "score": 80.0},
+        {"id": 2, "title": "Second", "score": 79.5},
+    ]
+
+    with TestClient(main_module.app, headers=authenticated_headers()) as client:
+        # 1. Rebinding immediately after initial validation (lookup #1 -> public IP, lookup #2 -> metadata IP):
+        #    Blocked before any outbound request across save, /api/llm/test, GET/POST /api/llm/models, and serving.
+        dns_plan[:] = [public_ip, private_metadata_ip]
+        save_rebound = client.put(
+            "/api/settings/llm-rerank",
+            json={
+                "enabled": True,
+                "mode": "openai-compatible",
+                "api_url": "https://rebind.example:8443/v1/chat/completions",
+                "model": "m1",
+                "api_key": "sk-user-supplied-secret",
+            },
+        )
+        assert save_rebound.status_code == 400
+        assert "sk-user-supplied-secret" not in save_rebound.text
+        assert connected_requests == []
+
+        dns_plan[:] = [public_ip, private_metadata_ip]
+        test_rebound = client.post(
+            "/api/llm/test",
+            json={
+                "mode": "openai-compatible",
+                "api_url": "https://rebind.example:8443/v1/chat/completions",
+                "model": "m1",
+                "api_key": "sk-user-supplied-secret",
+            },
+        )
+        assert test_rebound.status_code == 400
+        assert "sk-user-supplied-secret" not in test_rebound.text
+        assert connected_requests == []
+
+        dns_plan[:] = [public_ip, private_metadata_ip]
+        get_models_rebound = client.get(
+            "/api/llm/models",
+            params={"mode": "ollama", "api_url": "http://rebind.example:11434"},
+        )
+        assert get_models_rebound.status_code == 400
+        assert connected_requests == []
+
+        dns_plan[:] = [public_ip, private_metadata_ip]
+        post_models_rebound = client.post(
+            "/api/llm/models",
+            json={
+                "mode": "openai-compatible",
+                "api_url": "https://rebind.example:8443/v1",
+                "api_key": "sk-user-supplied-secret",
+            },
+        )
+        assert post_models_rebound.status_code == 400
+        assert "sk-user-supplied-secret" not in post_models_rebound.text
+        assert connected_requests == []
+
+        reranker_module.clear_llm_rerank_cache()
+        dns_plan[:] = [public_ip, private_metadata_ip]
+        out_items, out_diag = reranker_module.rerank_with_llm_sync(
+            reads,
+            candidates,
+            mode="cloud",
+            api_url="https://rebind.example:8443/v1/chat/completions",
+            api_key="sk-user-supplied-secret",
+            model="m1",
+        )
+        assert out_diag == {"applied": False, "reason": "fallback"}
+        assert [c["id"] for c in out_items] == [1, 2]
+        assert "sk-user-supplied-secret" not in reranker_module.last_rerank_error()
+        assert connected_requests == []
+
+        # 2. Rebinding at connect time (DNS returns public IP for validation + target pinning, then metadata IP):
+        #    Every endpoint connects to the pinned global IP with Host header + SNI and never touches metadata IP.
+        dns_plan[:] = [public_ip, public_ip, private_metadata_ip]
+        test_pinned = client.post(
+            "/api/llm/test",
+            json={
+                "mode": "openai-compatible",
+                "api_url": "https://rebind.example:8443/v1/chat/completions",
+                "model": "m1",
+                "api_key": "sk-pinned-test",
+            },
+        )
+        assert test_pinned.status_code == 200, test_pinned.text
+        assert connected_requests[-1]["url"] == f"https://{public_ip}:8443/v1/chat/completions"
+        assert connected_requests[-1]["headers"]["Host"] == "rebind.example:8443"
+        assert connected_requests[-1]["headers"]["Authorization"] == "Bearer sk-pinned-test"
+        assert connected_requests[-1]["extensions"] == {"sni_hostname": "rebind.example"}
+
+        dns_plan[:] = [public_ip, public_ip, private_metadata_ip]
+        post_models_pinned = client.post(
+            "/api/llm/models",
+            json={
+                "mode": "openai-compatible",
+                "api_url": "https://rebind.example:8443/v1",
+                "api_key": "sk-pinned-models",
+            },
+        )
+        assert post_models_pinned.status_code == 200, post_models_pinned.text
+        assert connected_requests[-1]["url"] == f"https://{public_ip}:8443/v1/models"
+        assert connected_requests[-1]["headers"]["Host"] == "rebind.example:8443"
+        assert connected_requests[-1]["headers"]["Authorization"] == "Bearer sk-pinned-models"
+        assert connected_requests[-1]["extensions"] == {"sni_hostname": "rebind.example"}
+
+        dns_plan[:] = [public_ip, public_ip, private_metadata_ip]
+        get_models_pinned = client.get(
+            "/api/llm/models",
+            params={"mode": "ollama", "api_url": "https://rebind.example:8443"},
+        )
+        assert get_models_pinned.status_code == 200, get_models_pinned.text
+        assert connected_requests[-1]["url"] == f"https://{public_ip}:8443/api/tags"
+        assert connected_requests[-1]["headers"]["Host"] == "rebind.example:8443"
+        assert connected_requests[-1]["extensions"] == {"sni_hostname": "rebind.example"}
+
+        # 3. Redirect hop DNS rebinding: Hop 0 resolves to public IP and returns same-origin 307;
+        #    Hop 1 rebinds to metadata IP -> blocked before Hop 1 connects!
+        connected_requests.clear()
+        reranker_module.clear_llm_rerank_cache()
+        dns_plan[:] = [public_ip, public_ip, private_metadata_ip]
+        next_responses[:] = [
+            (307, {"location": "/v2/chat/completions"}, b""),
+        ]
+        hop_rebind_test = client.post(
+            "/api/llm/test",
+            json={
+                "mode": "openai-compatible",
+                "api_url": "https://rebind.example:8443/v1/chat/completions",
+                "model": "m1",
+                "api_key": "sk-hop-secret",
+            },
+        )
+        assert hop_rebind_test.status_code == 400
+        assert "sk-hop-secret" not in hop_rebind_test.text
+        assert len(connected_requests) == 1
+        assert connected_requests[0]["url"] == f"https://{public_ip}:8443/v1/chat/completions"
+
+        # Valid same-origin 307 redirect hop where Hop 1 resolves to a valid global IP connects to the pinned Hop 1 IP.
+        connected_requests.clear()
+        reranker_module.clear_llm_rerank_cache()
+        dns_plan[:] = [public_ip, public_ip, hop_public_ip]
+        next_responses[:] = [
+            (307, {"location": "/v2/chat/completions"}, b""),
+            (
+                200,
+                {"content-type": "application/json"},
+                b'{"choices": [{"message": {"content": "{\\"adjustments\\": [{\\"id\\": 2, \\"delta\\": 0.9, \\"reason\\": \\"Hop ok\\"}]}"}}]}',
+            ),
+        ]
+        reranked_hop, diag_hop = reranker_module.rerank_with_llm_sync(
+            reads,
+            candidates,
+            mode="cloud",
+            api_url="https://rebind.example:8443/v1/chat/completions",
+            api_key="sk-hop-ok",
+            model="m1",
+        )
+        assert diag_hop["applied"] is True
+        assert [c["id"] for c in reranked_hop] == [2, 1]
+        assert len(connected_requests) == 2
+        assert connected_requests[0]["url"] == f"https://{public_ip}:8443/v1/chat/completions"
+        assert connected_requests[1]["url"] == f"https://{hop_public_ip}:8443/v2/chat/completions"
+        assert connected_requests[1]["headers"]["Host"] == "rebind.example:8443"
+        assert connected_requests[1]["extensions"] == {"sni_hostname": "rebind.example"}
+
+
+def test_canonical_custom_endpoint_and_hmac_key_fingerprint_invalidates_cache_and_breaker(
+    monkeypatch,
+) -> None:
+    import socket
+    import httpx
+    import respx
+    from afterword_engine.config import settings
+    import afterword_engine.llm_reranker as reranker_module
+
+    monkeypatch.setattr(settings, "llm_rerank_mode", "cloud")
+    monkeypatch.setattr(
+        settings, "llm_rerank_api_url", "https://api.openai.com/v1/chat/completions"
+    )
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "ollama,vllm")
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))
+        ],
+    )
+
+    # Canonical endpoint comparison in is_custom_llm_endpoint
+    assert reranker_module.is_custom_llm_endpoint("") is False
+    assert reranker_module.is_custom_llm_endpoint("https://api.openai.com/v1") is False
+    assert (
+        reranker_module.is_custom_llm_endpoint(
+            "https://API.OPENAI.COM:443/v1/chat/completions/"
+        )
+        is False
+    )
+    assert (
+        reranker_module.is_custom_llm_endpoint(
+            "https://api.openai.com/v1/chat/completions", mode="openai-compatible"
+        )
+        is True
+    )
+    assert (
+        reranker_module.is_custom_llm_endpoint(
+            "https://api.openai.com/v1/chat/completions?api-version=2024-10-21"
+        )
+        is True
+    )
+    assert (
+        reranker_module.is_custom_llm_endpoint("https://custom.example/v1")
+        is True
+    )
+    assert reranker_module.is_custom_llm_endpoint("not-a-valid-url") is True
+
+    # Salted HMAC-SHA256 fingerprint invalidates circuit-breaker and slate cache on key rotation
+    fp1 = reranker_module._derive_api_key_fingerprint("sk-alpha")
+    fp2 = reranker_module._derive_api_key_fingerprint("sk-beta")
+    assert len(fp1) == 32
+    assert fp1 == reranker_module._derive_api_key_fingerprint("sk-alpha")
+    assert fp1 != fp2
+    assert "sk-alpha" not in fp1
+    assert reranker_module._derive_api_key_fingerprint("") == ""
+
+    reranker_module.clear_llm_rerank_cache()
+    reranker_module.trip_circuit_breaker(
+        "prof-fp::/tmp/fp.db",
+        api_url="https://api.openai.com/v1/chat/completions",
+        api_key="sk-alpha",
+        model="gpt-4o-mini",
+        error="Upstream 502",
+        mode="cloud",
+    )
+    assert (
+        reranker_module.get_circuit_breaker_state(
+            "prof-fp::/tmp/fp.db",
+            api_url="https://api.openai.com/v1",
+            api_key="sk-alpha",
+            model="gpt-4o-mini",
+            mode="cloud",
+        )
+        is not None
+    )
+    assert (
+        reranker_module.get_circuit_breaker_state(
+            "prof-fp::/tmp/fp.db",
+            api_url="https://api.openai.com/v1",
+            api_key="sk-beta",
+            model="gpt-4o-mini",
+            mode="cloud",
+        )
+        is None
+    )
+
+    reads = [{"title": "Dune", "author": "Frank Herbert", "rating": 5.0}]
+    candidates = [
+        {"id": 1, "title": "First", "score": 80.0},
+        {"id": 2, "title": "Second", "score": 79.5},
+    ]
+    with respx.mock as mock_http:
+        vllm_route = mock_http.post("http://vllm:8000/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"adjustments": [{"id": 2, "delta": 1.0, "reason": "Boost"}]}'
+                            }
+                        }
+                    ]
+                },
+            )
+        )
+        _, d_key1 = reranker_module.rerank_with_llm_sync(
+            reads,
+            candidates,
+            profile_id="prof-fp",
+            mode="openai-compatible",
+            api_url="http://vllm:8000/v1",
+            api_key="sk-alpha",
+            model="qwen2.5:7b",
+        )
+        assert d_key1["cached"] is False
+        assert len(vllm_route.calls) == 1
+
+        # Same key hits cache
+        cached_same = reranker_module.try_cached_rerank(
+            reads,
+            candidates,
+            profile_id="prof-fp",
+            mode="openai-compatible",
+            api_url="http://vllm:8000/v1",
+            api_key="sk-alpha",
+            model="qwen2.5:7b",
+        )
+        assert cached_same is not None
+        assert cached_same[1]["cached"] is True
+
+        # Rotated key misses cache and re-fetches
+        assert (
+            reranker_module.try_cached_rerank(
+                reads,
+                candidates,
+                profile_id="prof-fp",
+                mode="openai-compatible",
+                api_url="http://vllm:8000/v1",
+                api_key="sk-beta",
+                model="qwen2.5:7b",
+            )
+            is None
+        )
+        _, d_key2 = reranker_module.rerank_with_llm_sync(
+            reads,
+            candidates,
+            profile_id="prof-fp",
+            mode="openai-compatible",
+            api_url="http://vllm:8000/v1",
+            api_key="sk-beta",
+            model="qwen2.5:7b",
+        )
+        assert d_key2["cached"] is False
+        assert len(vllm_route.calls) == 2
+
+        # Clearing key (keyless) also misses key-scoped cache
+        _, d_keyless = reranker_module.rerank_with_llm_sync(
+            reads,
+            candidates,
+            profile_id="prof-fp",
+            mode="openai-compatible",
+            api_url="http://vllm:8000/v1",
+            api_key="",
+            model="qwen2.5:7b",
+        )
+        assert d_keyless["cached"] is False
+        assert len(vllm_route.calls) == 3
 
