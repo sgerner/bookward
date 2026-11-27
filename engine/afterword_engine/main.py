@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 import httpx
 import numpy as np
 from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -90,15 +91,22 @@ from .http_bounds import (
     stream_json_async,
 )
 from .security import safe_error_message, validate_public_url, validate_service_url
+from . import llm_reranker
 from .llm_reranker import (
     DEFAULT_CLOUD_LLM_URL,
     DEFAULT_OLLAMA_URL,
     LLM_RERANK_MODES,
+    _normalize_chat_url,
     can_reuse_saved_llm_key,
     canonical_llm_endpoint_key,
+    clear_llm_rerank_cache,
     discover_local_llm_models,
+    is_custom_llm_endpoint,
     normalize_llm_rerank_mode,
     read_stored_llm_rerank_mode,
+    rerank_with_llm_sync as _default_rerank_with_llm_sync,
+    resolve_llm_rerank_credentials,
+    sanitize_llm_error,
     validate_llm_api_url,
     verify_llm_reranker,
 )
@@ -170,15 +178,6 @@ from .quality import (
     prepare_candidate_quality_batch,
     quality_summary,
 )
-from . import llm_reranker
-from .llm_reranker import (
-    _normalize_chat_url,
-    clear_llm_rerank_cache,
-    is_custom_llm_endpoint,
-    rerank_with_llm_sync as _default_rerank_with_llm_sync,
-    resolve_llm_rerank_credentials,
-)
-
 rerank_with_llm_sync = _default_rerank_with_llm_sync
 from .identity import (
     ReadIdentityIndex,
@@ -2480,6 +2479,7 @@ class LLMRerankSettingsIn(BaseModel):
             validate_llm_api_url(
                 url,
                 allowed_hosts=set() if mode == "cloud" else None,
+                mode=mode,
                 has_api_key=(mode == "cloud" or has_api_key),
             )
         if self.enabled and (not url or not self.model.strip()):
@@ -5049,125 +5049,138 @@ def get_llm_rerank_settings():
 
 
 @app.put("/api/settings/llm-rerank")
-@fenced_async
-async def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
-    current = private_settings()
-    existing_effective = effective_llm_rerank_settings(private=current)
-    supplied_key = (payload.api_key or "").strip()
-    try:
-        mode, resolved_url = payload.validate_values(
-            existing_effective["mode"],
-            has_api_key=bool(supplied_key),
-        )
-    except ValueError as exc:
-        raise HTTPException(400, safe_error_message(exc)) from exc
-    saved_profile_key = (current.get("llm_rerank_api_key") or "").strip()
-    if payload.clear_api_key:
-        api_key = ""
-        persist_api_key = True
-    elif supplied_key:
-        api_key = supplied_key
-        persist_api_key = True
-    elif saved_profile_key:
-        if not can_reuse_saved_llm_key(
-            existing_effective, mode=mode, api_url=resolved_url
-        ):
-            raise HTTPException(
-                400,
-                "Saved profile API key can only be reused when the mode and endpoint origin match the saved settings; provide a new profile API key or clear the saved key",
-            )
-        api_key = saved_profile_key
-        persist_api_key = True
-    elif "llm_rerank_api_key" in current:
-        api_key = ""
-        persist_api_key = True
-    else:
-        env_mode, env_mode_valid = read_stored_llm_rerank_mode(
-            settings.llm_rerank_mode, fallback="cloud"
-        )
-        env_url = (
-            DEFAULT_OLLAMA_URL
-            if env_mode == "ollama" and settings.llm_rerank_api_url == DEFAULT_CLOUD_LLM_URL
-            else settings.llm_rerank_api_url
-        )
-        if (
-            env_mode_valid
-            and (settings.llm_rerank_api_key or "").strip()
-            and mode == env_mode
-            and canonical_llm_endpoint_key(resolved_url, mode) is not None
-            and canonical_llm_endpoint_key(resolved_url, mode)
-            == canonical_llm_endpoint_key(env_url, env_mode)
-        ):
-            api_key = (settings.llm_rerank_api_key or "").strip()
-        else:
-            api_key = ""
-        persist_api_key = False
-    if resolved_url:
+def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
+    with bind_request_restore_epoch():
+        current = private_settings()
+        existing_effective = effective_llm_rerank_settings(private=current)
+        supplied_key = (payload.api_key or "").strip()
         try:
-            validate_llm_api_url(
-                resolved_url,
-                allowed_hosts=set() if mode == "cloud" else None,
-                has_api_key=(mode == "cloud" or bool(api_key.strip())),
+            mode, resolved_url = payload.validate_values(
+                existing_effective["mode"],
+                has_api_key=bool(supplied_key),
             )
         except ValueError as exc:
-            raise HTTPException(400, safe_error_message(exc)) from exc
-    if payload.enabled and mode == "cloud" and not api_key.strip():
-        if is_custom_llm_endpoint(resolved_url):
             raise HTTPException(
-                400, "A profile API key is required for custom LLM endpoint URLs"
-            )
-        raise HTTPException(400, "An API key is required when cloud LLM reranking is enabled")
-    health: dict[str, Any] = {
-        "ok": True,
-        "checked": False,
-        "mode": mode,
-        "model": payload.model.strip(),
-    }
-    if payload.enabled and mode in LLM_RERANK_MODES and mode != "cloud":
-        try:
-            health = await verify_llm_reranker(
-                mode=mode,
-                api_url=resolved_url,
-                api_key=api_key,
-                model=payload.model.strip(),
-            )
-            health["checked"] = True
-        except (ProfileDeletedError, RestoreEpochError):
-            raise
-        except Exception as exc:
-            raise HTTPException(
-                400,
-                f"LLM reranker check failed: {safe_error_message(exc)}",
+                400, sanitize_llm_error(exc, api_key=supplied_key)
             ) from exc
-    provider_value = payload.provider.strip()
-    if mode == "ollama" and not provider_value:
-        provider_value = "ollama"
-    elif mode == "openai-compatible" and not provider_value:
-        provider_value = "openai-compatible"
-    values = {
-        "llm_rerank_enabled": "1" if payload.enabled else "0",
-        "llm_rerank_mode": mode,
-        "llm_rerank_provider": provider_value,
-        "llm_rerank_api_url": resolved_url,
-        "llm_rerank_model": payload.model.strip(),
-    }
-    if persist_api_key:
-        values["llm_rerank_api_key"] = api_key
-    with transaction() as con:
-        for key, value in values.items():
-            secret = key == "llm_rerank_api_key"
-            stored = seal(value) if secret and value else value
-            con.execute(
-                "INSERT INTO settings(key,value,secret) VALUES(?,?,?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
-                (key, stored, 1 if secret else 0),
+        saved_profile_key = (current.get("llm_rerank_api_key") or "").strip()
+        if payload.clear_api_key:
+            api_key = ""
+            persist_api_key = True
+        elif supplied_key:
+            api_key = supplied_key
+            persist_api_key = True
+        elif saved_profile_key:
+            if not can_reuse_saved_llm_key(
+                existing_effective, mode=mode, api_url=resolved_url
+            ):
+                raise HTTPException(
+                    400,
+                    "Saved profile API key can only be reused when the mode and endpoint origin match the saved settings; provide a new profile API key or clear the saved key",
+                )
+            api_key = saved_profile_key
+            persist_api_key = True
+        elif "llm_rerank_api_key" in current:
+            api_key = ""
+            persist_api_key = True
+        else:
+            env_mode, env_mode_valid = read_stored_llm_rerank_mode(
+                settings.llm_rerank_mode, fallback="cloud"
             )
-    clear_llm_rerank_cache(current_profile_id() or "legacy")
-    return {"saved": True, "llm_rerank": safe_llm_rerank_settings(), "health": health}
+            env_url = (
+                DEFAULT_OLLAMA_URL
+                if env_mode == "ollama"
+                and settings.llm_rerank_api_url == DEFAULT_CLOUD_LLM_URL
+                else settings.llm_rerank_api_url
+            )
+            if (
+                env_mode_valid
+                and (settings.llm_rerank_api_key or "").strip()
+                and mode == env_mode
+                and canonical_llm_endpoint_key(resolved_url, mode) is not None
+                and canonical_llm_endpoint_key(resolved_url, mode)
+                == canonical_llm_endpoint_key(env_url, env_mode)
+            ):
+                api_key = (settings.llm_rerank_api_key or "").strip()
+            else:
+                api_key = ""
+            persist_api_key = False
+        if resolved_url:
+            try:
+                validate_llm_api_url(
+                    resolved_url,
+                    allowed_hosts=set() if mode == "cloud" else None,
+                    mode=mode,
+                    has_api_key=(mode == "cloud" or bool(api_key.strip())),
+                    resolve_dns=False,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    400, sanitize_llm_error(exc, api_key=api_key)
+                ) from exc
+        if payload.enabled and mode == "cloud" and not api_key.strip():
+            if is_custom_llm_endpoint(resolved_url, mode=mode):
+                raise HTTPException(
+                    400, "A profile API key is required for custom LLM endpoint URLs"
+                )
+            raise HTTPException(
+                400, "An API key is required when cloud LLM reranking is enabled"
+            )
+        health: dict[str, Any] = {
+            "ok": True,
+            "checked": False,
+            "mode": mode,
+            "model": payload.model.strip(),
+        }
+        if payload.enabled and mode in LLM_RERANK_MODES and mode != "cloud":
+            try:
+                health = verify_llm_reranker(
+                    mode=mode,
+                    api_url=resolved_url,
+                    api_key=api_key,
+                    model=payload.model.strip(),
+                )
+                health["checked"] = True
+            except (ProfileDeletedError, RestoreEpochError):
+                raise
+            except Exception as exc:
+                raise HTTPException(
+                    400,
+                    f"LLM reranker check failed: {sanitize_llm_error(exc, api_key=api_key)}",
+                ) from exc
+        provider_value = payload.provider.strip()
+        if mode == "ollama" and not provider_value:
+            provider_value = "ollama"
+        elif mode == "openai-compatible" and not provider_value:
+            provider_value = "openai-compatible"
+        values = {
+            "llm_rerank_enabled": "1" if payload.enabled else "0",
+            "llm_rerank_mode": mode,
+            "llm_rerank_provider": provider_value,
+            "llm_rerank_api_url": resolved_url,
+            "llm_rerank_model": payload.model.strip(),
+        }
+        if persist_api_key:
+            values["llm_rerank_api_key"] = api_key
+        with transaction() as con:
+            for key, value in values.items():
+                secret = key == "llm_rerank_api_key"
+                stored = seal(value) if secret and value else value
+                con.execute(
+                    "INSERT INTO settings(key,value,secret) VALUES(?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
+                    (key, stored, 1 if secret else 0),
+                )
+        clear_llm_rerank_cache(current_profile_id() or "legacy")
+        return {
+            "saved": True,
+            "llm_rerank": safe_llm_rerank_settings(),
+            "health": health,
+        }
 
 
 @app.post("/api/llm/test")
-async def test_llm_rerank_settings(payload: LLMRerankTestIn):
+def test_llm_rerank_settings(payload: LLMRerankTestIn):
     existing = effective_llm_rerank_settings()
     try:
         mode = payload.validate_values(existing["mode"])
@@ -5192,7 +5205,7 @@ async def test_llm_rerank_settings(payload: LLMRerankTestIn):
     else:
         api_key = ""
     try:
-        health = await verify_llm_reranker(
+        health = verify_llm_reranker(
             mode=mode,
             api_url=api_url,
             api_key=api_key,
@@ -5201,9 +5214,12 @@ async def test_llm_rerank_settings(payload: LLMRerankTestIn):
     except (ProfileDeletedError, RestoreEpochError):
         raise
     except ValueError as exc:
-        raise HTTPException(400, safe_error_message(exc)) from exc
+        raise HTTPException(400, sanitize_llm_error(exc, api_key=api_key)) from exc
     except Exception as exc:
-        raise HTTPException(400, f"LLM reranker check failed: {safe_error_message(exc)}") from exc
+        raise HTTPException(
+            400,
+            f"LLM reranker check failed: {sanitize_llm_error(exc, api_key=api_key)}",
+        ) from exc
     return health
 
 
@@ -5299,7 +5315,8 @@ async def _resolve_llm_models_response(
         else:
             resolved_key = ""
         try:
-            models = await discover_local_llm_models(
+            models = await run_in_threadpool(
+                discover_local_llm_models,
                 mode=resolved_mode,
                 api_url=target_url,
                 api_key=resolved_key,
@@ -5309,14 +5326,16 @@ async def _resolve_llm_models_response(
         except ResponseBoundsError as exc:
             raise HTTPException(
                 502,
-                f"Unable to fetch models from {resolved_mode} endpoint: {safe_error_message(exc)}",
+                f"Unable to fetch models from {resolved_mode} endpoint: {sanitize_llm_error(exc, api_key=resolved_key)}",
             ) from exc
         except ValueError as exc:
-            raise HTTPException(400, safe_error_message(exc)) from exc
+            raise HTTPException(
+                400, sanitize_llm_error(exc, api_key=resolved_key)
+            ) from exc
         except Exception as exc:
             raise HTTPException(
                 502,
-                f"Unable to fetch models from {resolved_mode} endpoint: {safe_error_message(exc)}",
+                f"Unable to fetch models from {resolved_mode} endpoint: {sanitize_llm_error(exc, api_key=resolved_key)}",
             ) from exc
         return {
             "mode": resolved_mode,

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
+import hmac
+import ipaddress
 import json
 import logging
 import math
 import re
+import secrets
 import threading
 import time
 from typing import Any
@@ -18,9 +21,19 @@ from urllib.parse import unquote, urljoin, urlparse, urlsplit, urlunsplit
 import httpx
 
 from .config import settings
-from .http_bounds import read_bounded_json_async, read_bounded_json_sync
+from .http_bounds import (
+    ERROR_BODY_MAX_BYTES,
+    JSON_CONTENT_TYPES,
+    read_bounded_bytes_sync,
+    read_bounded_json_sync,
+)
 from .identity import ReadIdentityIndex, book_identity, book_row_identity_match_keys
-from .security import safe_error_message, validate_service_url
+from .security import (
+    resolve_public_target,
+    safe_error_message,
+    sanitize_pinned_error_message,
+    validate_public_url,
+)
 from .tenancy import current_profile_id, profile_database_path
 
 LOGGER = logging.getLogger(__name__)
@@ -37,12 +50,16 @@ CACHE_TTL_SECONDS = 900.0
 MAX_CACHE_ENTRIES_PER_PROFILE = 32
 MAX_CACHED_PROFILES = 128
 MAX_DISLIKED_READS = 8
+LLM_CIRCUIT_COOLDOWN_SECONDS = 300.0
 
+_KEY_FINGERPRINT_SALT = secrets.token_bytes(16)
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", flags=re.DOTALL | re.IGNORECASE)
-_SAFE_AUTHORITY_HOST_RE = re.compile(r"(?:[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?|\[[0-9a-f:]+\])")
-_SAFE_OPTIONAL_PATH_RE = re.compile(r"(?:/[A-Za-z0-9._/-]*)?")
-_SAFE_ENDPOINT_PATH_RE = re.compile(r"/[A-Za-z0-9._/-]+")
+_SAFE_AUTHORITY_HOST_RE = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?|\[[0-9a-f:]+\])"
+)
+_SAFE_OPTIONAL_PATH_RE = re.compile(r"(?:/[A-Za-z0-9._~/-]*)?")
+_SAFE_ENDPOINT_PATH_RE = re.compile(r"/[A-Za-z0-9._~/-]+")
 _SAFE_LLM_QUERY_RE = re.compile(r"[A-Za-z0-9._~=&+-]+")
 
 _DECISION_EVENT_TYPES = frozenset(
@@ -53,6 +70,29 @@ _RERANK_CACHE_LOCK = threading.Lock()
 _RERANK_CACHE_BY_PROFILE: OrderedDict[
     str, OrderedDict[str, tuple[float, str, list[dict[str, Any]]]]
 ] = OrderedDict()
+
+_STATE_LOCK = threading.Lock()
+_CIRCUIT_BREAKER: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_LAST_ERROR = threading.local()
+
+
+def last_rerank_error() -> str:
+    """Return the credential-redacted error recorded by the latest fallback on this thread."""
+    return str(getattr(_LAST_ERROR, "message", "") or "")
+
+
+def _set_last_rerank_error(message: str) -> None:
+    _LAST_ERROR.message = message
+
+
+def current_llm_profile_key() -> str:
+    """Return an isolated per-profile circuit-breaker scope key."""
+    profile = current_profile_id() or "legacy"
+    try:
+        db_path = str(profile_database_path())
+    except Exception:
+        db_path = settings.db
+    return f"{profile}::{db_path}"
 
 
 def _parse_datetime(value: object) -> datetime | None:
@@ -741,37 +781,53 @@ def validate_llm_api_url(
     url: str,
     allowed_hosts: set[str] | None = None,
     *,
+    mode: str = "",
+    endpoint: str = "chat",
     has_api_key: bool = True,
+    resolve_dns: bool = True,
 ) -> str:
-    """Validate an LLM endpoint URL against SSRF and HTTPS guards and normalize its chat path."""
+    """Validate an LLM endpoint URL against SSRF and HTTPS guards and canonicalize its target path."""
+    resolved_mode = normalize_llm_rerank_mode(mode, allow_blank=True)
+    if endpoint not in {"chat", "models", "base", "exact"}:
+        raise ValueError(f"Unsupported LLM endpoint target: {endpoint!r}")
+
     cleaned = str(url or "").strip()
     if not cleaned:
         raise ValueError("LLM API URL is required")
     if "\\" in cleaned or any(ord(ch) < 33 or ord(ch) == 127 for ch in cleaned):
         raise ValueError("LLM API URL contains invalid characters")
+
     parsed = urlparse(cleaned)
     if parsed.scheme == "https":
         scheme = "https"
+        default_port = 443
     elif parsed.scheme == "http":
         scheme = "http"
+        default_port = 80
     else:
         raise ValueError("LLM API URL must use HTTP or HTTPS")
+
     if not parsed.hostname:
         raise ValueError("LLM API URL must include a hostname")
     if parsed.username or parsed.password or parsed.params:
         raise ValueError("LLM API URL cannot contain credentials or URL parameters")
+    if resolved_mode == "ollama" and (parsed.query or parsed.fragment):
+        raise ValueError("Ollama URL cannot contain query parameters or fragments")
+
     try:
         port_num = parsed.port
     except ValueError as exc:
         raise ValueError("Invalid port in LLM API URL") from exc
 
-    port_str = ""
+    port_suffix = ""
     if port_num is not None:
         if not (1 <= port_num <= 65535):
             raise ValueError("Invalid port in LLM API URL")
-        port_str = str(int(port_num))
-        if not port_str.isdigit():
-            raise ValueError("Invalid port in LLM API URL")
+        if port_num != default_port:
+            port_str = str(int(port_num))
+            if not port_str.isdigit():
+                raise ValueError("Invalid port in LLM API URL")
+            port_suffix = f":{port_str}"
 
     raw_path = parsed.path or ""
     unquoted_path = unquote(raw_path)
@@ -788,21 +844,23 @@ def validate_llm_api_url(
     if raw_query and not _SAFE_LLM_QUERY_RE.fullmatch(raw_query):
         raise ValueError("LLM API URL contains invalid query characters")
 
-    hosts = (
-        llm_rerank_allowed_hosts()
-        if allowed_hosts is None
-        else {
+    if allowed_hosts is None:
+        hosts = set() if resolved_mode == "cloud" else llm_rerank_allowed_hosts()
+    else:
+        hosts = {
             host.strip().lower().strip("[]").rstrip(".")
             for host in allowed_hosts
             if host and host.strip()
         }
-    )
+
     raw_host = parsed.hostname.lower().rstrip(".")
     matched_allowed = next((allowed for allowed in hosts if allowed == raw_host), None)
-    if scheme == "http" and has_api_key and matched_allowed is None:
+    effective_has_key = True if resolved_mode == "cloud" else bool(has_api_key)
+    if scheme == "http" and effective_has_key and matched_allowed is None:
         raise ValueError(
             "LLM API URL must use HTTPS when an API key is configured unless the host is allowlisted"
         )
+
     effective_host = matched_allowed if matched_allowed is not None else raw_host
     authority_host = (
         f"[{effective_host}]"
@@ -812,56 +870,217 @@ def validate_llm_api_url(
     if not _SAFE_AUTHORITY_HOST_RE.fullmatch(authority_host):
         raise ValueError("Invalid host in LLM API URL")
 
-    authority = f"{authority_host}:{port_str}" if port_str else authority_host
+    authority = f"{authority_host}{port_suffix}"
     sanitized_url = f"{scheme}://{authority}{raw_path}"
-    validate_service_url(sanitized_url, hosts)
-    normalized_path = urlparse(_normalize_chat_url(sanitized_url)).path
+    if resolve_dns and matched_allowed is None:
+        validate_public_url(
+            sanitized_url,
+            allow_http=(scheme == "http" and not effective_has_key),
+        )
+
+    query_suffix = ""
+    if resolved_mode == "ollama":
+        if endpoint == "exact":
+            endpoint_path = (
+                raw_path
+                if raw_path and raw_path != "/"
+                else "/api/chat"
+            )
+        else:
+            base_path = urlparse(
+                _normalize_ollama_base_url(f"{scheme}://{authority}{raw_path.rstrip('/')}")
+            ).path.rstrip("/")
+            if endpoint == "base":
+                endpoint_path = base_path
+            else:
+                suffix = "/api/tags" if endpoint == "models" else "/api/chat"
+                endpoint_path = f"{base_path}{suffix}" if base_path else suffix
+    elif endpoint == "models":
+        endpoint_path = urlparse(_normalize_openai_models_url(sanitized_url)).path
+    elif endpoint == "exact":
+        endpoint_path = (
+            raw_path
+            if raw_path and raw_path != "/"
+            else urlparse(_normalize_chat_url(sanitized_url)).path
+        )
+        if raw_query:
+            query_suffix = f"?{raw_query}"
+    else:
+        endpoint_path = urlparse(_normalize_chat_url(sanitized_url)).path
+        if raw_query and endpoint != "base":
+            query_suffix = f"?{raw_query}"
+
+    if endpoint == "base" and resolved_mode == "ollama" and endpoint_path == "":
+        return f"{scheme}://{authority}"
     if (
-        ".." in normalized_path.split("/")
-        or not _SAFE_ENDPOINT_PATH_RE.fullmatch(normalized_path)
+        ".." in endpoint_path.split("/")
+        or not _SAFE_ENDPOINT_PATH_RE.fullmatch(endpoint_path)
     ):
         raise ValueError("Invalid endpoint path in LLM API URL")
+    return f"{scheme}://{authority}{endpoint_path}{query_suffix}"
+
+
+def _prepare_llm_request_target(
+    url: str,
+    allowed_hosts: set[str] | None = None,
+    *,
+    mode: str = "",
+    endpoint: str = "chat",
+    has_api_key: bool = True,
+) -> tuple[str, dict[str, str], dict[str, str] | None]:
+    """Validate and pin an outbound LLM endpoint URL against SSRF, cleartext credential use, and DNS rebinding."""
+    resolved_mode = normalize_llm_rerank_mode(mode, allow_blank=True)
+    effective_has_key = True if resolved_mode == "cloud" else bool(has_api_key)
+    normalized = validate_llm_api_url(
+        url,
+        allowed_hosts=allowed_hosts,
+        mode=resolved_mode,
+        endpoint=endpoint,
+        has_api_key=effective_has_key,
+        resolve_dns=False,
+    )
+    parsed = urlparse(normalized)
+    if parsed.scheme == "https":
+        scheme = "https"
+        default_port = 443
+    elif parsed.scheme == "http":
+        scheme = "http"
+        default_port = 80
+    else:
+        raise ValueError("LLM API URL must use HTTP or HTTPS")
+
+    port = parsed.port
+    port_suffix = ""
+    if port is not None and port != default_port:
+        port_str = str(int(port))
+        if not port_str.isdigit():
+            raise ValueError("Invalid port in LLM API URL")
+        port_suffix = f":{port_str}"
+
+    raw_path = parsed.path or "/"
+    if ".." in raw_path.split("/") or not _SAFE_ENDPOINT_PATH_RE.fullmatch(raw_path):
+        raise ValueError("Invalid endpoint path in LLM API URL")
+
+    raw_query = parsed.query
+    if raw_query and not _SAFE_LLM_QUERY_RE.fullmatch(raw_query):
+        raise ValueError("LLM API URL contains invalid query characters")
     query_suffix = f"?{raw_query}" if raw_query else ""
-    return f"{scheme}://{authority}{normalized_path}{query_suffix}"
+
+    requested_host = (parsed.hostname or "").lower().rstrip(".")
+    if not requested_host:
+        raise ValueError("LLM API URL must include a hostname")
+
+    if allowed_hosts is None:
+        hosts = set() if resolved_mode == "cloud" else llm_rerank_allowed_hosts()
+    else:
+        hosts = {
+            host.strip().lower().strip("[]").rstrip(".")
+            for host in allowed_hosts
+            if host and host.strip()
+        }
+
+    matched_allowed = next(
+        (allowed for allowed in hosts if allowed == requested_host),
+        None,
+    )
+    if matched_allowed is not None:
+        connect_host = (
+            f"[{matched_allowed}]" if ":" in matched_allowed else matched_allowed
+        )
+        return (
+            f"{scheme}://{connect_host}{port_suffix}{raw_path}{query_suffix}",
+            {},
+            None,
+        )
+
+    if scheme == "http" and effective_has_key:
+        raise ValueError(
+            "LLM API URL must use HTTPS when an API key is configured unless the host is allowlisted"
+        )
+
+    _, address, resolved_host = resolve_public_target(
+        f"{scheme}://{f'[{requested_host}]' if ':' in requested_host else requested_host}{port_suffix}{raw_path}",
+        allow_http=(scheme == "http" and not effective_has_key),
+    )
+    try:
+        ipaddress.ip_address(resolved_host)
+        is_ip_literal = True
+    except ValueError:
+        is_ip_literal = False
+    connect_host = f"[{address}]" if ":" in address else address
+    formatted_host = f"[{resolved_host}]" if ":" in resolved_host else resolved_host
+    host_header = (
+        formatted_host if not port_suffix else f"{formatted_host}{port_suffix}"
+    )
+    extensions = (
+        {"sni_hostname": resolved_host}
+        if scheme == "https" and not is_ip_literal
+        else None
+    )
+    return (
+        f"{scheme}://{connect_host}{port_suffix}{raw_path}{query_suffix}",
+        {"Host": host_header},
+        extensions,
+    )
 
 
 def canonical_llm_endpoint_key(
     url: str, mode: str = "cloud"
 ) -> tuple[str, str, int, str] | None:
-    """Return normalized (scheme, host, port, canonical_path) for saved-key matching."""
+    """Return normalized (scheme, host, port, canonical_path) for saved-key and endpoint matching."""
     cleaned = str(url or "").strip()
     if not cleaned:
         return None
     try:
         resolved_mode = normalize_llm_rerank_mode(mode)
-        raw_parsed = urlparse(cleaned)
-        if resolved_mode == "ollama" and (raw_parsed.query or raw_parsed.fragment):
-            return None
-        raw_host = (raw_parsed.hostname or "").strip().lower().rstrip(".")
-        if not raw_host:
-            return None
         validated = validate_llm_api_url(
             cleaned,
-            allowed_hosts={raw_host},
+            mode=resolved_mode,
+            endpoint="base" if resolved_mode == "ollama" else "chat",
             has_api_key=False,
+            resolve_dns=False,
         )
     except ValueError:
         return None
     parsed = urlparse(validated)
     scheme = parsed.scheme.lower()
     host = (parsed.hostname or "").lower().rstrip(".")
-    port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
+    port = (
+        parsed.port
+        if parsed.port is not None
+        else (443 if scheme == "https" else 80)
+    )
     if resolved_mode == "ollama":
-        raw_input_path = (raw_parsed.path or "").rstrip("/")
-        authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
-        canonical_path = urlparse(
-            _normalize_ollama_base_url(f"{scheme}://{authority}{raw_input_path}")
-        ).path.rstrip("/")
+        canonical_path = (parsed.path or "").rstrip("/")
     else:
         canonical_path = (
             f"{parsed.path}?{parsed.query}" if parsed.query else parsed.path
         )
     return (scheme, host, int(port), canonical_path)
+
+
+def normalized_llm_origin(url: str, mode: str = "cloud") -> str:
+    """Return canonical scheme://host[:non_default_port] for origin comparisons."""
+    key = canonical_llm_endpoint_key(url, mode)
+    if key is None:
+        return ""
+    scheme, host, port, _path = key
+    default_port = 443 if scheme == "https" else 80
+    formatted_host = f"[{host}]" if ":" in host else host
+    port_suffix = f":{port}" if port != default_port else ""
+    return f"{scheme}://{formatted_host}{port_suffix}"
+
+
+def canonical_llm_url(url: str, mode: str = "cloud") -> str:
+    """Return canonical scheme://host[:non_default_port]/canonical_path[?query]."""
+    key = canonical_llm_endpoint_key(url, mode)
+    if key is None:
+        return ""
+    scheme, host, port, canonical_path = key
+    default_port = 443 if scheme == "https" else 80
+    formatted_host = f"[{host}]" if ":" in host else host
+    port_suffix = f":{port}" if port != default_port else ""
+    return f"{scheme}://{formatted_host}{port_suffix}{canonical_path}"
 
 
 def can_reuse_saved_llm_key(
@@ -890,96 +1109,196 @@ def can_reuse_saved_llm_key(
     return target_endpoint is not None and target_endpoint == saved_endpoint
 
 
-def _build_validated_llm_target_url(
-    url: str,
+def is_custom_llm_endpoint(
+    api_url: str | None,
     *,
-    mode: str,
-    endpoint: str,
-    allowed_hosts: set[str] | None = None,
-    has_api_key: bool = False,
-) -> str:
-    resolved_mode = normalize_llm_rerank_mode(mode)
-    raw_input = str(url or "").strip()
-    raw_input_parsed = urlparse(raw_input)
-    if resolved_mode == "ollama" and (
-        raw_input_parsed.query or raw_input_parsed.fragment
-    ):
-        raise ValueError("Ollama URL cannot contain query parameters or fragments")
-    effective_hosts: set[str] | None = (
-        set() if resolved_mode == "cloud" else allowed_hosts
-    )
-    validated = validate_llm_api_url(
-        raw_input,
-        allowed_hosts=effective_hosts,
-        has_api_key=(resolved_mode == "cloud" or has_api_key),
-    )
-    parsed = urlparse(validated)
-    scheme = "https" if parsed.scheme == "https" else "http"
-    raw_host = (parsed.hostname or "").lower().rstrip(".")
-    authority_host = f"[{raw_host}]" if ":" in raw_host else raw_host
-    if not _SAFE_AUTHORITY_HOST_RE.fullmatch(authority_host):
-        raise ValueError("Invalid host in LLM API URL")
-    port_str = str(int(parsed.port)) if parsed.port is not None else ""
-
-    query_suffix = ""
-    if resolved_mode == "ollama":
-        raw_input_path = (raw_input_parsed.path or "").rstrip("/")
-        raw_origin_url = (
-            f"{scheme}://{authority_host}:{port_str}{raw_input_path}"
-            if port_str
-            else f"{scheme}://{authority_host}{raw_input_path}"
-        )
-        base_path = urlparse(_normalize_ollama_base_url(raw_origin_url)).path.rstrip("/")
-        suffix = "/api/tags" if endpoint == "models" else "/api/chat"
-        endpoint_path = f"{base_path}{suffix}" if base_path else suffix
-    elif endpoint == "models":
-        endpoint_path = urlparse(_normalize_openai_models_url(validated)).path
-    else:
-        endpoint_path = parsed.path
-        if parsed.query:
-            if not _SAFE_LLM_QUERY_RE.fullmatch(parsed.query):
-                raise ValueError("LLM API URL contains invalid query characters")
-            query_suffix = f"?{parsed.query}"
-
-    if (
-        ".." in endpoint_path.split("/")
-        or not _SAFE_ENDPOINT_PATH_RE.fullmatch(endpoint_path)
-    ):
-        raise ValueError("Invalid endpoint path in LLM API URL")
-
-    if port_str:
-        return f"{scheme}://{authority_host}:{port_str}{endpoint_path}{query_suffix}"
-    return f"{scheme}://{authority_host}{endpoint_path}{query_suffix}"
-
-
-def is_custom_llm_endpoint(api_url: str | None) -> bool:
+    mode: str | None = None,
+) -> bool:
     """Return whether ``api_url`` points to a non-default custom LLM endpoint."""
-    normalized = _normalize_chat_url(api_url or "")
-    if not normalized:
+    raw = str(api_url or "").strip()
+    if not raw:
         return False
-    host_default = _normalize_chat_url(settings.llm_rerank_api_url or "")
-    return normalized != host_default
+    target_mode, target_valid = read_stored_llm_rerank_mode(
+        mode if mode is not None else settings.llm_rerank_mode,
+        fallback="cloud",
+    )
+    default_mode, default_valid = read_stored_llm_rerank_mode(
+        settings.llm_rerank_mode,
+        fallback="cloud",
+    )
+    if not target_valid or not default_valid or target_mode != default_mode:
+        return True
+    default_url = (
+        DEFAULT_OLLAMA_URL
+        if default_mode == "ollama"
+        and (settings.llm_rerank_api_url or "").strip() == DEFAULT_CLOUD_LLM_URL
+        else (settings.llm_rerank_api_url or "").strip()
+    )
+    target_key = canonical_llm_endpoint_key(raw, target_mode)
+    default_key = canonical_llm_endpoint_key(default_url, default_mode)
+    if target_key is None or default_key is None:
+        return True
+    return target_key != default_key
 
 
 def resolve_llm_rerank_credentials(
     api_url: str | None,
     profile_api_key: str | None,
+    *,
+    mode: str | None = None,
 ) -> tuple[str, str]:
     """Resolve ``(effective_api_url, effective_api_key)`` under one shared rule.
 
     A non-empty profile API key always takes precedence. Otherwise, the host
     environment key (``settings.llm_rerank_api_key``) is used only when the
-    endpoint matches ``settings.llm_rerank_api_url`` and is never forwarded to
-    a custom endpoint URL.
+    canonical endpoint and mode match ``settings.llm_rerank_api_url`` and is
+    never forwarded to a custom endpoint URL.
     """
     cleaned_url = (api_url or "").strip()
     effective_url = cleaned_url or (settings.llm_rerank_api_url or "").strip()
     own_key = (profile_api_key or "").strip()
     if own_key:
         return effective_url, own_key
-    if is_custom_llm_endpoint(effective_url):
+    if is_custom_llm_endpoint(effective_url, mode=mode):
         return effective_url, ""
     return effective_url, (settings.llm_rerank_api_key or "").strip()
+
+
+def sanitize_llm_error(error: Any, api_key: str = "", limit: int = 300) -> str:
+    """Return a bounded, credential-redacted error message."""
+    raw = str(error or "").strip() or "Request failed"
+    secret = str(api_key or "").strip()
+    if secret and secret in raw:
+        raw = raw.replace(secret, "[redacted]")
+    redacted = safe_error_message(raw, limit=limit)
+    if secret and secret in redacted:
+        redacted = redacted.replace(secret, "[redacted]")[:limit]
+    return redacted
+
+
+def _derive_api_key_fingerprint(api_key: str) -> str:
+    """Derive a fast, non-reversible HMAC-SHA256 fingerprint using the process salt."""
+    cleaned = str(api_key or "").strip()
+    if not cleaned:
+        return ""
+    return hmac.digest(
+        cleaned.encode("utf-8"),
+        _KEY_FINGERPRINT_SALT,
+        "sha256",
+    )[:16].hex()
+
+
+def _config_fingerprint(
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    top_k: int,
+    max_delta: float,
+    mode: str = "",
+) -> str:
+    try:
+        normalized_mode = normalize_llm_rerank_mode(mode, allow_blank=True)
+    except ValueError:
+        normalized_mode = ""
+    canon_mode = normalized_mode or "cloud"
+    non_secret_payload = json.dumps(
+        {
+            "mode": normalized_mode,
+            "url": canonical_llm_url(api_url, canon_mode) or _normalize_chat_url(api_url),
+            "model": model.strip(),
+            "top_k": int(top_k),
+            "max_delta": round(float(max_delta), 4),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cfg_digest = hashlib.sha256(non_secret_payload.encode("utf-8")).hexdigest()[:24]
+    key_fp = _derive_api_key_fingerprint(api_key)
+    return f"{cfg_digest}:{key_fp}"
+
+
+def get_circuit_breaker_state(
+    profile_key: str,
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    top_k: int | None = None,
+    max_delta: float | None = None,
+    mode: str = "",
+) -> dict[str, Any] | None:
+    now = time.monotonic()
+    with _STATE_LOCK:
+        entry = _CIRCUIT_BREAKER.get(profile_key)
+        if not entry:
+            return None
+        if now >= float(entry.get("open_until") or 0.0):
+            _CIRCUIT_BREAKER.pop(profile_key, None)
+            return None
+    cfg_fp = _config_fingerprint(
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        top_k=settings.llm_rerank_top_k if top_k is None else top_k,
+        max_delta=settings.llm_rerank_max_delta if max_delta is None else max_delta,
+        mode=mode,
+    )
+    now = time.monotonic()
+    with _STATE_LOCK:
+        entry = _CIRCUIT_BREAKER.get(profile_key)
+        if not entry:
+            return None
+        if entry.get("cfg") != cfg_fp or now >= float(entry.get("open_until") or 0.0):
+            _CIRCUIT_BREAKER.pop(profile_key, None)
+            return None
+        _CIRCUIT_BREAKER.move_to_end(profile_key)
+        return dict(entry)
+
+
+def trip_circuit_breaker(
+    profile_key: str,
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    error: str,
+    cooldown_seconds: float = LLM_CIRCUIT_COOLDOWN_SECONDS,
+    top_k: int | None = None,
+    max_delta: float | None = None,
+    mode: str = "",
+) -> dict[str, Any]:
+    cfg_fp = _config_fingerprint(
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        top_k=settings.llm_rerank_top_k if top_k is None else top_k,
+        max_delta=settings.llm_rerank_max_delta if max_delta is None else max_delta,
+        mode=mode,
+    )
+    cooldown = max(1.0, float(cooldown_seconds))
+    now_mono = time.monotonic()
+    cooldown_until = (
+        datetime.now(timezone.utc) + timedelta(seconds=cooldown)
+    ).isoformat(timespec="seconds")
+    record = {
+        "cfg": cfg_fp,
+        "open_until": now_mono + cooldown,
+        "cooldown_until": cooldown_until,
+        "error": error,
+    }
+    with _STATE_LOCK:
+        _CIRCUIT_BREAKER[profile_key] = record
+        _CIRCUIT_BREAKER.move_to_end(profile_key)
+        while len(_CIRCUIT_BREAKER) > MAX_CACHED_PROFILES:
+            _CIRCUIT_BREAKER.popitem(last=False)
+    return dict(record)
+
+
+def clear_circuit_breaker(profile_key: str | None = None) -> None:
+    target = current_llm_profile_key() if profile_key is None else profile_key
+    with _STATE_LOCK:
+        _CIRCUIT_BREAKER.pop(target, None)
 
 
 def _bounded_timeout(timeout_seconds: float | None) -> float:
@@ -1016,6 +1335,7 @@ def _build_cache_key(
     reads: Sequence[Mapping[str, Any]],
     interaction_events: Sequence[Mapping[str, Any]] | None,
     mode: str = "",
+    key_fingerprint: str = "",
 ) -> str:
     slate_fp = [
         (
@@ -1047,9 +1367,14 @@ def _build_cache_key(
         )
         for d in _resolve_active_discovery_decisions(interaction_events)
     ]
+    try:
+        cleaned_mode = normalize_llm_rerank_mode(mode, allow_blank=True)
+    except ValueError:
+        cleaned_mode = ""
+    canon_mode = cleaned_mode or "cloud"
     material: dict[str, Any] = {
         "profile_scope": profile_scope,
-        "url": url,
+        "url": canonical_llm_url(url, canon_mode) or url,
         "model": model,
         "top_k": int(top_k),
         "max_delta": round(float(max_delta), 4),
@@ -1058,14 +1383,14 @@ def _build_cache_key(
         "reads": reads_fp,
         "feedback": active_fp,
     }
-    try:
-        cleaned_mode = normalize_llm_rerank_mode(mode, allow_blank=True)
-    except ValueError:
-        cleaned_mode = ""
     if cleaned_mode:
         material["mode"] = cleaned_mode
-    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    encoded = json.dumps(
+        material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    cleaned_fp = str(key_fingerprint or "").strip()
+    return f"{digest}:{cleaned_fp}" if cleaned_fp else digest
 
 
 def _cache_get(
@@ -1127,12 +1452,37 @@ def _cache_put(
 
 
 def clear_llm_rerank_cache(profile_id: str | None = None) -> None:
-    """Clear cached LLM rerank entries globally or for a single profile."""
+    """Clear cached LLM rerank entries (and any open circuit-breaker state) globally or for a single profile."""
     with _RERANK_CACHE_LOCK:
         if profile_id is None:
             _RERANK_CACHE_BY_PROFILE.clear()
         else:
             _RERANK_CACHE_BY_PROFILE.pop(_profile_cache_scope(profile_id), None)
+    with _STATE_LOCK:
+        if profile_id is None:
+            _CIRCUIT_BREAKER.clear()
+        else:
+            prefix = f"{profile_id.strip()}::"
+            for key in [k for k in _CIRCUIT_BREAKER if k.startswith(prefix)]:
+                _CIRCUIT_BREAKER.pop(key, None)
+
+
+def clear_llm_rerank_state(
+    profile_key: str | None = None,
+    *,
+    clear_all: bool = False,
+) -> None:
+    """Clear cached slates and circuit-breaker state for a profile or globally."""
+    if clear_all:
+        clear_llm_rerank_cache(None)
+        return
+    target_breaker = current_llm_profile_key() if profile_key is None else profile_key
+    with _STATE_LOCK:
+        _CIRCUIT_BREAKER.pop(target_breaker, None)
+    if profile_key is None:
+        clear_llm_rerank_cache(current_profile_id() or "legacy")
+    else:
+        clear_llm_rerank_cache(profile_key.split("::", 1)[0])
 
 
 def extract_llm_json(content: str) -> dict[str, Any]:
@@ -1250,206 +1600,214 @@ def _build_chat_request_bodies(
     return strict_body, plain_body
 
 
+def _url_origin(url: str) -> tuple[str, str, int]:
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower().rstrip(".")
+    port = parsed.port or (443 if scheme == "https" else 80)
+    return scheme, host, int(port)
+
+
 def _validate_redirect_target(
     origin_url: str,
     status_code: int,
     location: str,
-    *,
-    mode: str,
     allowed_hosts: set[str] | None = None,
-    has_api_key: bool = False,
+    *,
+    mode: str = "",
+    has_api_key: bool = True,
 ) -> str:
     if not location:
         raise ValueError("LLM endpoint returned a redirect without a Location header")
-    if status_code not in {307, 308}:
-        raise ValueError("Method-changing redirects are not allowed for LLM POST requests")
-    resolved_mode = normalize_llm_rerank_mode(mode)
-    effective_hosts: set[str] | None = (
-        set() if resolved_mode == "cloud" else allowed_hosts
-    )
-    effective_has_key = resolved_mode == "cloud" or has_api_key
+    resolved_mode = normalize_llm_rerank_mode(mode, allow_blank=True)
+    effective_has_key = True if resolved_mode == "cloud" else bool(has_api_key)
     validated_origin = validate_llm_api_url(
         origin_url,
-        allowed_hosts=effective_hosts,
+        allowed_hosts=allowed_hosts,
+        mode=resolved_mode,
+        endpoint="exact",
         has_api_key=effective_has_key,
+        resolve_dns=False,
     )
-    candidate_raw = urljoin(origin_url, location)
-    try:
-        validated_candidate = validate_llm_api_url(
-            candidate_raw,
-            allowed_hosts=effective_hosts,
-            has_api_key=effective_has_key,
-        )
-    except ValueError as exc:
-        raise ValueError("Cross-origin redirects are not allowed for LLM requests") from exc
-
-    orig_parsed = urlparse(validated_origin)
-    cand_parsed = urlparse(validated_candidate)
-    orig_port = orig_parsed.port or (443 if orig_parsed.scheme == "https" else 80)
-    cand_port = cand_parsed.port or (443 if cand_parsed.scheme == "https" else 80)
+    candidate_raw = urljoin(validated_origin, location)
+    cand_raw_parsed = urlparse(candidate_raw)
     if (
-        cand_parsed.scheme,
-        (cand_parsed.hostname or "").lower().rstrip("."),
-        cand_port,
-    ) != (
-        orig_parsed.scheme,
-        (orig_parsed.hostname or "").lower().rstrip("."),
-        orig_port,
+        cand_raw_parsed.username
+        or cand_raw_parsed.password
+        or _url_origin(candidate_raw) != _url_origin(validated_origin)
     ):
         raise ValueError("Cross-origin redirects are not allowed for LLM requests")
-
-    cand_raw_path = urlparse(candidate_raw).path or ""
-    endpoint_path = cand_raw_path if cand_raw_path and cand_raw_path != "/" else cand_parsed.path
-    if ".." in endpoint_path.split("/") or not _SAFE_ENDPOINT_PATH_RE.fullmatch(endpoint_path):
-        raise ValueError("Invalid redirect path from LLM endpoint")
-
-    scheme = "https" if cand_parsed.scheme == "https" else "http"
-    raw_host = (cand_parsed.hostname or "").lower().rstrip(".")
-    authority_host = f"[{raw_host}]" if ":" in raw_host else raw_host
-    if not _SAFE_AUTHORITY_HOST_RE.fullmatch(authority_host):
-        raise ValueError("Invalid host in LLM API URL")
-    if cand_parsed.port is not None:
-        return f"{scheme}://{authority_host}:{int(cand_parsed.port)}{endpoint_path}"
-    return f"{scheme}://{authority_host}{endpoint_path}"
-
-
-async def _send_llm_post_async(
-    client: httpx.AsyncClient,
-    origin_url: str,
-    *,
-    headers: dict[str, str],
-    json_body: dict[str, Any],
-    mode: str,
-    allowed_hosts: set[str] | None,
-    has_api_key: bool,
-    allow_schema_fallback: bool,
-) -> Any:
-    current_url = origin_url
-    for _hop in range(MAX_SAME_ORIGIN_REDIRECTS + 1):
-        request = client.build_request(
-            "POST",
-            current_url,
-            headers=headers,
-            json=json_body,
+    if status_code not in {307, 308}:
+        raise ValueError(
+            "Method-changing redirects are not allowed for LLM POST requests"
         )
-        response = await client.send(request, stream=True)
-        try:
-            if 300 <= response.status_code < 400:
-                current_url = _validate_redirect_target(
-                    origin_url,
-                    response.status_code,
-                    response.headers.get("location", "").strip(),
-                    mode=mode,
-                    allowed_hosts=allowed_hosts,
-                    has_api_key=has_api_key,
+    return validate_llm_api_url(
+        candidate_raw,
+        allowed_hosts=allowed_hosts,
+        mode=resolved_mode,
+        endpoint="exact",
+        has_api_key=effective_has_key,
+        resolve_dns=False,
+    )
+
+
+def _read_error_detail_sync(response: Any) -> str:
+    try:
+        error_cap = min(settings.llm_rerank_max_bytes, ERROR_BODY_MAX_BYTES)
+        if error_cap <= 0 or not hasattr(response, "iter_bytes"):
+            return ""
+        err_raw = read_bounded_bytes_sync(
+            response,
+            max_bytes=error_cap,
+            allowed_content_types=JSON_CONTENT_TYPES,
+            allow_missing_content_type=True,
+        )
+        err_body = json.loads(err_raw) if err_raw.strip() else None
+        if isinstance(err_body, Mapping):
+            raw_err = err_body.get("error")
+            if isinstance(raw_err, Mapping):
+                return str(raw_err.get("message") or "").strip()
+            if isinstance(raw_err, str):
+                return raw_err.strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _send_pinned_llm_request(
+    client: Any,
+    method: str,
+    url: str,
+    *,
+    headers: Mapping[str, str],
+    json_body: Mapping[str, Any] | None = None,
+    mode: str = "",
+    endpoint: str = "chat",
+    allowed_hosts: set[str] | None = None,
+    has_api_key: bool = True,
+    max_redirects: int = MAX_SAME_ORIGIN_REDIRECTS,
+    allow_schema_fallback: bool = False,
+    size_error: str = "LLM reranker response is too large",
+) -> Any:
+    resolved_mode = normalize_llm_rerank_mode(mode, allow_blank=True)
+    effective_has_key = True if resolved_mode == "cloud" else bool(has_api_key)
+    logical_origin_url = validate_llm_api_url(
+        url,
+        allowed_hosts=allowed_hosts,
+        mode=resolved_mode,
+        endpoint=endpoint,
+        has_api_key=effective_has_key,
+        resolve_dns=False,
+    )
+    current_logical_url = logical_origin_url
+    current_endpoint = endpoint
+
+    for hop in range(MAX_SAME_ORIGIN_REDIRECTS + 1):
+        target_url, host_headers, extensions = _prepare_llm_request_target(
+            current_logical_url,
+            allowed_hosts=allowed_hosts,
+            mode=resolved_mode,
+            endpoint=current_endpoint,
+            has_api_key=effective_has_key,
+        )
+        logical_host = (urlparse(current_logical_url).hostname or "").lower().rstrip(".")
+        pinned_host = (urlparse(target_url).hostname or "").lower().rstrip(".")
+        req_headers = {**headers, **host_headers}
+        request_kwargs: dict[str, Any] = {"headers": req_headers}
+        if json_body is not None:
+            request_kwargs["json"] = json_body
+        if extensions:
+            try:
+                request = client.build_request(
+                    method,
+                    target_url,
+                    extensions=extensions,
+                    **request_kwargs,
                 )
-                continue
-            if allow_schema_fallback and response.status_code in {400, 422}:
-                return None
-            response.raise_for_status()
-            return await read_bounded_json_async(
-                response,
-                max_bytes=settings.llm_rerank_max_bytes,
-                size_error="LLM reranker response is too large",
+            except TypeError:
+                request = client.build_request(
+                    method,
+                    target_url,
+                    **request_kwargs,
+                )
+        else:
+            request = client.build_request(
+                method,
+                target_url,
+                **request_kwargs,
             )
-        finally:
-            await response.aclose()
-    raise ValueError("Too many redirects from LLM endpoint")
 
-
-def _send_llm_post_sync(
-    client: httpx.Client,
-    origin_url: str,
-    *,
-    headers: dict[str, str],
-    json_body: dict[str, Any],
-    mode: str,
-    allowed_hosts: set[str] | None,
-    has_api_key: bool,
-    allow_schema_fallback: bool,
-) -> Any:
-    current_url = origin_url
-    for _hop in range(MAX_SAME_ORIGIN_REDIRECTS + 1):
-        request = client.build_request(
-            "POST",
-            current_url,
-            headers=headers,
-            json=json_body,
-        )
-        response = client.send(request, stream=True)
         try:
-            if 300 <= response.status_code < 400:
-                current_url = _validate_redirect_target(
-                    origin_url,
-                    response.status_code,
-                    response.headers.get("location", "").strip(),
-                    mode=mode,
-                    allowed_hosts=allowed_hosts,
-                    has_api_key=has_api_key,
+            response = client.send(request, stream=True)
+        except httpx.HTTPError as exc:
+            sanitized = (
+                sanitize_pinned_error_message(
+                    exc, address=pinned_host, hostname=logical_host
                 )
+                if pinned_host and pinned_host != logical_host
+                else safe_error_message(exc)
+            )
+            raise RuntimeError(sanitized) from exc
+
+        try:
+            status_code = int(getattr(response, "status_code", 200))
+            if 300 <= status_code < 400 or getattr(response, "is_redirect", False):
+                if max_redirects <= 0:
+                    raise ValueError("Redirects are not allowed for LLM requests")
+                current_logical_url = _validate_redirect_target(
+                    logical_origin_url,
+                    status_code,
+                    response.headers.get("location", "").strip(),
+                    allowed_hosts=allowed_hosts,
+                    mode=resolved_mode,
+                    has_api_key=effective_has_key,
+                )
+                current_endpoint = "exact"
+                if hop >= max_redirects:
+                    raise ValueError("Too many redirects from LLM endpoint")
                 continue
-            if allow_schema_fallback and response.status_code in {400, 422}:
+
+            if allow_schema_fallback and status_code in {400, 422}:
                 return None
-            response.raise_for_status()
+
+            if status_code >= 400:
+                detail = _read_error_detail_sync(response)
+                if detail:
+                    raise RuntimeError(f"HTTP {status_code}: {detail}")
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPError as exc:
+                    sanitized = (
+                        sanitize_pinned_error_message(
+                            exc, address=pinned_host, hostname=logical_host
+                        )
+                        if pinned_host and pinned_host != logical_host
+                        else safe_error_message(exc)
+                    )
+                    raise RuntimeError(sanitized) from exc
+                raise RuntimeError(f"HTTP {status_code}")
+
+            try:
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                sanitized = (
+                    sanitize_pinned_error_message(
+                        exc, address=pinned_host, hostname=logical_host
+                    )
+                    if pinned_host and pinned_host != logical_host
+                    else safe_error_message(exc)
+                )
+                raise RuntimeError(sanitized) from exc
+
             return read_bounded_json_sync(
                 response,
                 max_bytes=settings.llm_rerank_max_bytes,
-                size_error="LLM reranker response is too large",
+                size_error=size_error,
             )
         finally:
             response.close()
+
     raise ValueError("Too many redirects from LLM endpoint")
-
-
-async def _request_llm_completion_async(
-    *,
-    mode: str,
-    api_url: str,
-    api_key: str,
-    model: str,
-    messages: list[dict[str, str]],
-    timeout: float,
-    allowed_hosts: set[str] | None = None,
-) -> str:
-    has_key = bool(api_key.strip())
-    target_url = _build_validated_llm_target_url(
-        api_url,
-        mode=mode,
-        endpoint="chat",
-        allowed_hosts=allowed_hosts,
-        has_api_key=has_key,
-    )
-    headers = _build_headers(api_key, include_content_type=True)
-    strict_body, plain_body = _build_chat_request_bodies(
-        mode=mode, model=model, messages=messages
-    )
-    async with httpx.AsyncClient(
-        timeout=timeout,
-        follow_redirects=False,
-        trust_env=False,
-    ) as client:
-        payload = await _send_llm_post_async(
-            client,
-            target_url,
-            headers=headers,
-            json_body=strict_body,
-            mode=mode,
-            allowed_hosts=allowed_hosts,
-            has_api_key=has_key,
-            allow_schema_fallback=True,
-        )
-        if payload is None:
-            payload = await _send_llm_post_async(
-                client,
-                target_url,
-                headers=headers,
-                json_body=plain_body,
-                mode=mode,
-                allowed_hosts=allowed_hosts,
-                has_api_key=has_key,
-                allow_schema_fallback=False,
-            )
-        return _extract_completion_text(payload, mode)
 
 
 def _request_llm_completion_sync(
@@ -1464,41 +1822,36 @@ def _request_llm_completion_sync(
 ) -> str:
     resolved_mode = normalize_llm_rerank_mode(mode)
     has_key = bool(api_key.strip())
-    target_url = _build_validated_llm_target_url(
-        api_url,
-        mode=resolved_mode,
-        endpoint="chat",
-        allowed_hosts=allowed_hosts,
-        has_api_key=has_key,
-    )
     headers = _build_headers(api_key, include_content_type=True)
     strict_body, plain_body = _build_chat_request_bodies(
         mode=resolved_mode, model=model, messages=messages
     )
-    client_kwargs: dict[str, Any] = {
-        "timeout": timeout,
-        "follow_redirects": False,
-    }
-    if resolved_mode != "cloud":
-        client_kwargs["trust_env"] = False
-    with httpx.Client(**client_kwargs) as client:
-        payload = _send_llm_post_sync(
+    with httpx.Client(
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        payload = _send_pinned_llm_request(
             client,
-            target_url,
+            "POST",
+            api_url,
             headers=headers,
             json_body=strict_body,
             mode=resolved_mode,
+            endpoint="chat",
             allowed_hosts=allowed_hosts,
             has_api_key=has_key,
             allow_schema_fallback=True,
         )
         if payload is None:
-            payload = _send_llm_post_sync(
+            payload = _send_pinned_llm_request(
                 client,
-                target_url,
+                "POST",
+                api_url,
                 headers=headers,
                 json_body=plain_body,
                 mode=resolved_mode,
+                endpoint="chat",
                 allowed_hosts=allowed_hosts,
                 has_api_key=has_key,
                 allow_schema_fallback=False,
@@ -1531,11 +1884,15 @@ def _extract_response_payload(parsed: Any) -> tuple[str, list[dict[str, Any]]]:
         raise ValueError("LLM response JSON must be an object")
     if isinstance(parsed.get("adjustments"), list):
         return "adjustments", [
-            dict(entry) for entry in parsed["adjustments"] if isinstance(entry, Mapping)
+            dict(entry)
+            for entry in parsed["adjustments"]
+            if isinstance(entry, Mapping)
         ]
     if isinstance(parsed.get("rankings"), list):
         return "rankings", [
-            dict(entry) for entry in parsed["rankings"] if isinstance(entry, Mapping)
+            dict(entry)
+            for entry in parsed["rankings"]
+            if isinstance(entry, Mapping)
         ]
     raise ValueError("LLM response JSON did not include adjustments or rankings")
 
@@ -1587,27 +1944,30 @@ def _resolve_rerank_runtime(
     return resolved_mode, raw_url, key, chosen_model
 
 
-async def verify_llm_reranker(
+def verify_llm_reranker(
     *,
-    mode: str,
+    mode: str = "cloud",
     api_url: str,
     api_key: str = "",
     model: str,
     timeout_seconds: float | None = None,
     allowed_hosts: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Verify endpoint allowlist, connectivity, and JSON parsing before saving active reranker changes."""
+    """Verify endpoint allowlist, IP-pinned connectivity, and JSON parsing synchronously."""
     resolved_mode = normalize_llm_rerank_mode(mode)
     raw_url = api_url.strip() or (DEFAULT_OLLAMA_URL if resolved_mode == "ollama" else "")
     chosen_model = model.strip()
+    key = str(api_key or "").strip()
     if not raw_url or not chosen_model:
         raise ValueError("LLM reranking requires both an API URL and a model")
     validate_llm_api_url(
         raw_url,
-        allowed_hosts=set() if resolved_mode == "cloud" else allowed_hosts,
-        has_api_key=(resolved_mode == "cloud" or bool(api_key.strip())),
+        allowed_hosts=allowed_hosts,
+        mode=resolved_mode,
+        endpoint="chat",
+        has_api_key=(resolved_mode == "cloud" or bool(key)),
     )
-    if resolved_mode == "cloud" and not api_key.strip():
+    if resolved_mode == "cloud" and not key:
         raise ValueError("An API key is required when cloud LLM reranking is enabled")
 
     probe_messages = [
@@ -1625,27 +1985,36 @@ async def verify_llm_reranker(
     ]
     timeout = min(15.0, _bounded_timeout(timeout_seconds))
     started = time.perf_counter()
-    content = await _request_llm_completion_async(
-        mode=resolved_mode,
-        api_url=raw_url,
-        api_key=api_key,
-        model=chosen_model,
-        messages=probe_messages,
-        timeout=timeout,
-        allowed_hosts=allowed_hosts,
-    )
-    parsed = extract_llm_json(content)
-    if "adjustments" in parsed and not isinstance(parsed["adjustments"], list):
-        raise ValueError("LLM response field 'adjustments' must be a JSON list")
+    try:
+        content = _request_llm_completion_sync(
+            mode=resolved_mode,
+            api_url=raw_url,
+            api_key=key,
+            model=chosen_model,
+            messages=probe_messages,
+            timeout=timeout,
+            allowed_hosts=allowed_hosts,
+        )
+        parsed = extract_llm_json(content)
+        if "adjustments" in parsed and not isinstance(parsed["adjustments"], list):
+            raise ValueError("LLM response field 'adjustments' must be a JSON list")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(sanitize_llm_error(exc, api_key=key)) from exc
     return {
         "ok": True,
+        "checked": True,
         "mode": resolved_mode,
         "model": chosen_model,
         "latency_ms": round((time.perf_counter() - started) * 1000),
     }
 
 
-async def discover_local_llm_models(
+probe_llm_reranker = verify_llm_reranker
+
+
+def discover_local_llm_models(
     *,
     mode: str,
     api_url: str,
@@ -1653,39 +2022,41 @@ async def discover_local_llm_models(
     timeout_seconds: float = 10.0,
     allowed_hosts: set[str] | None = None,
 ) -> list[dict[str, str]]:
-    """Discover installed models from an allowlisted Ollama or OpenAI-compatible server."""
+    """Discover installed models synchronously from a validated, IP-pinned Ollama or OpenAI-compatible server."""
     resolved_mode = normalize_llm_rerank_mode(mode)
     if resolved_mode not in LLM_RERANK_MODES or resolved_mode == "cloud":
-        raise ValueError("Local model discovery is supported for ollama and openai-compatible modes")
+        raise ValueError(
+            "Local model discovery is supported for ollama and openai-compatible modes"
+        )
     raw_url = api_url.strip() or (DEFAULT_OLLAMA_URL if resolved_mode == "ollama" else "")
     if not raw_url:
         raise ValueError("Enter an endpoint URL to load models")
-    target_url = _build_validated_llm_target_url(
+    key = str(api_key or "").strip()
+    validate_llm_api_url(
         raw_url,
+        allowed_hosts=allowed_hosts,
         mode=resolved_mode,
         endpoint="models",
-        allowed_hosts=allowed_hosts,
-        has_api_key=bool(api_key.strip()),
+        has_api_key=bool(key),
     )
-    headers = _build_headers(api_key, include_content_type=False)
-    async with httpx.AsyncClient(
+    headers = _build_headers(key, include_content_type=False)
+    with httpx.Client(
         timeout=_bounded_timeout(timeout_seconds),
         follow_redirects=False,
         trust_env=False,
     ) as client:
-        request = client.build_request("GET", target_url, headers=headers)
-        response = await client.send(request, stream=True)
-        try:
-            if 300 <= response.status_code < 400:
-                raise ValueError("Redirects are not allowed for LLM requests")
-            response.raise_for_status()
-            payload = await read_bounded_json_async(
-                response,
-                max_bytes=settings.llm_rerank_max_bytes,
-                size_error="LLM model discovery response is too large",
-            )
-        finally:
-            await response.aclose()
+        payload = _send_pinned_llm_request(
+            client,
+            "GET",
+            raw_url,
+            headers=headers,
+            mode=resolved_mode,
+            endpoint="models",
+            allowed_hosts=allowed_hosts,
+            has_api_key=bool(key),
+            max_redirects=0,
+            size_error="LLM model discovery response is too large",
+        )
 
     if not isinstance(payload, dict):
         raise ValueError("Model discovery endpoint returned an invalid JSON payload")
@@ -1693,7 +2064,11 @@ async def discover_local_llm_models(
     raw_items = (
         payload.get("models")
         if resolved_mode == "ollama"
-        else (payload.get("data") if isinstance(payload.get("data"), list) else payload.get("models"))
+        else (
+            payload.get("data")
+            if isinstance(payload.get("data"), list)
+            else payload.get("models")
+        )
     )
     if not isinstance(raw_items, list):
         raise ValueError("Model discovery endpoint did not return a model list")
@@ -1720,6 +2095,100 @@ async def discover_local_llm_models(
     return discovered
 
 
+_DEFAULT_PROMPT_DATA_FN = _build_rerank_prompt_data
+
+
+def try_cached_rerank(
+    reads: Sequence[dict[str, Any]],
+    candidates: Sequence[dict[str, Any]],
+    *,
+    interaction_events: Sequence[dict[str, Any]] | None = None,
+    profile_id: str | None = None,
+    mode: str | None = None,
+    api_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+    top_k: int | None = None,
+    max_delta: float | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    """Return a cached or non-network rerank result when no live HTTP call is needed."""
+    if (
+        rerank_with_llm_sync is not _DEFAULT_RERANK_SYNC_FN
+        or _build_rerank_prompt_data is not _DEFAULT_PROMPT_DATA_FN
+    ):
+        return None
+    safe_candidates = [dict(c) for c in candidates]
+    try:
+        resolved_mode, raw_url, key, chosen_model = _resolve_rerank_runtime(
+            mode=mode, api_url=api_url, api_key=api_key, model=model
+        )
+    except ValueError:
+        return safe_candidates, {"applied": False, "reason": "not_configured"}
+
+    k = top_k if top_k is not None else settings.llm_rerank_top_k
+    delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta
+    requires_key = resolved_mode == "cloud"
+    if (
+        (requires_key and not key)
+        or not raw_url
+        or not chosen_model
+        or len(safe_candidates) < 2
+    ):
+        return safe_candidates, {"applied": False, "reason": "not_configured"}
+
+    try:
+        cache_url = validate_llm_api_url(
+            raw_url,
+            mode=resolved_mode,
+            endpoint="chat",
+            has_api_key=(requires_key or bool(key)),
+            resolve_dns=False,
+        )
+        messages, _payload, evidence_count = _build_rerank_prompt_data(
+            reads,
+            safe_candidates,
+            interaction_events=interaction_events,
+            top_k=k,
+            max_delta=delta,
+        )
+    except Exception:
+        return None
+
+    if evidence_count == 0:
+        return safe_candidates, {
+            "applied": False,
+            "adjusted_count": 0,
+            "reason": "insufficient_evidence",
+        }
+
+    scope = _profile_cache_scope(profile_id)
+    cache_key = _build_cache_key(
+        profile_scope=scope,
+        url=cache_url,
+        model=chosen_model,
+        top_k=k,
+        max_delta=delta,
+        messages=messages,
+        candidates=safe_candidates,
+        reads=reads,
+        interaction_events=interaction_events,
+        mode=resolved_mode,
+        key_fingerprint=_derive_api_key_fingerprint(key),
+    )
+    cached_hit = _cache_get(scope, cache_key)
+    if cached_hit is None:
+        return None
+    kind, payload_items = cached_hit
+    return _apply_parsed_payload(
+        safe_candidates,
+        kind,
+        payload_items,
+        top_k=k,
+        max_delta=delta,
+        cached=True,
+    )
+
+
 def rerank_with_llm_sync(
     reads: Sequence[dict[str, Any]],
     candidates: Sequence[dict[str, Any]],
@@ -1733,8 +2202,10 @@ def rerank_with_llm_sync(
     top_k: int | None = None,
     max_delta: float | None = None,
     timeout_seconds: float | None = None,
+    allowed_hosts: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Call the configured Ollama, OpenAI-compatible, or cloud LLM endpoint synchronously and rerank top-K candidates."""
+    _set_last_rerank_error("")
     safe_candidates = [dict(c) for c in candidates]
     try:
         resolved_mode, raw_url, key, chosen_model = _resolve_rerank_runtime(
@@ -1750,8 +2221,22 @@ def rerank_with_llm_sync(
         timeout = _bounded_timeout(timeout_seconds)
 
         requires_key = resolved_mode == "cloud"
-        if (requires_key and not key) or not raw_url or not chosen_model or len(safe_candidates) < 2:
+        if (
+            (requires_key and not key)
+            or not raw_url
+            or not chosen_model
+            or len(safe_candidates) < 2
+        ):
             return safe_candidates, {"applied": False, "reason": "not_configured"}
+
+        cache_url = validate_llm_api_url(
+            raw_url,
+            allowed_hosts=allowed_hosts,
+            mode=resolved_mode,
+            endpoint="chat",
+            has_api_key=(requires_key or bool(key)),
+            resolve_dns=False,
+        )
 
         messages, _payload, evidence_count = _build_rerank_prompt_data(
             reads,
@@ -1767,11 +2252,6 @@ def rerank_with_llm_sync(
                 "reason": "insufficient_evidence",
             }
 
-        cache_url = (
-            f"{_normalize_ollama_base_url(raw_url)}/api/chat"
-            if resolved_mode == "ollama"
-            else _normalize_chat_url(raw_url)
-        )
         scope = _profile_cache_scope(profile_id)
         cache_key = _build_cache_key(
             profile_scope=scope,
@@ -1784,6 +2264,7 @@ def rerank_with_llm_sync(
             reads=reads,
             interaction_events=interaction_events,
             mode=resolved_mode,
+            key_fingerprint=_derive_api_key_fingerprint(key),
         )
         cached_hit = _cache_get(scope, cache_key)
         if cached_hit is not None:
@@ -1797,6 +2278,14 @@ def rerank_with_llm_sync(
                 cached=True,
             )
 
+        validate_llm_api_url(
+            raw_url,
+            allowed_hosts=allowed_hosts,
+            mode=resolved_mode,
+            endpoint="chat",
+            has_api_key=(requires_key or bool(key)),
+            resolve_dns=True,
+        )
         content = _request_llm_completion_sync(
             mode=resolved_mode,
             api_url=raw_url,
@@ -1804,6 +2293,7 @@ def rerank_with_llm_sync(
             model=chosen_model,
             messages=messages,
             timeout=timeout,
+            allowed_hosts=allowed_hosts,
         )
         parsed = extract_llm_json(content)
         kind, payload_items = _extract_response_payload(parsed)
@@ -1819,8 +2309,16 @@ def rerank_with_llm_sync(
             _cache_put(scope, cache_key, kind, payload_items)
         return reranked, diag
     except Exception as exc:
+        err = sanitize_llm_error(exc, api_key=key)
+        _set_last_rerank_error(err)
         LOGGER.warning(
             "LLM reranker failed; falling back to base order: %s",
-            safe_error_message(exc),
+            err,
         )
-        return [dict(c) for c in safe_candidates], {"applied": False, "reason": "fallback"}
+        return [dict(c) for c in safe_candidates], {
+            "applied": False,
+            "reason": "fallback",
+        }
+
+
+_DEFAULT_RERANK_SYNC_FN = rerank_with_llm_sync
