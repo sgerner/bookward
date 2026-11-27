@@ -40,8 +40,12 @@ Only explicit Pass actions create a negative feedback label. Maybe later is a
 separate persisted state, remains available from Past decisions, and never
 trains as a rejection. Recent shortlist, Pass, and Maybe later actions can be
 undone; the engine accepts an undo only while that decision is still the latest
-one for the book. Only reads already attributed to a recommendation impression
-are used. Merely being shown a book or opening its details is never interpreted
+one for the book. Only reads already attributed to a discovery recommendation impression are used
+(`run_metadata.is_discovery_run_metadata`: `status` in `""`, `"recommended"`, or
+`"all"`, or legacy `NULL`/empty/`{}` metadata; non-discovery runs and legacy
+runs with malformed/non-JSON `metadata` are excluded from attribution and
+evaluation filtering, and events carrying an explicit `run_id` never fall back
+to a different run's impression). Merely being shown a book or opening its details is never interpreted
 as dislike. The latest decision or read replaces older actions for a canonical
 title-author identity, so a Maybe later decision clears an earlier save or pass
 and repeated clicks or duplicate imports do not count as independent books. At

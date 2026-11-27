@@ -97,11 +97,28 @@
     shouldShowLibrarrEmptyBanner,
   } from "#lib/librarr-stream.js";
   import {
+    buildBaseBooks,
+    commitLocalBookStatus,
+    createOptimisticBookStatus,
+    createOptimisticImport,
+    createPendingSubmit,
+    extractActionBookId,
+    extractActionBookStatus,
+    extractActionReadId,
+    extractActionRestoredItems,
+    mergeDiscoverPaginationSlice,
+    mergeReconciledBooks,
+    reconcileOverviewBooksReload,
+    resolveLibrarrDownloadReconciliation,
+    type OptimisticChange,
+    type OptimisticFactory,
+    type PendingOptions,
+  } from "#lib/discover-reconciliation.js";
+  import {
     applyReadingHistoryScores,
     createUrlNavigationController,
     READING_HISTORY_SCORE_BATCH_SIZE,
     readUrlViewState,
-    reconcileBookMutation,
     reconcilePagedBooks,
     runReadingHistoryScoreBatches,
     sortReadingHistory,
@@ -125,6 +142,7 @@
     error?: boolean;
     token?: string;
     id?: number;
+    status?: string;
     undo_id?: number;
     undo_decisions?: Array<{ id: number; decision_id: number }>;
     undo_label?: string;
@@ -165,11 +183,6 @@
     metadata_confidence: number | null;
   };
   type LibrarrResult = Record<string, unknown>;
-  type OptimisticChange = {
-    commit?: () => void;
-    rollback?: () => void;
-  };
-  type OptimisticFactory = (formData: FormData) => OptimisticChange | void;
 
   let { data, form } = $props();
   type PageBook = (typeof data.books)[number];
@@ -205,12 +218,28 @@
   const DECISION_PAGE_SIZE = 24;
   const FILTER_DEBOUNCE_MS = 180;
   let discoverVisibleCount = $state(DISCOVER_PAGE_SIZE);
-  let additionalDiscoverBooks = $state<PageBook[]>([]);
-  let unfilteredDiscoverOffset = $state(
-    untrack(() => data.books.filter((book) => book.status === "recommended").length),
+  let activeRunIdOverride = $state<string | null>(null);
+  const activeRunId = $derived(
+    activeRunIdOverride ?? (data.recommendation_run_id ?? ""),
   );
-  let unfilteredDiscoverHasMore = $state(
-    untrack(() => Boolean(data.recommendations_has_more)),
+  let discoverSessionInitializedOverride = $state(
+    untrack(() => Boolean(data.recommendation_run_id)),
+  );
+  const discoverSessionInitialized = $derived(
+    discoverSessionInitializedOverride || Boolean(data.recommendation_run_id),
+  );
+  let discoverSessionStarting = false;
+  let clientDiscoverBooks = $state<PageBook[] | null>(null);
+  let discoverLoadedCountOverride = $state<number | null>(null);
+  const discoverLoadedCount = $derived(
+    discoverLoadedCountOverride ??
+      data.books.filter((book) => book.status === "recommended").length,
+  );
+  let additionalDiscoverBooks = $state<PageBook[]>([]);
+  let discoverHasMoreOverride = $state<boolean | null>(null);
+  const unfilteredDiscoverOffset = $derived(discoverLoadedCount);
+  const unfilteredDiscoverHasMore = $derived(
+    discoverHasMoreOverride ?? Boolean(data.recommendations_has_more),
   );
   let filteredDiscoverBooks = $state<PageBook[]>([]);
   let filteredDiscoverOffset = $state(0);
@@ -257,6 +286,7 @@
   // Keep identity sentinels outside `$state` to avoid proxying server arrays
   // and retriggering synchronization effects unnecessarily.
   let previousDataBooks: PageBook[] | null = untrack(() => data.books);
+  let previousDataRunId = untrack(() => data.recommendation_run_id ?? "");
   let previousDataRecommendationsHasMore: boolean | null = untrack(() =>
     Boolean(data.recommendations_has_more),
   );
@@ -270,15 +300,6 @@
   );
   let previousDiscoverSearch = "";
   let previousDiscoverGenre = "";
-  const undoBookSnapshots = new Map<
-    number,
-    {
-      book: PageBook;
-      previousStatus: string;
-      discoverIndex: number;
-      decisionIndex: number;
-    }
-  >();
   let pendingActions = $state(new Set<string>());
   let sourceFilter = $state<SourceFilter>("all");
   let librarrSearchOpen = $state(false);
@@ -362,6 +383,12 @@
   let llmModelOverride = $state<string | null>(null);
   let revokedApiTokenIds = $state(new Set<number>());
   let bookStatusOverrides = $state<Record<number, string>>({});
+  let committedBookStatuses = $state<Record<number, string>>({});
+  let sessionBooksById = $state<Record<number, PageBook>>({});
+  let localReadBookIds = $state(new Set<number>());
+  let localRecentReads = $state<
+    Array<{ id: number; title: string; author: string; rating: number | null }>
+  >([]);
   let profileHeaders = $derived({ "x-bookward-profile": data.user?.profile_id ?? "" });
   const telemetry = createTelemetryClient();
   $effect(() => telemetry.setProfileId(data.user?.profile_id));
@@ -439,7 +466,7 @@
     );
   }
   function withStatusOverride(book: PageBook): PageBook {
-    const status = bookStatusOverrides[book.id];
+    const status = bookStatusOverrides[book.id] ?? committedBookStatuses[book.id];
     return status === undefined ? book : { ...book, status };
   }
   function sourceEnabled(source: { id: number; enabled: number }) {
@@ -476,27 +503,40 @@
   const digestRequested = $derived(
     digestVisible && data.digestReview.requested,
   );
-  const allBooks = $derived.by(() => {
-    const byId = new Map<number, PageBook>();
-    for (const book of [
-      ...data.books,
-      ...(data.digestReview.books ?? []),
-      ...data.decisions,
-      ...additionalDiscoverBooks,
-      ...filteredDiscoverBooks,
-      ...additionalDecisionBooks,
-      ...queriedDecisionBooks,
-    ]) {
-      if (!byId.has(book.id)) {
-        byId.set(book.id, withStatusOverride(book));
-      }
-    }
-    return [...byId.values()];
-  });
+  const baseBooks = $derived.by(() =>
+    buildBaseBooks(data.books, clientDiscoverBooks),
+  );
+  const allBooks = $derived.by(() =>
+    mergeReconciledBooks({
+      baseBooks: [
+        ...baseBooks,
+        ...(data.digestReview.books ?? []),
+        ...filteredDiscoverBooks,
+      ],
+      additionalDiscoverBooks,
+      decisions: data.decisions,
+      additionalDecisionBooks: [
+        ...additionalDecisionBooks,
+        ...queriedDecisionBooks,
+      ],
+      sessionBooksById,
+      committedBookStatuses,
+      bookStatusOverrides,
+    }),
+  );
+  const effectiveReadCount = $derived(data.readCount + localReadBookIds.size);
   const activeDigestReviewBooks = $derived.by(() => {
     if (Array.isArray(data.digestReview.books)) {
+      const clientById = clientDiscoverBooks
+        ? new Map(clientDiscoverBooks.map((book) => [book.id, book]))
+        : null;
       return data.digestReview.books
-        .map(withStatusOverride)
+        .map((book) => {
+          const freshRunId = clientById?.get(book.id)?.recommendation_run_id;
+          return withStatusOverride(
+            freshRunId ? { ...book, recommendation_run_id: freshRunId } : book,
+          );
+        })
         .filter((book) => book.status === "recommended");
     }
     return allBooks.filter(
@@ -506,7 +546,7 @@
   const unfilteredDiscoverBooks = $derived.by(() => {
     const seen = new Set<number>();
     const items: PageBook[] = [];
-    for (const raw of [...data.books, ...additionalDiscoverBooks]) {
+    for (const raw of [...baseBooks, ...additionalDiscoverBooks]) {
       if (seen.has(raw.id)) continue;
       seen.add(raw.id);
       const book = withStatusOverride(raw);
@@ -613,7 +653,8 @@
       const queriedIdSet = new Set(queriedDecisionBooks.map((book) => book.id));
       const optimisticMatches = allBooks.filter(
         (book) =>
-          bookStatusOverrides[book.id] !== undefined &&
+          (bookStatusOverrides[book.id] !== undefined ||
+            committedBookStatuses[book.id] !== undefined) &&
           !queriedIdSet.has(book.id) &&
           matchesDecisionTab(book),
       );
@@ -666,9 +707,25 @@
   const synchronizedReadingHistory = $derived(
     applyRatingOverrides(readingHistory, historyRatingOverrides),
   );
-  const recentReads = $derived(
-    applyRatingOverrides(data.history, historyRatingOverrides),
-  );
+  const recentReads = $derived.by(() => {
+    const localKeys = new Set(
+      localRecentReads.map(
+        (item) => `${item.title.toLowerCase()}\u0000${item.author.toLowerCase()}`,
+      ),
+    );
+    const localIds = new Set(localRecentReads.map((item) => item.id));
+    const merged = [
+      ...localRecentReads,
+      ...data.history.filter(
+        (item) =>
+          !localIds.has(item.id) &&
+          !localKeys.has(
+            `${item.title.toLowerCase()}\u0000${item.author.toLowerCase()}`,
+          ),
+      ),
+    ].slice(0, 12);
+    return applyRatingOverrides(merged, historyRatingOverrides);
+  });
   const filteredReadingHistory = $derived.by(() => {
     const query = decisionsSearch.trim().toLowerCase();
     const matchesRating = (item: ReadingHistoryItem) => {
@@ -1023,10 +1080,8 @@
     decisionQueryAbortController?.abort();
     decisionQueryAbortController = null;
     additionalDiscoverBooks = [];
-    unfilteredDiscoverOffset = data.books.filter(
-      (book) => book.status === "recommended",
-    ).length;
-    unfilteredDiscoverHasMore = Boolean(data.recommendations_has_more);
+    discoverLoadedCountOverride = null;
+    discoverHasMoreOverride = null;
     filteredDiscoverBooks = [];
     filteredDiscoverOffset = 0;
     filteredDiscoverHasMore = false;
@@ -1045,7 +1100,6 @@
     decisionsHasMoreOverride = null;
     decisionsLoading = false;
     decisionsLoadError = "";
-    undoBookSnapshots.clear();
   }
   function resetReadingHistory() {
     readingHistoryGeneration += 1;
@@ -1222,6 +1276,11 @@
       readingHistory = readingHistory.map((entry) =>
         entry.id === id ? { ...entry, rating } : entry,
       );
+      if (localRecentReads.some((entry) => entry.id === id)) {
+        localRecentReads = localRecentReads.map((entry) =>
+          entry.id === id ? { ...entry, rating } : entry,
+        );
+      }
     },
     onCommittedSuccess: ({ title, rating }) => {
       announceActionSuccess(formatRatingConfirmation(title, rating));
@@ -1391,51 +1450,6 @@
     pendingActions = next;
   }
 
-  function submitUndoDecision(key: string): SubmitFunction {
-    return ({ formData }) => {
-      withPending(key, true);
-      let change: OptimisticChange | void;
-      try {
-        change = optimisticUndoDecision(formData);
-      } catch {
-        change = undefined;
-      }
-      return async ({ update, result }) => {
-        const succeeded = result.type === "success" || result.type === "redirect";
-        const rollback = () => {
-          try {
-            change?.rollback?.();
-          } catch {
-            // A rollback must never obscure the action result.
-          }
-        };
-        try {
-          if (!succeeded) {
-            rollback();
-          }
-          if (result.type === "error") {
-            announceActionError(actionResultMessage(result));
-            return;
-          }
-          if (succeeded) {
-            notifications.clearUndoKey(key);
-          }
-          await update({ navigate: false });
-          if (succeeded) change?.commit?.();
-        } catch (error) {
-          rollback();
-          announceActionError(
-            error instanceof Error
-              ? error.message
-              : "The request could not be completed. Your change was reverted.",
-          );
-        } finally {
-          withPending(key, false);
-        }
-      };
-    };
-  }
-
   function submitMarkRead(bookId: number): SubmitFunction {
     return createMarkReadSubmit({
       bookId,
@@ -1448,6 +1462,8 @@
         resetReadingHistory();
         notifications.clearUndoForBook(bookId);
       },
+      localOnly: true,
+      flushTelemetry: () => telemetry.flush(),
     });
   }
 
@@ -1462,79 +1478,49 @@
   function setPending(
     key: string,
     optimistic?: OptimisticFactory,
+    options?: PendingOptions,
   ): SubmitFunction {
-    return ({ formData, submitter }) => {
-      if (submitter instanceof HTMLButtonElement && submitter.name && !formData.has(submitter.name)) {
-        formData.set(submitter.name, submitter.value);
-      }
-      withPending(key, true);
-      let change: OptimisticChange | void;
-      try {
-        change = optimistic?.(formData);
-      } catch {
-        change = undefined;
-      }
-      return async ({ update, result }) => {
-        const succeeded = result.type === "success" || result.type === "redirect";
-        const rollback = () => {
-          try {
-            change?.rollback?.();
-          } catch {
-            // A rollback must never obscure the action result.
-          }
-        };
-        try {
-          if (!succeeded) {
-            rollback();
-          }
-          if (result.type === "error") {
-            announceActionError(actionResultMessage(result));
-            return;
-          }
-          await update({ navigate: false });
-          if (succeeded && key === "sync") {
-            resetClientPagination();
-          }
-          if (
-            succeeded &&
-            (key.startsWith("read-") ||
-              key.startsWith("shortlist-read-") ||
-              key === "goodreads-rss" ||
-              key === "csv-import" ||
-              key === "goodreads-csv")
-          ) {
-            resetReadingHistory();
-          }
-          if (succeeded) change?.commit?.();
-          if (
-            succeeded &&
-            (key === "sync" ||
-              key === "rebuild-embeddings" ||
-              key === "goodreads-rss" ||
-              key === "goodreads-csv" ||
-              key === "source" ||
-              key.startsWith("source-") ||
-              key.startsWith("refresh-source-"))
-          ) {
-            if (hasActiveDiscoverFilter) reloadFilteredDiscover();
-            if (isQueriedDecisionMode) reloadQueriedDecisions();
-          }
-        } catch (error) {
-          rollback();
-          announceActionError(
-            error instanceof Error
-              ? error.message
-              : "The request could not be completed. Your change was reverted.",
-          );
-        } finally {
-          withPending(key, false);
+    return createPendingSubmit({
+      key,
+      optimistic,
+      options,
+      setPendingState: withPending,
+      flushTelemetry: () => telemetry.flush(),
+      clearOptimisticNotification: () => {},
+      announceActionError,
+      onResetReadingHistory: resetReadingHistory,
+      onResetClientPagination: resetClientPagination,
+      onReloadFilteredLists: () => {
+        if (hasActiveDiscoverFilter) reloadFilteredDiscover();
+        if (isQueriedDecisionMode) reloadQueriedDecisions();
+      },
+      onRefreshDiscoverRun: async () => {
+        if (activeView === "discover") {
+          await startOrRefreshDiscoverRun(true);
+        } else {
+          activeRunIdOverride = null;
+          discoverSessionInitializedOverride = false;
+          clientDiscoverBooks = null;
+          additionalDiscoverBooks = [];
+          sessionBooksById = {};
+          discoverLoadedCountOverride = null;
+          discoverHasMoreOverride = null;
+          bookStatusOverrides = {};
+          committedBookStatuses = {};
         }
-      };
-    };
+      },
+    });
+  }
+
+  function setPendingLocal(
+    key: string,
+    optimistic?: OptimisticFactory,
+  ): SubmitFunction {
+    return setPending(key, optimistic, { localOnly: true });
   }
 
   function setPendingDigestBulk(): SubmitFunction {
-    return setPending("shortlist-bulk", optimisticShortlistBulk);
+    return setPendingLocal("shortlist-bulk", optimisticShortlistBulk);
   }
 
   function isPending(key: string) {
@@ -1619,7 +1605,10 @@
     status: string,
     fallbackBook?: PageBook,
   ) {
-    const knownBook = allBooks.find((item) => item.id === id) ?? fallbackBook;
+    const knownBook =
+      allBooks.find((item) => item.id === id) ??
+      sessionBooksById[id] ??
+      fallbackBook;
     const prevFilteredDiscover = filteredDiscoverBooks.find((item) => item.id === id);
     if (
       prevFilteredDiscover &&
@@ -1665,142 +1654,83 @@
     }
   }
 
+  function recordCommittedBookStatus(id: number, status: string) {
+    const existingBook = allBooks.find((item) => item.id === id) ?? sessionBooksById[id];
+    const next = commitLocalBookStatus(
+      { committedBookStatuses, sessionBooksById },
+      existingBook,
+      id,
+      status,
+    );
+    committedBookStatuses = next.committedBookStatuses;
+    sessionBooksById = next.sessionBooksById;
+    applyCommittedStatusToClientSlices(id, status, existingBook);
+  }
+
   function optimisticBookStatus(
     id: number,
     status: string,
-    recordUndo = false,
+    keepCommitted = false,
   ): OptimisticChange | void {
-    const discoverIndex = additionalDiscoverBooks.findIndex((item) => item.id === id);
-    const decisionIndex = additionalDecisionBooks.findIndex((item) => item.id === id);
-    const book = allBooks.find((item) => item.id === id);
-    if (!book) return;
-    if (recordUndo && ["saved", "rejected", "maybe_later"].includes(status)) {
-      undoBookSnapshots.set(id, {
-        book: { ...book },
-        previousStatus: book.status,
-        discoverIndex,
-        decisionIndex,
-      });
-    } else if (status === "recommended" || status === "read") {
-      undoBookSnapshots.delete(id);
+    return createOptimisticBookStatus(
+      {
+        hasBook: (bookId) => allBooks.some((item) => item.id === bookId),
+        getOverrides: () => bookStatusOverrides,
+        setOverrides: (next) => {
+          bookStatusOverrides = next;
+        },
+      },
+      id,
+      status,
+      keepCommitted,
+    );
+  }
+
+  function optimisticDecision(formData: FormData): OptimisticChange | void {
+    const id = Number(formData.get("id"));
+    const status = String(formData.get("status") ?? "");
+    if (
+      !Number.isInteger(id) ||
+      !["saved", "rejected", "maybe_later", "recommended"].includes(status)
+    ) {
+      return undefined;
     }
-    const snapshot = { ...book };
-    const previous = bookStatusOverrides[id];
-    bookStatusOverrides = { ...bookStatusOverrides, [id]: status };
+    const targetBook = allBooks.find((item) => item.id === id);
+    if (targetBook) {
+      sessionBooksById = { ...sessionBooksById, [id]: targetBook };
+    }
+    const change = optimisticBookStatus(id, status);
     return {
-      commit: () => {
-        const reconciled = reconcileBookMutation({
-          serverBooks: data.books,
-          serverDecisions: data.decisions,
-          additionalDiscoverBooks,
-          additionalDecisionBooks,
-          id,
-          nextStatus: status,
-          snapshot,
-        });
-        additionalDiscoverBooks = reconciled.additionalDiscoverBooks;
-        additionalDecisionBooks = reconciled.additionalDecisionBooks;
-        unfilteredDiscoverOffset =
-          data.books.filter((item) => item.status === "recommended").length +
-          reconciled.additionalDiscoverBooks.length;
-        unfilteredDecisionOffset =
-          data.decisions.length + reconciled.additionalDecisionBooks.length;
-        if (bookStatusOverrides[id] !== status) return;
-        applyCommittedStatusToClientSlices(id, status, snapshot);
-        const next = { ...bookStatusOverrides };
-        delete next[id];
-        bookStatusOverrides = next;
+      commit: (result) => {
+        change?.commit?.(result);
+        const committedId = extractActionBookId(result, id);
+        const committedStatus = extractActionBookStatus(result) ?? status;
+        recordCommittedBookStatus(committedId, committedStatus);
+        if (committedStatus === "recommended") {
+          notifications.clearUndoForBook(committedId);
+        }
       },
-      rollback: () => {
-        if (recordUndo) undoBookSnapshots.delete(id);
-        if (bookStatusOverrides[id] !== status) return;
-        const next = { ...bookStatusOverrides };
-        if (previous === undefined) delete next[id];
-        else next[id] = previous;
-        bookStatusOverrides = next;
-      },
+      rollback: () => change?.rollback?.(),
     };
   }
 
-  function optimisticDecision(formData: FormData) {
-    const id = Number(formData.get("id"));
-    const status = String(formData.get("status") ?? "");
-    return Number.isInteger(id) && ["saved", "rejected", "maybe_later", "recommended"].includes(status)
-      ? optimisticBookStatus(id, status, true)
-      : undefined;
-  }
-
-  function optimisticUndoDecision(formData: FormData): OptimisticChange | void {
-    const ids = [
-      ...new Set(
-        formData
-          .getAll("id")
-          .map((value) => Number(value))
-          .filter((id) => Number.isInteger(id)),
-      ),
-    ];
-    if (!ids.length) return;
-    const entries = ids.map((id) => {
-      const undoSnapshot = undoBookSnapshots.get(id);
-      const restoredStatus = undoSnapshot?.previousStatus ?? "recommended";
-      const fallbackBook = allBooks.find((item) => item.id === id);
-      const snapshot =
-        undoSnapshot?.book ?? (fallbackBook ? { ...fallbackBook } : undefined);
-      const previousOverride = bookStatusOverrides[id];
-      return { id, undoSnapshot, restoredStatus, snapshot, previousOverride };
-    });
-    const nextOverrides = { ...bookStatusOverrides };
-    for (const entry of entries) {
-      nextOverrides[entry.id] = entry.restoredStatus;
-    }
-    bookStatusOverrides = nextOverrides;
+  function optimisticUndo(
+    formData: FormData,
+    undoKey?: string,
+  ): OptimisticChange | void {
+    const ids = formData
+      .getAll("id")
+      .map((value) => Number(value))
+      .filter((id) => Number.isInteger(id) && id > 0);
+    if (!ids.length) return undefined;
     return {
-      commit: () => {
-        let nextDiscover = additionalDiscoverBooks;
-        let nextDecisions = additionalDecisionBooks;
-        for (const entry of entries) {
-          const reconciled = reconcileBookMutation({
-            serverBooks: data.books,
-            serverDecisions: data.decisions,
-            additionalDiscoverBooks: nextDiscover,
-            additionalDecisionBooks: nextDecisions,
-            id: entry.id,
-            nextStatus: entry.restoredStatus,
-            snapshot: entry.snapshot,
-            restoreDiscoverIndex: entry.undoSnapshot?.discoverIndex,
-            restoreDecisionIndex: entry.undoSnapshot?.decisionIndex,
-          });
-          nextDiscover = reconciled.additionalDiscoverBooks;
-          nextDecisions = reconciled.additionalDecisionBooks;
-          undoBookSnapshots.delete(entry.id);
-          applyCommittedStatusToClientSlices(
-            entry.id,
-            entry.restoredStatus,
-            entry.snapshot,
-          );
+      commit: (result) => {
+        if (undoKey) {
+          notifications.clearUndoKey(undoKey);
         }
-        additionalDiscoverBooks = nextDiscover;
-        additionalDecisionBooks = nextDecisions;
-        unfilteredDiscoverOffset =
-          data.books.filter((item) => item.status === "recommended").length +
-          nextDiscover.length;
-        unfilteredDecisionOffset = data.decisions.length + nextDecisions.length;
-        const cleaned = { ...bookStatusOverrides };
-        for (const entry of entries) {
-          if (cleaned[entry.id] === entry.restoredStatus) {
-            delete cleaned[entry.id];
-          }
+        for (const item of extractActionRestoredItems(result, ids)) {
+          recordCommittedBookStatus(item.id, item.status);
         }
-        bookStatusOverrides = cleaned;
-      },
-      rollback: () => {
-        const reverted = { ...bookStatusOverrides };
-        for (const entry of entries) {
-          if (reverted[entry.id] !== entry.restoredStatus) continue;
-          if (entry.previousOverride === undefined) delete reverted[entry.id];
-          else reverted[entry.id] = entry.previousOverride;
-        }
-        bookStatusOverrides = reverted;
       },
     };
   }
@@ -1810,11 +1740,48 @@
     return Number.isInteger(id) ? optimisticBookStatus(id, "read") : undefined;
   }
 
-  function optimisticShortlistRead(formData: FormData) {
+  function optimisticShortlistRead(formData: FormData): OptimisticChange | void {
+    const id = Number(formData.get("id"));
+    const rawRating = String(formData.get("rating") ?? "").trim();
+    const rating = rawRating ? Number(rawRating) : null;
+    const targetBook = allBooks.find((item) => item.id === id) ?? markReadBook;
     const change = optimisticRead(formData);
     return {
-      commit: () => {
-        change?.commit?.();
+      commit: (result) => {
+        change?.commit?.(result);
+        if (Number.isInteger(id) && id > 0) {
+          recordCommittedBookStatus(
+            extractActionBookId(result, id),
+            extractActionBookStatus(result) ?? "read",
+          );
+        }
+        if (Number.isInteger(id) && targetBook) {
+          const alreadyInHistory = data.history.some(
+            (item) =>
+              item.title.toLowerCase() === targetBook.title.toLowerCase() &&
+              item.author.toLowerCase() === targetBook.author.toLowerCase(),
+          );
+          if (!alreadyInHistory && !localReadBookIds.has(id)) {
+            localReadBookIds = new Set([...localReadBookIds, id]);
+          }
+          const readId = extractActionReadId(result) ?? -Date.now() - id;
+          localRecentReads = [
+            {
+              id: readId,
+              title: targetBook.title,
+              author: targetBook.author,
+              rating: rating && Number.isFinite(rating) ? rating : null,
+            },
+            ...localRecentReads.filter(
+              (item) =>
+                item.id !== readId &&
+                !(
+                  item.title.toLowerCase() === targetBook.title.toLowerCase() &&
+                  item.author.toLowerCase() === targetBook.author.toLowerCase()
+                ),
+            ),
+          ];
+        }
         closeMarkRead();
       },
       rollback: () => change?.rollback?.(),
@@ -1894,22 +1861,22 @@
     }
   }
 
-  function optimisticImport(formData: FormData) {
-    const id = Number(formData.get("id"));
-    return Number.isInteger(id) ? optimisticBookStatus(id, "imported") : undefined;
+  function optimisticImport(formData: FormData): OptimisticChange | void {
+    return createOptimisticImport(formData, recordCommittedBookStatus);
   }
 
-  function optimisticShortlistBulk(formData: FormData) {
+  function optimisticShortlistBulk(formData: FormData): OptimisticChange | void {
     const ids = [...new Set(
       formData
         .getAll("ids")
         .map((value) => Number(value))
         .filter((id) => Number.isInteger(id)),
     )];
-    const changes = ids.map((id) => optimisticBookStatus(id, "saved", true)).filter(Boolean) as OptimisticChange[];
+    const changes = ids.map((id) => optimisticBookStatus(id, "saved")).filter(Boolean) as OptimisticChange[];
     return {
-      commit: () => {
-        changes.forEach((change) => change.commit?.());
+      commit: (result) => {
+        changes.forEach((change) => change.commit?.(result));
+        ids.forEach((id) => recordCommittedBookStatus(id, "saved"));
         clearDigestSelection();
       },
       rollback: () => changes.forEach((change) => change.rollback?.()),
@@ -2153,6 +2120,53 @@
     return Math.min(100, Math.round((used / quota) * 100));
   }
 
+  async function startOrRefreshDiscoverRun(forceNew = false) {
+    if (discoverSessionStarting) return;
+    if (!forceNew && (activeRunId || discoverSessionInitialized)) return;
+    discoverSessionStarting = true;
+    discoverLoadError = "";
+    try {
+      const params = new URLSearchParams({
+        status: "recommended",
+        limit: "24",
+        offset: "0",
+        start_run: "1",
+      });
+      const response = await fetch(`/api/recommendations?${params.toString()}`, {
+        headers: profileHeaders,
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        items?: PageBook[];
+        has_more?: boolean;
+        recommendation_run_id?: string;
+        message?: string;
+      };
+      if (!response.ok || !Array.isArray(payload.items)) {
+        throw new Error(payload.message || "Recommendations could not be loaded.");
+      }
+      const nextRunId =
+        payload.recommendation_run_id ||
+        payload.items.find((item) => item.recommendation_run_id)?.recommendation_run_id ||
+        "";
+      clientDiscoverBooks = payload.items;
+      additionalDiscoverBooks = [];
+      discoverLoadedCountOverride = payload.items.length;
+      discoverHasMoreOverride = payload.has_more === true;
+      discoverVisibleCount = DISCOVER_PAGE_SIZE;
+      if (forceNew) {
+        bookStatusOverrides = {};
+        committedBookStatuses = {};
+      }
+      activeRunIdOverride = nextRunId || null;
+      discoverSessionInitializedOverride = true;
+    } catch (error) {
+      discoverLoadError =
+        error instanceof Error ? error.message : "Recommendations could not be loaded.";
+    } finally {
+      discoverSessionStarting = false;
+    }
+  }
+
   async function fetchInitialFilteredDiscover(
     key: string,
     searchQuery: string,
@@ -2168,6 +2182,7 @@
         status: "recommended",
         limit: String(DISCOVER_PAGE_SIZE),
         offset: "0",
+        track_run: "false",
       });
       if (searchQuery) params.set("search", searchQuery);
       if (selectedGenre) params.set("genre", selectedGenre);
@@ -2249,8 +2264,15 @@
         limit: String(DISCOVER_PAGE_SIZE),
         offset: String(offset),
       });
-      if (filteredMode && searchQuery) params.set("search", searchQuery);
-      if (filteredMode && selectedGenre) params.set("genre", selectedGenre);
+      if (filteredMode) {
+        params.set("track_run", "false");
+        if (searchQuery) params.set("search", searchQuery);
+        if (selectedGenre) params.set("genre", selectedGenre);
+      } else if (activeRunId.length >= 8) {
+        params.set("run_id", activeRunId);
+      } else {
+        params.set("start_run", "1");
+      }
       const response = await fetch(`/api/recommendations?${params.toString()}`, {
         headers: profileHeaders,
         signal: controller.signal,
@@ -2258,6 +2280,7 @@
       const payload = (await response.json().catch(() => ({}))) as {
         items?: PageBook[];
         has_more?: boolean;
+        recommendation_run_id?: string;
         message?: string;
         detail?: string;
       };
@@ -2274,19 +2297,32 @@
         ];
         filteredDiscoverOffset = offset + payload.items.length;
         filteredDiscoverHasMore = payload.has_more === true;
+        discoverVisibleCount += DISCOVER_PAGE_SIZE;
       } else {
-        const existing = new Set(
-          [...data.books, ...additionalDiscoverBooks].map((book) => book.id),
-        );
-        additionalDiscoverBooks = [
-          ...additionalDiscoverBooks,
-          ...payload.items.filter((book) => !existing.has(book.id)),
-        ];
-        unfilteredDiscoverOffset = offset + payload.items.length;
-        unfilteredDiscoverHasMore = payload.has_more === true;
+        const merged = mergeDiscoverPaginationSlice({
+          existingBooks: [...baseBooks, ...additionalDiscoverBooks],
+          additionalDiscoverBooks,
+          incomingItems: payload.items,
+          hasMore: payload.has_more === true,
+          responseRunId: payload.recommendation_run_id,
+          activeRunId,
+          discoverLoadedCount: offset,
+          discoverVisibleCount,
+          priorFilteredCount: discoverViewBooks.length,
+          pageSize: DISCOVER_PAGE_SIZE,
+        });
+        if (merged.activeRunIdOverride !== undefined) {
+          activeRunIdOverride = merged.activeRunIdOverride;
+        }
+        if (merged.discoverSessionInitializedOverride !== undefined) {
+          discoverSessionInitializedOverride = merged.discoverSessionInitializedOverride;
+        }
+        additionalDiscoverBooks = merged.additionalDiscoverBooks;
+        discoverLoadedCountOverride = merged.discoverLoadedCountOverride;
+        discoverHasMoreOverride = merged.discoverHasMoreOverride;
+        discoverVisibleCount = merged.discoverVisibleCount;
       }
       recommendationsImmediate = true;
-      discoverVisibleCount += DISCOVER_PAGE_SIZE;
     } catch (error) {
       if (controller.signal.aborted || discoverFilterAbortController !== controller) return;
       discoverLoadError =
@@ -2601,8 +2637,13 @@
     candidateId: number,
     eventType: "visible" | "detail_open" | "source_open" | "librarr_search" | "librarr_import",
     metadata: Record<string, unknown> = {},
+    explicitRunId?: string,
   ) {
-    const runId = String(allBooks.find((book) => book.id === candidateId)?.recommendation_run_id || "");
+    const runId = String(
+      explicitRunId ??
+        allBooks.find((book) => book.id === candidateId)?.recommendation_run_id ??
+        "",
+    );
     telemetry.enqueue({
       candidate_id: candidateId,
       event_type: eventType,
@@ -2613,29 +2654,65 @@
 
   function trackRecommendation(
     node: HTMLElement,
-    detail: { candidateId: number },
+    detail: { candidateId: number; runId: string; active: boolean },
   ) {
-    let sent = false;
-    const markVisible = () => {
-      if (sent) return;
-      sent = true;
-      recordBookEvent(detail.candidateId, "visible");
+    let current = detail;
+    let sentRunId = "";
+    let observer: IntersectionObserver | undefined;
+
+    const disconnect = () => {
       observer?.disconnect();
+      observer = undefined;
     };
-    const observer =
-      typeof IntersectionObserver === "undefined"
-        ? undefined
-        : new IntersectionObserver(
-            (entries) => {
-              if (entries.some((entry) => entry.isIntersecting)) markVisible();
-            },
-            { threshold: 0.25 },
-          );
-    if (observer) observer.observe(node);
-    else markVisible();
+
+    const markVisible = () => {
+      if (!current.active || current.runId.length < 8) return;
+      if (sentRunId === current.runId) return;
+      sentRunId = current.runId;
+      recordBookEvent(current.candidateId, "visible", {}, current.runId);
+      disconnect();
+    };
+
+    const observe = () => {
+      disconnect();
+      if (
+        !current.active ||
+        current.runId.length < 8 ||
+        sentRunId === current.runId
+      ) {
+        return;
+      }
+      if (typeof IntersectionObserver === "undefined") {
+        markVisible();
+        return;
+      }
+      observer = new IntersectionObserver(
+        (entries) => {
+          if (entries.some((entry) => entry.isIntersecting)) markVisible();
+        },
+        { threshold: 0.25 },
+      );
+      observer.observe(node);
+    };
+
+    observe();
+
     return {
+      update(next: { candidateId: number; runId: string; active: boolean }) {
+        const changed =
+          next.candidateId !== current.candidateId ||
+          next.runId !== current.runId ||
+          next.active !== current.active;
+        if (next.candidateId !== current.candidateId) {
+          sentRunId = "";
+        }
+        current = next;
+        if (changed) {
+          observe();
+        }
+      },
       destroy() {
-        observer?.disconnect();
+        disconnect();
       },
     };
   }
@@ -2663,6 +2740,14 @@
     const nextProfileId = data.user?.profile_id;
     if (previousProfileId === nextProfileId) return;
     previousProfileId = nextProfileId;
+    activeRunIdOverride = null;
+    discoverSessionInitializedOverride = Boolean(data.recommendation_run_id);
+    clientDiscoverBooks = null;
+    sessionBooksById = {};
+    bookStatusOverrides = {};
+    committedBookStatuses = {};
+    localReadBookIds = new Set();
+    localRecentReads = [];
     resetClientPagination();
     resetReadingHistory();
   });
@@ -2670,6 +2755,12 @@
   $effect(() => {
     const currentUrl = page.shallow?.url ?? page.url;
     syncFromUrl(currentUrl);
+  });
+
+  $effect(() => {
+    if (activeView === "discover" && !activeRunId && !discoverSessionInitialized) {
+      void startOrRefreshDiscoverRun(false);
+    }
   });
 
   $effect(() => {
@@ -2684,47 +2775,82 @@
 
   $effect(() => {
     const nextBooks = data.books;
+    const nextRunId = data.recommendation_run_id ?? "";
     const nextRecommendationsHasMore = Boolean(data.recommendations_has_more);
     const nextDecisions = data.decisions;
     const nextDecisionsHasMore = Boolean(data.decisions_has_more);
     if (
       previousDataBooks === nextBooks &&
+      previousDataRunId === nextRunId &&
       previousDataRecommendationsHasMore === nextRecommendationsHasMore &&
       previousDataDecisions === nextDecisions &&
       previousDataDecisionsHasMore === nextDecisionsHasMore
     ) {
       return;
     }
-    const prevDiscover = untrack(() => additionalDiscoverBooks);
+    const previousBooksSnapshot = previousDataBooks;
+    const priorRunId = previousDataRunId;
     const prevDecisions = untrack(() => additionalDecisionBooks);
-    const prevDiscoverHasMore = untrack(() => unfilteredDiscoverHasMore);
     const prevDecisionsOverride = untrack(() => decisionsHasMoreOverride);
     previousDataBooks = nextBooks;
+    previousDataRunId = nextRunId;
     previousDataRecommendationsHasMore = nextRecommendationsHasMore;
     previousDataDecisions = nextDecisions;
     previousDataDecisionsHasMore = nextDecisionsHasMore;
-    const reconciled = reconcilePagedBooks(
+
+    const reconciledDiscover = untrack(() =>
+      reconcileOverviewBooksReload({
+        state: {
+          activeRunIdOverride,
+          discoverSessionInitializedOverride,
+          clientDiscoverBooks,
+          additionalDiscoverBooks,
+          sessionBooksById,
+          bookStatusOverrides,
+          committedBookStatuses,
+          localReadBookIds,
+          localRecentReads,
+          discoverLoadedCountOverride,
+          discoverHasMoreOverride,
+          discoverLoadError,
+        },
+        previousBooksSnapshot,
+        priorRunId,
+        nextBooks,
+        nextDecisions,
+        nextRunId,
+      }),
+    );
+    if (reconciledDiscover) {
+      activeRunIdOverride = reconciledDiscover.activeRunIdOverride;
+      discoverSessionInitializedOverride =
+        reconciledDiscover.discoverSessionInitializedOverride;
+      clientDiscoverBooks = reconciledDiscover.clientDiscoverBooks;
+      additionalDiscoverBooks = reconciledDiscover.additionalDiscoverBooks;
+      sessionBooksById = reconciledDiscover.sessionBooksById;
+      bookStatusOverrides = reconciledDiscover.bookStatusOverrides;
+      committedBookStatuses = reconciledDiscover.committedBookStatuses;
+      localReadBookIds = reconciledDiscover.localReadBookIds;
+      localRecentReads = reconciledDiscover.localRecentReads;
+      discoverLoadedCountOverride = reconciledDiscover.discoverLoadedCountOverride;
+      discoverHasMoreOverride = reconciledDiscover.discoverHasMoreOverride;
+      discoverLoadError = reconciledDiscover.discoverLoadError;
+    }
+
+    const reconciledDecisions = reconcilePagedBooks(
       nextBooks,
       nextDecisions,
-      prevDiscover,
+      [],
       prevDecisions,
     );
-    additionalDiscoverBooks = reconciled.additionalDiscoverBooks;
-    additionalDecisionBooks = reconciled.additionalDecisionBooks;
-    unfilteredDiscoverOffset =
-      nextBooks.filter((book) => book.status === "recommended").length +
-      reconciled.additionalDiscoverBooks.length;
-    unfilteredDiscoverHasMore =
-      nextRecommendationsHasMore &&
-      (prevDiscover.length > 0 ? prevDiscoverHasMore : true);
+    additionalDecisionBooks = reconciledDecisions.additionalDecisionBooks;
     unfilteredDecisionOffset =
-      nextDecisions.length + reconciled.additionalDecisionBooks.length;
+      nextDecisions.length + reconciledDecisions.additionalDecisionBooks.length;
     decisionsHasMoreOverride = !nextDecisionsHasMore
       ? false
       : prevDecisions.length > 0 && prevDecisionsOverride === false
         ? false
         : null;
-    discoverLoadError = "";
     decisionsLoadError = "";
   });
 
@@ -2989,15 +3115,25 @@
       const payload = (await response.json().catch(() => ({}))) as {
         message?: string;
         detail?: string;
+        candidate?: { id?: number; status?: string };
       };
       if (!response.ok)
         throw new Error(payloadErrorMessage(payload, "Librarr could not add that book."));
       if (librarrSearchBook) recordBookEvent(librarrSearchBook.id, "librarr_import", { result_index: index });
+      const reconciliation = resolveLibrarrDownloadReconciliation(payload, activeView);
+      if (librarrSearchBook && reconciliation.candidateStatus) {
+        recordCommittedBookStatus(
+          librarrSearchBook.id,
+          reconciliation.candidateStatus,
+        );
+      }
       librarrSearchMessage = `${resultTitle(result)} added to Librarr.`;
       if (closeAfter) {
         announceActionSuccess(`${resultTitle(result)} added to Librarr.`);
         closeLibrarrSearch();
-        await invalidateAll();
+        if (reconciliation.shouldInvalidate) {
+          await invalidateAll();
+        }
       }
       return true;
     } catch (error) {
@@ -3029,11 +3165,11 @@
     if (failed) {
       librarrSearchMessage = added ? `${added} high-confidence match${added === 1 ? "" : "es"} added.` : "No high-confidence matches were added.";
       librarrSearchError = `${failed} match${failed === 1 ? "" : "es"} could not be added. Review the remaining results and try again.`;
-      if (added) await invalidateAll();
+      if (added && activeView !== "discover") await invalidateAll();
     } else if (added) {
       announceActionSuccess(`${added} high-confidence match${added === 1 ? "" : "es"} added to Librarr.`);
       closeLibrarrSearch();
-      await invalidateAll();
+      if (activeView !== "discover") await invalidateAll();
     }
   }
 
@@ -3100,6 +3236,7 @@
               });
               const change = optimisticBookStatus(id, "saved");
               try {
+                await telemetry.flush();
                 const response = await fetch("?/decide", {
                   method: "POST",
                   headers: {
@@ -3109,13 +3246,48 @@
                   },
                   body,
                 });
+                const rawText = await response.text();
                 if (!response.ok) {
-                  const payload = await response.json().catch(() => ({}));
-                  throw new Error(payloadErrorMessage(payload, "Could not shortlist that book."));
+                  let parsedPayload: unknown = {};
+                  try {
+                    parsedPayload = JSON.parse(rawText);
+                  } catch {
+                    parsedPayload = {};
+                  }
+                  const maybeAction = (() => {
+                    try {
+                      return deserialize(rawText);
+                    } catch {
+                      return null;
+                    }
+                  })();
+                  if (
+                    maybeAction &&
+                    (maybeAction.type === "failure" || maybeAction.type === "error")
+                  ) {
+                    throw new Error(
+                      actionResultMessage(maybeAction, "Could not shortlist that book."),
+                    );
+                  }
+                  throw new Error(
+                    payloadErrorMessage(parsedPayload, "Could not shortlist that book."),
+                  );
                 }
-                await applyAction(deserialize(await response.text()));
-                await invalidateAll();
-                change?.commit?.();
+                const actionResult = deserialize(rawText);
+                if (
+                  actionResult.type === "failure" ||
+                  actionResult.type === "error"
+                ) {
+                  throw new Error(
+                    actionResultMessage(actionResult, "Could not shortlist that book."),
+                  );
+                }
+                await applyAction(actionResult);
+                change?.commit?.(actionResult);
+                recordCommittedBookStatus(
+                  extractActionBookId(actionResult, id),
+                  extractActionBookStatus(actionResult) ?? "saved",
+                );
                 go("saved");
                 return { id, status: "saved" };
               } catch (error) {
@@ -3198,7 +3370,7 @@
         {#if activeView === "discover" || activeView === "saved" || activeView === "sources"}<form
             method="POST"
             action="?/runSync"
-            use:enhance={setPending("sync")}
+            use:enhance={setPending("sync", undefined, { refreshDiscoverRun: true })}
             in:fade={{ duration: motionDuration(180) }}
             out:fade={{ duration: motionDuration(120) }}
           >
@@ -3300,7 +3472,7 @@
                       method="POST"
                       action="?/undoDecision"
                       class="mt-3"
-                      use:enhance={submitUndoDecision(undoBanner.key)}
+                      use:enhance={setPendingLocal(undoBanner.key, (formData) => optimisticUndo(formData, undoBanner!.key))}
                     >
                       <ProfileField profileId={data.user?.profile_id} />
                       {#each undoBanner.decisions as item (`${item.id}-${item.decision_id}`)}
@@ -3479,7 +3651,7 @@
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "all" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "all"} onclick={() => selectDecisionFilter("all")}>All</button>
               <button type="button" class={`btn btn-sm btn-reflow min-h-10 ${decisionFilter === "maybe_later" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "maybe_later"} onclick={() => selectDecisionFilter("maybe_later")}>Maybe later</button>
               <button type="button" class={`btn btn-sm min-h-10 ${decisionFilter === "rejected" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "rejected"} onclick={() => selectDecisionFilter("rejected")}>Passed</button>
-              <button type="button" class={`btn btn-sm btn-reflow min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({data.readCount})</button>
+              <button type="button" class={`btn btn-sm btn-reflow min-h-10 ${decisionFilter === "read" ? "preset-filled-primary-500" : "preset-tonal-surface"}`} aria-pressed={decisionFilter === "read"} onclick={() => selectDecisionFilter("read")}>Read ({effectiveReadCount})</button>
             </div>
             {#if decisionFilter === "maybe_later" || decisionFilter === "all"}
               <p class="mt-2.5 text-xs leading-5 text-surface-700-300">
@@ -3532,7 +3704,7 @@
             {@const showSynopsisToggle = synopsisExpanded || (measuredSynopses.has(book.id) ? overflowingSynopses.has(book.id) : synopsisText.length > 140)}
             {@const formattedRank = Number(book.score).toFixed(1)}
             <article
-              use:trackRecommendation={{ candidateId: book.id }}
+              use:trackRecommendation={{ candidateId: book.id, runId: book.recommendation_run_id ?? "", active: view === "discover" }}
               in:fly={{ y: 18, duration: motionDuration(380), delay: motionDelay(index) }}
               out:fade={{ duration: motionDuration(160) }}
               animate:flip={{ duration: motionDuration(360) }}
@@ -3638,15 +3810,15 @@
                 <div class="mt-auto flex flex-wrap items-center gap-2 pt-0.5">
                   {#if book.status === "recommended"}
                     {#if librarrConnected}<button in:fly={{ y: 8, duration: motionDuration(180) }} type="button" class="btn btn-sm btn-reflow min-h-10 preset-tonal-secondary" aria-label={`Find in Librarr: ${book.title} by ${book.author}`} onclick={() => openLibrarrSearch(book)}><Search size={15} /> Find in Librarr</button>{/if}
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(1, 20) }} method="POST" action="?/decide" use:enhance={setPendingLocal(`save-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" aria-label={`Shortlist: ${book.title} by ${book.author}`} aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                     </form>
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPendingLocal(`pass-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Pass on ${book.title}`} title="Pass" aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ThumbsDown size={16} />{/if}</button>
                     </form>
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(3, 20) }} method="POST" action="?/decide" use:enhance={setPending(`later-${book.id}`, optimisticDecision)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(3, 20) }} method="POST" action="?/decide" use:enhance={setPendingLocal(`later-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="maybe_later" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-icon btn-sm min-h-10 min-w-10 preset-tonal-surface" aria-label={`Maybe later on ${book.title}`} title="Maybe later — never expires; hides from Discover and digests until you act on it in History" aria-busy={isPending(`later-${book.id}`)}>{#if isPending(`later-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Clock size={16} />{/if}</button>
                     </form>
@@ -3693,12 +3865,12 @@
                       aria-label={`Mark Read: ${book.title} by ${book.author}`}
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPendingLocal(`restore-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm min-h-10 preset-tonal-surface" aria-label={`Remove ${book.title} from your shortlist`} aria-busy={isPending(`restore-${book.id}`)}>Remove</button>
                     </form>
                   {:else if book.status === "maybe_later"}
-                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPendingLocal(`save-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" aria-label={`Shortlist: ${book.title} by ${book.author}`} disabled={isPending(`save-${book.id}`)} aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                     </form>
@@ -3709,11 +3881,11 @@
                       aria-label={`Mark Read: ${book.title} by ${book.author}`}
                       onclick={() => openMarkRead(book)}
                     ><Check size={15} /> Mark Read</button>
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPending(`pass-${book.id}`, optimisticDecision)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(2, 20) }} method="POST" action="?/decide" use:enhance={setPendingLocal(`pass-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="rejected" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-tonal-surface" aria-label={`Pass on ${book.title}`} disabled={isPending(`pass-${book.id}`)} aria-busy={isPending(`pass-${book.id}`)}>{#if isPending(`pass-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ThumbsDown size={15} />{/if} Pass</button>
                     </form>
-                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(3, 20) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180), delay: motionDelay(3, 20) }} method="POST" action="?/decide" use:enhance={setPendingLocal(`restore-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-tonal-surface" aria-label={`Return to Discover: ${book.title}`} disabled={!isBookRestorable(book) || isPending(`restore-${book.id}`)} aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
                     </form>
@@ -3726,7 +3898,7 @@
                     {/if}
                   {:else if book.status === "rejected"}
                     {#if !isBookRestorable(book)}
-                      <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`save-${book.id}`, optimisticDecision)}>
+                      <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPendingLocal(`save-${book.id}`, optimisticDecision)}>
                         <ProfileField profileId={data.user?.profile_id} />
                         <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="saved" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" aria-label={`Shortlist: ${book.title} by ${book.author}`} disabled={isPending(`save-${book.id}`)} aria-busy={isPending(`save-${book.id}`)}>{#if isPending(`save-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<Bookmark size={15} />{/if} Shortlist</button>
                       </form>
@@ -3738,7 +3910,7 @@
                         onclick={() => openMarkRead(book)}
                       ><Check size={15} /> Mark Read</button>
                     {/if}
-                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPending(`restore-${book.id}`, optimisticDecision)}>
+                    <form in:fly={{ y: 8, duration: motionDuration(180) }} method="POST" action="?/decide" use:enhance={setPendingLocal(`restore-${book.id}`, optimisticDecision)}>
                       <ProfileField profileId={data.user?.profile_id} />
                       <input type="hidden" name="id" value={book.id} /><input type="hidden" name="status" value="recommended" /><input type="hidden" name="run_id" value={book.recommendation_run_id ?? ""} /><button type="submit" class="btn btn-sm btn-reflow min-h-10 preset-filled-primary-500" aria-label={`Return to Discover: ${book.title}`} disabled={!isBookRestorable(book) || isPending(`restore-${book.id}`)} aria-busy={isPending(`restore-${book.id}`)}>{#if isPending(`restore-${book.id}`)}<RefreshCw size={15} class="animate-spin" />{:else}<ArrowRight size={15} />{/if} Return to Discover</button>
                     </form>
@@ -3768,7 +3940,7 @@
                   <p class="mt-1 max-w-sm text-sm leading-6 text-surface-700-300">{view === "saved" && shortlistTotalCount === 0 ? "Shortlist a recommendation when one catches your eye." : view === "saved" && viewHasFilter ? "Change the shortlist search or genre filter to see your saved books." : viewHasFilter ? "Change the search or genre filter to see more books." : view === "decisions" && decisionFilter === "maybe_later" ? "Books you set aside with Maybe later never expire and stay hidden from Discover and weekly digests until you return or act on them." : view === "decisions" && decisionFilter === "rejected" ? "Books you pass on will appear here." : view === "decisions" ? "Books you pass on or set aside for later will appear here." : digestRequested ? "You have already acted on the books from this digest, or open View all to browse Discover." : digestVisible ? "The next digest will appear here when a new book clears your match threshold." : "Refresh your sources or check back when your next set of books is ready."}</p>
                 </div>
                 {#if view === "saved" && shortlistTotalCount === 0}<button in:fly={{ y: 8, duration: motionDuration(220) }} type="button" class="btn btn-reflow preset-filled-primary-500" onclick={() => go("discover")}>Browse recommendations <ArrowRight size={16} /></button>{/if}
-                {#if view === "discover" && !viewHasFilter && !digestVisible && !effectiveDiscoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync")}>
+                {#if view === "discover" && !viewHasFilter && !digestVisible && !effectiveDiscoverHasMore && !discoverLoadError}<form method="POST" action="?/runSync" use:enhance={setPending("sync", undefined, { refreshDiscoverRun: true })}>
                   <ProfileField profileId={data.user?.profile_id} />
                   <button type="submit" class="btn btn-reflow preset-filled-primary-500" disabled={isPending("sync")} aria-busy={isPending("sync")}>
                     {#if isPending("sync")}<RefreshCw size={15} class="animate-spin" />{:else}<RefreshCw size={15} />{/if} Refresh recommendations
@@ -4122,7 +4294,7 @@
                         class="ml-auto shrink-0"
                         method="POST"
                         action="?/toggleDefault"
-                        use:enhance={setPending("toggle-default", () => optimisticDefaultToggle())}
+                        use:enhance={setPending("toggle-default", () => optimisticDefaultToggle(), { refreshDiscoverRun: true })}
                       >
                         <ProfileField profileId={data.user?.profile_id} />
                         <SwitchControl
@@ -4403,7 +4575,7 @@
                               <form
                                 method="POST"
                                 action="?/refreshSource"
-                                use:enhance={setPending(`refresh-source-${source.id}`)}
+                                use:enhance={setPending(`refresh-source-${source.id}`, undefined, { refreshDiscoverRun: true })}
                               >
                                 <ProfileField profileId={data.user?.profile_id} />
                                 <input type="hidden" name="id" value={source.id} />
@@ -4426,7 +4598,7 @@
                               class="shrink-0"
                               method="POST"
                               action="?/toggleSource"
-                              use:enhance={setPending(`toggle-source-${source.id}`, optimisticSourceToggle)}
+                              use:enhance={setPending(`toggle-source-${source.id}`, optimisticSourceToggle, { refreshDiscoverRun: true })}
                             >
                               <ProfileField profileId={data.user?.profile_id} />
                               <input
@@ -4518,7 +4690,7 @@
                   class="card h-fit min-w-0 preset-tonal-surface p-4 sm:p-6"
                   method="POST"
                   action="?/source"
-                  use:enhance={setPending("source")}
+                  use:enhance={setPending("source", undefined, { refreshDiscoverRun: true })}
                 >
                   <ProfileField profileId={data.user?.profile_id} />
                   <div class="flex items-center gap-3">
@@ -4763,7 +4935,7 @@
                     <h3 class="font-semibold text-surface-950-50">Restore a backup</h3>
                     <p class="mt-1 text-sm leading-6 text-surface-700-300">Restoring replaces the current database. Bookward first creates a safety backup of the current state.</p>
                     {#if data.backupStatus.backups.length}
-                      <form class="mt-4 space-y-3" method="POST" action="?/restoreBackup" use:enhance={setPending("restore-backup")}>
+                      <form class="mt-4 space-y-3" method="POST" action="?/restoreBackup" use:enhance={setPending("restore-backup", undefined, { refreshDiscoverRun: true })}>
                         <ProfileField profileId={data.user?.profile_id} />
                         <label class="block min-w-0 text-sm font-medium text-surface-800-200">Backup<select class="select mt-2 w-full" name="backupId" required>
                           {#each data.backupStatus.backups as backup (backup.id)}
@@ -4790,7 +4962,7 @@
                 class="card preset-tonal-surface p-5 sm:p-6"
                 method="POST"
                 action="?/connectGoodreads"
-                use:enhance={setPending("goodreads-rss")}
+                use:enhance={setPending("goodreads-rss", undefined, { refreshDiscoverRun: true })}
               >
                 <ProfileField profileId={data.user?.profile_id} />
                 <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
@@ -4864,7 +5036,7 @@
                 method="POST"
                 action="?/importCsv"
                 enctype="multipart/form-data"
-                use:enhance={setPending("csv-import")}
+                use:enhance={setPending("csv-import", undefined, { refreshDiscoverRun: true })}
               >
                 <ProfileField profileId={data.user?.profile_id} />
                 <div class="mb-5 flex flex-wrap items-center justify-between gap-3">
@@ -5101,7 +5273,7 @@
                   <form
                     method="POST"
                     action="?/rebuildEmbeddings"
-                    use:enhance={setPending("rebuild-embeddings")}
+                    use:enhance={setPending("rebuild-embeddings", undefined, { refreshDiscoverRun: true })}
                     class="w-full"
                   >
                     <ProfileField profileId={data.user?.profile_id} />
@@ -5878,7 +6050,7 @@
                         in:fly={{
                           y: 8,
                           duration: motionDuration(220),
-                          delay: motionDelay(item.id % 6, 20),
+                          delay: motionDelay(Math.abs(item.id) % 6, 20),
                         }}
                         out:fade={{ duration: motionDuration(100) }}
                         class="flex min-h-16 min-w-0 flex-wrap items-center gap-3 preset-tonal-surface p-3"
@@ -5897,16 +6069,18 @@
                             rating={item.rating}
                             class="shrink-0 text-xs font-semibold text-primary-600-400"
                           />{/if}
-                        <div class="min-w-0 basis-full">
-                          <StarRating
-                            value={item.rating}
-                            label={`Rating for ${item.title}`}
-                            busy={pendingRatingIds.has(item.id)}
-                            groupKey={`recent-${item.id}`}
-                            onchange={(nextRating, trigger, clearedViaButton) =>
-                              void ratingController.update(item, nextRating, "recent", trigger, clearedViaButton)}
-                          />
-                        </div>
+                        {#if item.id > 0}
+                          <div class="min-w-0 basis-full">
+                            <StarRating
+                              value={item.rating}
+                              label={`Rating for ${item.title}`}
+                              busy={pendingRatingIds.has(item.id)}
+                              groupKey={`recent-${item.id}`}
+                              onchange={(nextRating, trigger, clearedViaButton) =>
+                                void ratingController.update(item, nextRating, "recent", trigger, clearedViaButton)}
+                            />
+                          </div>
+                        {/if}
                       </div>{/each}
                   </div>{:else}<p
                     in:fade={{ duration: motionDuration(220) }}

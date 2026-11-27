@@ -1361,18 +1361,43 @@ def archive_served_exposures(
     run_id: str,
     recommendations: Iterable[Mapping[str, Any]],
     presented_at: str,
+    offset: int = 0,
+    ranks: Sequence[int] | None = None,
 ) -> int:
     """Copy actual returned slots into the cleanup-independent evidence tables."""
 
+    if isinstance(offset, bool) or int(offset) < 0:
+        raise ValueError("Exposure offset must be a non-negative integer")
     items = list(recommendations)
-    if len(items) > MAX_EXPOSURES_PER_RUN:
+    if not items:
+        return 0
+    start_rank = int(offset) + 1
+    resolved_ranks = (
+        [int(rank) for rank in ranks]
+        if ranks is not None
+        else list(range(start_rank, start_rank + len(items)))
+    )
+    if len(resolved_ranks) != len(items):
+        LOGGER.warning("Recommendation exposure ranks did not match recommendation count")
+        return 0
+    existing_rows = connection.execute(
+        "SELECT candidate_id FROM recommendation_evidence_exposures WHERE run_id=?",
+        (run_id,),
+    ).fetchall()
+    existing_ids = {int(row["candidate_id"]) for row in existing_rows}
+    pending = [
+        (rank, item)
+        for rank, item in zip(resolved_ranks, items)
+        if (_cid := _candidate_id(item)) is not None and _cid not in existing_ids
+    ]
+    if len(existing_ids) + len(pending) > MAX_EXPOSURES_PER_RUN:
         LOGGER.warning("Recommendation evidence exposure cap exceeded")
         return 0
     archived = 0
-    for rank, item in enumerate(items, 1):
+    for rank, item in pending:
         try:
             candidate_id = _candidate_id(item)
-            if candidate_id is None:
+            if candidate_id is None or candidate_id in existing_ids:
                 continue
             propensity = float(item.get("propensity", 1.0))
             score = float(item.get("score") or 0.0)
@@ -1396,7 +1421,7 @@ def archive_served_exposures(
                     run_id,
                     candidate_id,
                     identity_hash,
-                    rank,
+                    int(rank),
                     score,
                     propensity,
                     presented_at,
@@ -1404,6 +1429,7 @@ def archive_served_exposures(
                     snapshot_status,
                 ),
             )
+            existing_ids.add(candidate_id)
             archived += 1
         except Exception:
             # Serving telemetry is best-effort; the canonical impression insert

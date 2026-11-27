@@ -2,8 +2,15 @@ import type { SubmitFunction } from '$app/forms';
 import { tick } from 'svelte';
 import { actionResultMessage } from '#lib/action-result-message.js';
 
+export type ActionResultLike = {
+	type: string;
+	status?: number;
+	data?: unknown;
+	error?: unknown;
+};
+
 export type OptimisticChange = {
-	commit?: () => void;
+	commit?: (result?: ActionResultLike) => void;
 	rollback?: () => void;
 };
 
@@ -13,9 +20,11 @@ export function createMarkReadSubmit(options: {
 	setPending: (key: string, pending: boolean) => void;
 	startOptimistic: (formData: FormData) => OptimisticChange | void;
 	onSuccess: () => void;
+	localOnly?: boolean;
+	flushTelemetry?: () => Promise<void>;
 }): SubmitFunction {
 	const key = `shortlist-read-${options.bookId}`;
-	return ({ formData, submitter }) => {
+	const prepare = (formData: FormData, submitter: HTMLElement | null) => {
 		options.setError('');
 		options.setPending(key, true);
 		let change: OptimisticChange | void;
@@ -24,7 +33,7 @@ export function createMarkReadSubmit(options: {
 		} catch {
 			change = undefined;
 		}
-		return async ({ update, result }) => {
+		const handleResult: ReturnType<SubmitFunction> = async ({ update, result }) => {
 			const succeeded = result.type === 'success' || result.type === 'redirect';
 			let failed = !succeeded;
 			const rollback = () => {
@@ -40,9 +49,17 @@ export function createMarkReadSubmit(options: {
 					options.setError(actionResultMessage(result));
 					return;
 				}
-				await update({ reset: false, navigate: false });
+				if (options.localOnly) {
+					await update({ reset: false, refreshAll: false, navigate: false });
+				} else {
+					await update({ reset: false, navigate: false });
+				}
 				options.onSuccess();
-				change?.commit?.();
+				if (options.localOnly) {
+					change?.commit?.(result);
+				} else {
+					change?.commit?.();
+				}
 			} catch (error) {
 				failed = true;
 				rollback();
@@ -67,7 +84,17 @@ export function createMarkReadSubmit(options: {
 				}
 			}
 		};
+		return handleResult;
 	};
+	if (options.localOnly && options.flushTelemetry) {
+		const flush = options.flushTelemetry;
+		return async ({ formData, submitter }) => {
+			const handler = prepare(formData, submitter);
+			await flush();
+			return handler;
+		};
+	}
+	return ({ formData, submitter }) => prepare(formData, submitter);
 }
 
 export function createLogoutSubmit(options: {

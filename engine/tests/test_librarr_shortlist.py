@@ -28,10 +28,13 @@ def _configure_librarr():
 @respx.mock
 def test_search_download_marks_unread_candidates_imported_and_logs_one_learning_event(database, initial_status):
     _configure_librarr()
-    with transaction() as con:
-        con.execute("UPDATE candidates SET status=? WHERE id=1", (initial_status,))
     recommendations, run_id = tracked_recommendations(include_imported=True)
     assert 1 in {item["id"] for item in recommendations}
+    if initial_status != "recommended":
+        with transaction() as con:
+            con.execute("UPDATE candidates SET status=? WHERE id=1", (initial_status,))
+        recommendations, _ = tracked_recommendations(include_imported=True, track_run=False)
+        assert 1 in {item["id"] for item in recommendations}
     route = respx.post("http://librarr:5050/api/download").mock(
         return_value=httpx.Response(200, json={"id": "download-1"})
     )
@@ -118,9 +121,9 @@ def test_search_download_does_not_overwrite_read_status(database):
 @respx.mock
 def test_waitlist_import_records_idempotent_librarr_import_event_with_run_attribution(database):
     _configure_librarr()
+    _, run_id = tracked_recommendations(include_imported=True)
     with transaction() as con:
         con.execute("UPDATE candidates SET status='saved' WHERE id=1")
-    _, run_id = tracked_recommendations(include_imported=True)
     route = respx.post("http://librarr:5050/api/wishlist").mock(
         return_value=httpx.Response(200, json={"id": "wishlist-1"})
     )
@@ -150,9 +153,9 @@ def test_waitlist_import_records_idempotent_librarr_import_event_with_run_attrib
 
 
 def test_remove_on_imported_shortlist_card_restores_to_discover_and_undo_restores_imported(database):
+    _, run_id = tracked_recommendations(include_imported=True)
     with transaction() as con:
         con.execute("UPDATE candidates SET status='imported' WHERE id=1")
-    _, run_id = tracked_recommendations(include_imported=True)
     reads_before = row("SELECT COUNT(*) count FROM reads")["count"]
 
     with TestClient(app, headers=authenticated_headers()) as client:

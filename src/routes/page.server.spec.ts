@@ -408,7 +408,11 @@ describe("page actions", () => {
       request: new Request("http://afterword.test", { method: "POST", body }),
     } as never);
 
-    expect(result).toEqual({ message: "Decision undone." });
+    expect(result).toEqual({
+      message: "Decision undone.",
+      id: 9,
+      status: "recommended",
+    });
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:8000/api/recommendations/9/undo",
       expect.objectContaining({
@@ -416,6 +420,67 @@ describe("page actions", () => {
         body: JSON.stringify({ decision_id: 55 }),
       }),
     );
+  });
+
+  it("returns the server-restored status from single and bulk undoDecision without guessing", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 9, status: "imported" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            undone: 2,
+            items: [
+              { id: 7, status: "recommended" },
+              { id: 8, status: "imported" },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const undoBody = new FormData();
+    undoBody.set("id", "9");
+    undoBody.set("decision_id", "77");
+    const undoResult = await actions.undoDecision!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: undoBody,
+      }),
+    } as never);
+    expect(undoResult).toEqual({
+      message: "Decision undone.",
+      id: 9,
+      status: "imported",
+    });
+
+    const bulkUndoBody = new FormData();
+    bulkUndoBody.append("id", "7");
+    bulkUndoBody.append("decision_id", "21");
+    bulkUndoBody.append("id", "8");
+    bulkUndoBody.append("decision_id", "22");
+    const bulkUndoResult = await actions.undoDecision!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: bulkUndoBody,
+      }),
+    } as never);
+    expect(bulkUndoResult).toEqual({
+      message: "Decisions undone.",
+      items: [
+        { id: 7, status: "recommended" },
+        { id: 8, status: "imported" },
+      ],
+    });
   });
 
   it("exposes a restore Undo token when returning a book to Discover", async () => {
@@ -1450,6 +1515,126 @@ describe("page actions", () => {
     });
   });
 
+  it("gates recommendation run creation on non-Discover views", async () => {
+    const overview = {
+      recommendation_run_id: "",
+      recommendations: [],
+      decisions: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    for (const view of ["saved", "decisions", "sources", "settings"]) {
+      const fetchMock = vi.fn().mockImplementation(
+        () =>
+          new Response(JSON.stringify(overview), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const result = (await load({
+        url: new URL(`http://afterword.test/?view=${view}`),
+        locals: { user: null },
+      } as never)) as { recommendation_run_id: string };
+      expect(result.recommendation_run_id).toBe("");
+      expect(fetchMock.mock.calls[0][0]).toContain("track_run=false");
+    }
+  });
+
+  it("passes digest_period to overview so fatigued active digest picks are loaded", async () => {
+    const overview = {
+      recommendation_run_id: "run-digest-99",
+      recommendations: [
+        {
+          id: 30,
+          title: "Fatigued Digest Pick",
+          author: "A Writer",
+          description: "Still recommended",
+          cover_url: "",
+          source_url: "",
+          release_date: null,
+          date_kind: "unknown",
+          genres: ["Sci-Fi"],
+          score: 64,
+          metadata_confidence: 1,
+          explanation: ["Weekly pick"],
+          status: "recommended",
+          source_name: "Source",
+          recommendation_run_id: "run-digest-99",
+        },
+      ],
+      decisions: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const fetchMock = vi.fn().mockImplementation((input: string | URL) => {
+      if (String(input).includes("/api/digest/review")) {
+        return new Response(
+          JSON.stringify({ period: "2026-W42", ids: [30], found: true }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify(overview), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = (await load({
+      url: new URL(
+        "http://afterword.test/?view=discover&digest=1&digest_period=2026-W42",
+      ),
+      locals: { user: null },
+    } as never)) as {
+      recommendation_run_id: string;
+      digestReview: {
+        requested: boolean;
+        ids: number[];
+        books: Array<{ id: number; recommendation_run_id: string }>;
+      };
+      books: Array<{ id: number; recommendation_run_id: string }>;
+    };
+
+    expect(fetchMock.mock.calls[0][0]).toContain("digest_period=2026-W42");
+    expect(fetchMock.mock.calls[0][0]).not.toContain("track_run=false");
+    expect(result.recommendation_run_id).toBe("run-digest-99");
+    expect(result.digestReview).toEqual({
+      requested: true,
+      ids: [30],
+      books: [
+        expect.objectContaining({
+          id: 30,
+          recommendation_run_id: "run-digest-99",
+        }),
+      ],
+    });
+    expect(result.books[0]).toMatchObject({
+      id: 30,
+      recommendation_run_id: "run-digest-99",
+    });
+  });
+
   it("throws HTTP 503 without contacting the engine when hooks report an outage", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
@@ -2350,6 +2535,7 @@ describe("page actions", () => {
 
     expect(result).toEqual({
       message: "Added past read to your reading history with a 4-star rating.",
+      read_id: 12,
     });
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:8000/api/recommendations/42/read",
@@ -2913,6 +3099,153 @@ describe("page actions", () => {
     );
     expect(fetchMock.mock.calls[1][0]).toBe(
       "http://127.0.0.1:8000/api/sources/default/toggle",
+    );
+  });
+
+  it("gates load run tracking on client invalidations and non-refresh POST fallbacks while allowing SSR Discover and no-JS refresh POSTs", async () => {
+    const overview = {
+      recommendation_run_id: "run-ssr-1",
+      recommendations: [],
+      decisions: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const fetchMock = vi.fn().mockImplementation(
+      () =>
+        new Response(JSON.stringify(overview), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    // 1. Shallow-routed client invalidation via query param on `/` must pass track_run=false
+    // 1. Real SvelteKit `/__data.json` data request (where respond() already
+    // stripped `x-sveltekit-invalidated` from `event.url` and set `isDataRequest: true`)
+    await load({
+      url: new URL("http://afterword.test/"),
+      request: new Request("http://afterword.test/__data.json?x-sveltekit-invalidated=01"),
+      isDataRequest: true,
+      locals: { user: null },
+    } as never);
+
+    // 2. Direct `isDataRequest: true` with plain Request URL
+    await load({
+      url: new URL("http://afterword.test/"),
+      request: new Request("http://afterword.test/"),
+      isDataRequest: true,
+      locals: { user: null },
+    } as never);
+
+    // 3. Client invalidation via header on `/` must pass track_run=false
+    await load({
+      url: new URL("http://afterword.test/"),
+      request: new Request("http://afterword.test/", {
+        headers: { "x-sveltekit-invalidated": "1" },
+      }),
+      isDataRequest: false,
+      locals: { user: null },
+    } as never);
+
+    // 4. Non-refresh no-JS POST fallback on `/` (e.g. ?/decide) must pass track_run=false
+    await load({
+      url: new URL("http://afterword.test/?/decide"),
+      request: new Request("http://afterword.test/?/decide", { method: "POST" }),
+      isDataRequest: false,
+      locals: { user: null },
+    } as never);
+
+    // 5. Initial SSR GET on `/` tracks Discover run (no track_run=false)
+    await load({
+      url: new URL("http://afterword.test/"),
+      request: new Request("http://afterword.test/", { method: "GET" }),
+      isDataRequest: false,
+      locals: { user: null },
+    } as never);
+
+    // 6. No-JS POST fallback for ?/runSync on `/` tracks fresh Discover run
+    await load({
+      url: new URL("http://afterword.test/?/runSync"),
+      request: new Request("http://afterword.test/?/runSync", { method: "POST" }),
+      isDataRequest: false,
+      locals: { user: null },
+    } as never);
+
+    const overviewCalls = fetchMock.mock.calls
+      .map(([input]) => String(input))
+      .filter((calledUrl) => calledUrl.includes("/api/overview"));
+    expect(overviewCalls).toHaveLength(6);
+    expect(overviewCalls[0]).toContain("track_run=false");
+    expect(overviewCalls[1]).toContain("track_run=false");
+    expect(overviewCalls[2]).toContain("track_run=false");
+    expect(overviewCalls[3]).toContain("track_run=false");
+    expect(overviewCalls[4]).not.toContain("track_run=false");
+    expect(overviewCalls[5]).not.toContain("track_run=false");
+  });
+
+  it("passes track_run=false when configureSourceFilters looks up an existing source without a submitted URL", async () => {
+    const overviewWithBuiltin = {
+      recommendations: [],
+      decisions: [],
+      history: [],
+      sources: [
+        {
+          id: 3,
+          label: "Built-in Picks",
+          url: "builtin://default",
+          kind: "builtin",
+          enabled: 1,
+        },
+      ],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(overviewWithBuiltin), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 3, job_id: "job-filter-3" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = new FormData();
+    body.set("id", "3");
+    body.set("includeGenres", "Science Fiction");
+    const result = await actions.configureSourceFilters!({
+      request: new Request("http://afterword.test", { method: "POST", body }),
+    } as never);
+
+    expect(result).toMatchObject({
+      message: "Source filters updated; a fresh scan is queued.",
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "http://127.0.0.1:8000/api/overview?recommendation_limit=1&decision_limit=1&track_run=false",
     );
   });
 });

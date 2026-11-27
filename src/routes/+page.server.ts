@@ -90,6 +90,7 @@ type Overview = {
     source_name: string | null;
     source_enabled?: boolean;
     quality_status?: string | null;
+    recommendation_run_id?: string;
   }>;
   recommendations_has_more?: boolean;
   recommendation_genres?: string[];
@@ -196,7 +197,12 @@ const distinctGenres = (items: Array<{ genres: string[] }>) => {
   return [...seen.values()].sort((left, right) => left.localeCompare(right));
 };
 
-export const load: PageServerLoad = async ({ url, locals }) => {
+export const load: PageServerLoad = async ({
+  url,
+  request,
+  isDataRequest,
+  locals,
+}) => {
   if (locals?.engineUnavailable) {
     throw httpError(503, "Bookward's recommendation engine is unavailable.");
   }
@@ -225,8 +231,38 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     evidence_complete_runs: 0,
     evidence_incomplete_runs: 0,
   };
+  const viewParam = url.searchParams.get("view");
+  const isDiscover =
+    !viewParam ||
+    !["saved", "decisions", "sources", "settings"].includes(viewParam);
+  let digestPeriod = url.searchParams.get("digest_period");
+  const validDigestPeriod =
+    digestPeriod && /^\d{4}-W\d{2}$/.test(digestPeriod) ? digestPeriod : null;
+  const overviewParams = new URLSearchParams({
+    recommendation_limit: "24",
+    decision_limit: "24",
+  });
+  // SvelteKit's respond() deletes `x-sveltekit-invalidated` from `event.url` on
+  // `/__data.json` requests while setting `isDataRequest = true`. Gate run
+  // creation on data requests as well as explicit invalidation params/headers so
+  // shallow-routed (#311) client updates never mint phantom Discover runs.
+  const isClientInvalidation =
+    Boolean(isDataRequest) ||
+    Boolean(request?.url && request.url.includes("/__data.json")) ||
+    url.searchParams.has("x-sveltekit-invalidated") ||
+    Boolean(request?.headers?.get("x-sveltekit-invalidated"));
+  const isPostFallbackWithoutRefresh =
+    request?.method === "POST" &&
+    !url.searchParams.has("/runSync") &&
+    !url.searchParams.has("/rebuildEmbeddings");
+  const shouldTrackRun =
+    isDiscover && !isClientInvalidation && !isPostFallbackWithoutRefresh;
+  if (!shouldTrackRun) overviewParams.set("track_run", "false");
+  if (isDiscover && validDigestPeriod) {
+    overviewParams.set("digest_period", validDigestPeriod);
+  }
   const overviewRequest = engine<Overview>(
-    "/api/overview?recommendation_limit=24&decision_limit=24",
+    `/api/overview?${overviewParams.toString()}`,
   );
   const backupStatusRequest = engine<BackupStatus>("/api/backups")
     .then((status) => ({ ...fallbackBackupStatus, ...status }))
@@ -234,7 +270,6 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   const catalogQualityRequest = engine<unknown>("/api/candidates/quality").catch(
     () => null,
   );
-  let digestPeriod = url.searchParams.get("digest_period");
   const digestReviewRequest = digestPeriod
     ? engine<{
         ids?: unknown[];
@@ -260,7 +295,12 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   const books = overview.recommendations.map((book) =>
     toPageBook({
       ...book,
-      recommendation_run_id: runId,
+      recommendation_run_id:
+        typeof book.recommendation_run_id === "string"
+          ? book.recommendation_run_id
+          : book.status === "recommended"
+            ? runId
+            : "",
     }),
   );
   const overviewBooksById = new Map(books.map((book) => [book.id, book]));
@@ -656,17 +696,35 @@ export const actions: Actions = {
     }
     try {
       if (decisions.length === 1) {
-        await engine(`/api/recommendations/${decisions[0].id}/undo`, {
-          method: "POST",
-          body: JSON.stringify({ decision_id: decisions[0].decision_id }),
-        });
-        return { message: "Decision undone." };
+        const result = await engine<{ id?: number; status?: string }>(
+          `/api/recommendations/${decisions[0].id}/undo`,
+          {
+            method: "POST",
+            body: JSON.stringify({ decision_id: decisions[0].decision_id }),
+          },
+        );
+        return {
+          message: "Decision undone.",
+          id: typeof result.id === "number" ? result.id : decisions[0].id,
+          ...(typeof result.status === "string" ? { status: result.status } : {}),
+        };
       }
-      await engine("/api/recommendations/bulk-undo", {
+      const result = await engine<{
+        items?: Array<{ id?: number; status?: string }>;
+      }>("/api/recommendations/bulk-undo", {
         method: "POST",
         body: JSON.stringify({ decisions }),
       });
-      return { message: "Decisions undone." };
+      const restoredItems = Array.isArray(result.items)
+        ? result.items.filter(
+            (item): item is { id: number; status: string } =>
+              typeof item?.id === "number" && typeof item?.status === "string",
+          )
+        : [];
+      return {
+        message: "Decisions undone.",
+        ...(restoredItems.length ? { items: restoredItems } : {}),
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }
@@ -690,25 +748,38 @@ export const actions: Actions = {
       return fail(400, { message: parsedReadAt.message });
     }
     try {
-      await engine(`/api/recommendations/${id.data}/read`, {
-        method: "POST",
-        body: JSON.stringify({
-          ...(rating === undefined ? {} : { rating }),
-          ...(historical ? { historical: true } : {}),
-          ...(parsedReadAt.value === undefined ? {} : { read_at: parsedReadAt.value }),
-        }),
-      });
+      const payload = await engine<{ read_id?: unknown }>(
+        `/api/recommendations/${id.data}/read`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            ...(rating === undefined ? {} : { rating }),
+            ...(historical ? { historical: true } : {}),
+            ...(parsedReadAt.value === undefined ? {} : { read_at: parsedReadAt.value }),
+          }),
+        },
+      );
+      const readId =
+        payload &&
+        typeof payload === "object" &&
+        typeof payload.read_id === "number" &&
+        Number.isInteger(payload.read_id) &&
+        payload.read_id > 0
+          ? payload.read_id
+          : undefined;
       if (historical) {
         return {
           message: rating === undefined
             ? "Added past read to your reading history."
             : `Added past read to your reading history with a ${rating}-star rating.`,
+          ...(readId !== undefined ? { read_id: readId } : {}),
         };
       }
       return {
         message: rating === undefined
           ? "Marked Read and added to your history."
           : `Marked Read and added to your history with a ${rating}-star rating.`,
+        ...(readId !== undefined ? { read_id: readId } : {}),
       };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
@@ -896,7 +967,7 @@ export const actions: Actions = {
     try {
       if (!targetUrl) {
         const overview = await engine<Overview>(
-          "/api/overview?recommendation_limit=1&decision_limit=1",
+          "/api/overview?recommendation_limit=1&decision_limit=1&track_run=false",
         );
         const existing = overview.sources.find((item) => item.id === id.data);
         if (!existing) return fail(404, { message: "Source not found." });
