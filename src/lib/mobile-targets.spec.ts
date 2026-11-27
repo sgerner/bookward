@@ -169,7 +169,7 @@ describe("mobile target sizes and modal bounds", () => {
     const visibleCheckboxes = checkboxes.filter(
       ({ element }) => !getRawAttrSlice(source, element, "class").includes("sr-only"),
     );
-    expect(visibleCheckboxes.length).toBe(6);
+    expect(visibleCheckboxes.length).toBe(8);
 
     for (const { element, ancestors } of visibleCheckboxes) {
       const cls = getRawAttrSlice(source, element, "class");

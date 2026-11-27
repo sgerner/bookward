@@ -2300,6 +2300,130 @@ describe("page actions", () => {
     });
   });
 
+  it("exposes recovery hold status and requires confirmation before dismissing or overriding a hold", async () => {
+    const overview = {
+      recommendations: [],
+      history: [],
+      sources: [],
+      settings: {
+        embedding_backend: "local",
+        embedding_model: "hashing-768",
+        embedding_url: "",
+        embedding_api_key_set: false,
+        librarr_url: "",
+        librarr_api_key_set: false,
+        librarr_media_type: "audiobook",
+        digest: {},
+      },
+    };
+    const backupStatus = {
+      enabled: true,
+      interval_hours: 24,
+      retention_count: 1,
+      recovery_hold: true,
+      recovery_hold_at: "2026-11-21T20:00:00+00:00",
+      last_success_at: "2026-11-20T19:00:00+00:00",
+      last_error: null,
+      next_backup_at: null,
+      backups: [
+        {
+          id: "bookward-20261120T190000Z-aaaa1111",
+          created_at: "2026-11-20T19:00:00+00:00",
+          size_bytes: 65536,
+        },
+        {
+          id: "bookward-20261119T190000Z-bbbb2222",
+          created_at: "2026-11-19T19:00:00+00:00",
+          size_bytes: 61440,
+        },
+      ],
+    };
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      const payload = input.includes("/api/backups") ? backupStatus : overview;
+      return Promise.resolve(
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const loaded = (await load({
+      url: new URL("http://afterword.test/?view=settings"),
+      locals: { user: null },
+    } as never)) as {
+      backupStatus: typeof backupStatus;
+    };
+    expect(loaded.backupStatus.recovery_hold).toBe(true);
+    expect(loaded.backupStatus.backups[0].id).toBe(
+      "bookward-20261120T190000Z-aaaa1111",
+    );
+
+    fetchMock.mockClear();
+    const unconfirmedDismiss = await actions.dismissRecoveryHold!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: new FormData(),
+      }),
+    } as never);
+    expect(unconfirmedDismiss).toMatchObject({ status: 400 });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ dismissed: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const confirmedBody = new FormData();
+    confirmedBody.set("confirm", "KEEP");
+    await expect(
+      actions.dismissRecoveryHold!({
+        request: new Request("http://afterword.test", {
+          method: "POST",
+          body: confirmedBody,
+        }),
+      } as never),
+    ).resolves.toEqual({
+      message:
+        "Recovery hold dismissed. Scheduled backups have resumed for this database.",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/backups/recovery-hold/dismiss",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ confirm: true }),
+      }),
+    );
+
+    fetchMock.mockClear();
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ backup: { created_at: "2026-11-21T20:05:00+00:00" } }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+    const createBody = new FormData();
+    createBody.set("confirmClearHold", "CONFIRM");
+    await actions.createBackup!({
+      request: new Request("http://afterword.test", {
+        method: "POST",
+        body: createBody,
+      }),
+    } as never);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8000/api/backups/create",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ confirm_clear_hold: true }),
+      }),
+    );
+  });
+
   it("propagates HTTP 409 when restoring a candidate from a disabled source", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
@@ -2369,7 +2493,6 @@ describe("page actions", () => {
     expect(futureResult.data.message).toContain("cannot be in the future");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
-
   it("loads active catalog sweep progress, remaining rows, and retry status in Settings", async () => {
     const overview = {
       recommendations: [],

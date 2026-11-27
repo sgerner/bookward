@@ -24,6 +24,9 @@ type Account = {
 type IdentityBackupStatus = {
 	enabled: boolean;
 	interval_hours: number;
+	retention_count?: number;
+	recovery_hold: boolean;
+	recovery_hold_at?: string | null;
 	last_success_at: string | null;
 	last_attempt_at: string | null;
 	last_error: string | null;
@@ -54,10 +57,10 @@ export const load: PageServerLoad = async ({ locals }) => {
 	if (!locals.user) throw redirect(303, '/login');
 	if (locals.user.role !== 'admin') throw redirect(303, '/');
 	let result: { accounts: Account[] };
-	let identityBackup: IdentityBackupStatus | null;
+	let rawIdentityBackup: IdentityBackupStatus | null;
 	let methods: { password_enabled: boolean };
 	try {
-		[result, identityBackup, methods] = await Promise.all([
+		[result, rawIdentityBackup, methods] = await Promise.all([
 			engine<{ accounts: Account[] }>('/admin/accounts'),
 			engine<IdentityBackupStatus>('/admin/auth-backups').catch(() => null),
 			engine<{ password_enabled: boolean }>('/auth/identities').catch(() => ({
@@ -69,6 +72,9 @@ export const load: PageServerLoad = async ({ locals }) => {
 		if (error instanceof EngineError && error.status === 403) throw redirect(303, '/');
 		throw httpError(503, "Bookward's recommendation engine is unavailable.");
 	}
+	const identityBackup = rawIdentityBackup
+		? { ...rawIdentityBackup, recovery_hold: Boolean(rawIdentityBackup.recovery_hold) }
+		: null;
 	const accounts = result.accounts.map((account) => {
 		const hasLocal =
 			typeof account.has_local_username === 'boolean'
@@ -187,6 +193,29 @@ export const actions: Actions = {
 					? { password: msg }
 					: {};
 			return failure(formId, error, mappedFieldErrors);
+		}
+	},
+	dismissIdentityHold: async ({ request }) => {
+		const form = await request.formData();
+		if (String(form.get('confirm') || '').trim() !== 'KEEP') {
+			return fail(400, {
+				formId: 'dismissIdentityHold',
+				message: 'Confirm keeping the current account registry before resuming scheduled backups.',
+				error: true as const,
+				fieldErrors: {}
+			});
+		}
+		try {
+			await engine('/admin/auth-backups/recovery-hold/dismiss', {
+				method: 'POST',
+				body: JSON.stringify({ confirm: true })
+			});
+			return {
+				formId: 'dismissIdentityHold',
+				message: 'Account-registry recovery hold dismissed. Scheduled backups have resumed.'
+			};
+		} catch (error) {
+			return failure('dismissIdentityHold', error);
 		}
 	},
 	unlock: async ({ request }) => {

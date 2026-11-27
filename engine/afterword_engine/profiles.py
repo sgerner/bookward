@@ -45,6 +45,7 @@ LOGIN_FAILURE_LIMIT = 10
 LOGIN_LOCKOUT_WINDOW = timedelta(minutes=15)
 LOGIN_ATTEMPT_RETENTION = timedelta(days=1)
 LOCKOUT_NOTICE_PREFIX = "lockout_notice:"
+AUTH_SCHEMA_INITIALIZED_KEY = "schema_initialized"
 AUTH_BUSY_TIMEOUT_MS = 5000
 TOKEN_CACHE_MAX_ENTRIES = 1024
 TOKEN_DERIVATION_CONCURRENCY = max(1, min(2, (os.cpu_count() or 2) // 2))
@@ -431,6 +432,43 @@ def validate_credentials(username: str, password: str) -> tuple[str, str]:
 def initialize_auth() -> None:
     """Create the identity store and establish the existing-data profile."""
     with auth_connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            existing_tables = {
+                row[0]
+                for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            schema_initialized = (
+                "auth_meta" in existing_tables
+                and con.execute(
+                    "SELECT 1 FROM auth_meta WHERE key=?",
+                    (AUTH_SCHEMA_INITIALIZED_KEY,),
+                ).fetchone()
+                is not None
+            )
+            has_existing_identities = any(
+                table in existing_tables
+                and con.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+                for table in ("accounts", "profiles")
+            )
+            if not schema_initialized and not has_existing_identities:
+                from . import backups
+
+                if backups.has_auth_backups():
+                    con.execute(
+                        "CREATE TABLE IF NOT EXISTS auth_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                    )
+                    con.execute(
+                        "INSERT OR IGNORE INTO auth_meta(key,value) VALUES(?,?)",
+                        (backups.AUTH_BACKUP_HOLD_KEY, iso(utc_now())),
+                    )
+            con.commit()
+        except Exception:
+            if con.in_transaction:
+                con.rollback()
+            raise
         con.executescript(AUTH_SCHEMA)
         account_columns = {row[1] for row in con.execute("PRAGMA table_info(accounts)")}
         if "must_change_password" not in account_columns:
@@ -512,6 +550,10 @@ def initialize_auth() -> None:
         # Older releases stored a setup-token digest here. First-admin setup
         # is now an atomic first-visitor claim, so remove any obsolete digest.
         con.execute("DELETE FROM auth_meta WHERE key='setup_token_hash'")
+        con.execute(
+            "INSERT OR IGNORE INTO auth_meta(key,value) VALUES(?,?)",
+            (AUTH_SCHEMA_INITIALIZED_KEY, "1"),
+        )
 
 
 def setup_required() -> bool:

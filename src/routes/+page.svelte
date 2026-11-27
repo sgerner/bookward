@@ -4613,16 +4613,63 @@
                   <div class="min-w-0 flex-1">
                     <div class="flex flex-wrap items-center gap-3">
                       <h2 class="text-lg font-semibold text-surface-950-50">Backup &amp; recovery</h2>
-                      <span class={`badge ${data.backupStatus.enabled ? "preset-tonal-success" : "preset-tonal-surface"}`}>
-                        {data.backupStatus.enabled ? `Every ${data.backupStatus.interval_hours} hours` : "Scheduled backups off"}
-                      </span>
+                      {#if data.backupStatus.recovery_hold}
+                        <span class="badge preset-tonal-warning">Recovery hold · backups paused</span>
+                      {:else}
+                        <span class={`badge ${data.backupStatus.enabled ? "preset-tonal-success" : "preset-tonal-surface"}`}>
+                          {data.backupStatus.enabled ? `Every ${data.backupStatus.interval_hours} hours` : "Scheduled backups off"}
+                        </span>
+                      {/if}
                     </div>
                     <p class="mt-1 text-sm leading-6 text-surface-700-300">
                       Last successful backup: <strong class="font-medium text-surface-950-50">{formatBackupTime(data.backupStatus.last_success_at)}</strong>.
-                      {#if data.backupStatus.enabled} Bookward keeps the latest {data.backupStatus.retention_count} snapshots in its private backup volume.{/if}
+                      {#if data.backupStatus.recovery_hold}
+                        {#if data.backupStatus.recovery_hold_at}
+                          Scheduled snapshots and retention pruning are paused until you restore a backup or confirm keeping this new database.
+                        {:else}
+                          Scheduled snapshots and retention pruning are paused because recovery-hold status could not be read from the current database.
+                        {/if}
+                      {:else if data.backupStatus.enabled}
+                        Bookward keeps the latest {data.backupStatus.retention_count} snapshots in its private backup volume.
+                      {/if}
                     </p>
                   </div>
                 </div>
+
+                {#if data.backupStatus.recovery_hold}
+                  <div class="mb-4 border-l-2 border-warning-500 preset-tonal-warning p-4 text-sm leading-6" role="alert">
+                    <div class="flex items-start gap-2.5">
+                      <TriangleAlert size={18} class="mt-0.5 shrink-0" />
+                      <div class="min-w-0 flex-1 space-y-3">
+                        {#if data.backupStatus.recovery_hold_at}
+                          <div>
+                            <p class="font-semibold text-surface-950-50">Recovery hold active — scheduled backups are paused</p>
+                            <p class="mt-1 text-surface-800-200">
+                              Bookward initialized a new profile database while {data.backupStatus.backups.length === 1 ? "1 surviving snapshot was" : `${data.backupStatus.backups.length} surviving snapshots were`} found on disk. Automatic snapshots and pruning are paused so your prior backups stay intact. Restore a snapshot under <strong>Restore a backup</strong>, or confirm below if you intended to start fresh.
+                            </p>
+                          </div>
+                          <form class="space-y-3 border-t border-warning-500/30 pt-3" method="POST" action="?/dismissRecoveryHold" use:enhance={setPending("dismiss-recovery-hold")}>
+                            <ProfileField profileId={data.user?.profile_id} />
+                            <label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs leading-5 text-surface-900-100">
+                              <input class="checkbox size-6 shrink-0" type="checkbox" name="confirm" value="KEEP" required />
+                              <span>Keep this new database and resume scheduled backups{#if data.backupStatus.retention_count <= 1} (later snapshots will prune older backups under retention {data.backupStatus.retention_count}){/if}.</span>
+                            </label>
+                            <button class="btn btn-sm btn-reflow min-h-10 preset-filled-warning-500" type="submit" disabled={isPending("dismiss-recovery-hold")} aria-busy={isPending("dismiss-recovery-hold")}>
+                              {#if isPending("dismiss-recovery-hold")}<RefreshCw size={15} class="animate-spin" />{:else}<Check size={15} />{/if} Keep current database &amp; resume backups
+                            </button>
+                          </form>
+                        {:else}
+                          <div>
+                            <p class="font-semibold text-surface-950-50">Scheduled backups paused — recovery hold status could not be read</p>
+                            <p class="mt-1 text-surface-800-200">
+                              Bookward could not read recovery-hold status from the current profile database, so automatic snapshots and retention pruning are paused to protect existing backups until database access recovers.
+                            </p>
+                          </div>
+                        {/if}
+                      </div>
+                    </div>
+                  </div>
+                {/if}
 
                 <StatusRegion
                   message={data.backupStatus.last_error ?? ""}
@@ -4741,6 +4788,12 @@
                   <div class="min-w-0">
                     <form method="POST" action="?/createBackup" use:enhance={setPending("create-backup")}>
                       <ProfileField profileId={data.user?.profile_id} />
+                      {#if data.backupStatus.recovery_hold}
+                        <label class="mb-3 flex min-h-10 cursor-pointer items-center gap-3 text-xs leading-5 text-surface-800-200">
+                          <input class="checkbox size-6 shrink-0" type="checkbox" name="confirmClearHold" value="CONFIRM" required />
+                          <span>Clear the recovery hold and snapshot this current database (existing snapshots stay intact now; later backups prune to {data.backupStatus.retention_count}).</span>
+                        </label>
+                      {/if}
                       <button class="btn btn-reflow min-h-11 w-full preset-filled-secondary-500" type="submit" disabled={isPending("create-backup")} aria-busy={isPending("create-backup")}>
                         {#if isPending("create-backup")}<RefreshCw size={16} class="animate-spin" />{:else}<Check size={16} />{/if} Create backup now
                       </button>
@@ -4766,8 +4819,8 @@
                       <form class="mt-4 space-y-3" method="POST" action="?/restoreBackup" use:enhance={setPending("restore-backup")}>
                         <ProfileField profileId={data.user?.profile_id} />
                         <label class="block min-w-0 text-sm font-medium text-surface-800-200">Backup<select class="select mt-2 w-full" name="backupId" required>
-                          {#each data.backupStatus.backups as backup (backup.id)}
-                            <option value={backup.id}>{formatBackupTime(backup.created_at)} · {formatBackupSize(backup.size_bytes)}</option>
+                          {#each data.backupStatus.backups as backup, index (backup.id)}
+                            <option value={backup.id} selected={index === 0}>{formatBackupTime(backup.created_at)} · {formatBackupSize(backup.size_bytes)}</option>
                           {/each}
                         </select></label>
                         <label class="block min-w-0 text-sm font-medium text-surface-800-200">Type RESTORE to confirm<input class="input mt-2 w-full" name="confirm" autocomplete="off" required pattern="RESTORE" /></label>

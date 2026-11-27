@@ -19,6 +19,8 @@ type BackupStatus = {
   enabled: boolean;
   interval_hours: number;
   retention_count: number;
+  recovery_hold: boolean;
+  recovery_hold_at?: string | null;
   last_success_at: string | null;
   last_error: string | null;
   next_backup_at: string | null;
@@ -204,6 +206,8 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     enabled: false,
     interval_hours: 0,
     retention_count: 0,
+    recovery_hold: false,
+    recovery_hold_at: null,
     last_success_at: null,
     last_error: null,
     next_backup_at: null,
@@ -250,10 +254,15 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   } catch {
     throw httpError(503, "Bookward's recommendation engine is unavailable.");
   }
-  const [backupStatus, rawCatalogQuality] = await Promise.all([
+  const [rawBackupStatus, rawCatalogQuality] = await Promise.all([
     backupStatusRequest,
     catalogQualityRequest,
   ]);
+  const backupStatus: BackupStatus = {
+    ...rawBackupStatus,
+    recovery_hold: Boolean(rawBackupStatus.recovery_hold),
+    recovery_hold_at: rawBackupStatus.recovery_hold_at ?? null,
+  };
   const catalogQuality = normalizeCatalogQuality(rawCatalogQuality);
   const builtIn = overview.sources.find((source) => source.is_default);
   const runId = overview.recommendation_run_id ?? "";
@@ -457,14 +466,41 @@ async function handleCsvImport(request: Request) {
   }
 }
 export const actions: Actions = {
-  createBackup: async () => {
+  createBackup: async ({ request }) => {
+    const data = request ? await request.formData().catch(() => new FormData()) : new FormData();
+    const confirmClearHold = formText(data, "confirmClearHold") === "CONFIRM";
     try {
       const result = await engine<{ backup: { created_at: string } }>(
         "/api/backups/create",
-        { method: "POST", body: "{}" },
+        {
+          method: "POST",
+          body: JSON.stringify(
+            confirmClearHold ? { confirm_clear_hold: true } : {},
+          ),
+        },
         10 * 60_000,
       );
       return { message: `Backup created at ${result.backup.created_at}.` };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  dismissRecoveryHold: async ({ request }) => {
+    const data = await request.formData();
+    if (formText(data, "confirm") !== "KEEP")
+      return fail(400, {
+        message:
+          "Confirm keeping the current database before resuming scheduled backups.",
+      });
+    try {
+      await engine("/api/backups/recovery-hold/dismiss", {
+        method: "POST",
+        body: JSON.stringify({ confirm: true }),
+      });
+      return {
+        message:
+          "Recovery hold dismissed. Scheduled backups have resumed for this database.",
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }

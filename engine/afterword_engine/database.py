@@ -27,6 +27,7 @@ from .tenancy import (
     active_restore_epoch_binding,
     bound_restore_epoch,
     current_profile_id,
+    has_database_path_override,
     profile_database_path,
     profile_scope,
     restore_epoch_latch_scope,
@@ -2874,6 +2875,23 @@ def initialize(*, seed_demo: bool = True):
     with connect() as con:
         con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         applied = {item[0] for item in con.execute("SELECT version FROM schema_migrations")}
+        has_surviving_backups = False
+        if not has_database_path_override() and not applied:
+            existing_tables = {
+                item[0]
+                for item in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            has_legacy_rows = any(
+                table in existing_tables
+                and con.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+                for table in ("reads", "candidates", "sources")
+            )
+            if not has_legacy_rows:
+                from . import backups
+
+                has_surviving_backups = bool(backups.list_backups())
         for version, script in MIGRATIONS:
             if version in applied:
                 continue
@@ -2885,6 +2903,24 @@ def initialize(*, seed_demo: bool = True):
                 if already_applied:
                     con.commit()
                     continue
+                if version == 1 and has_surviving_backups:
+                    from . import backups
+
+                    con.execute(
+                        "CREATE TABLE IF NOT EXISTS settings ("
+                        "key TEXT PRIMARY KEY, "
+                        "value TEXT NOT NULL, "
+                        "secret INTEGER NOT NULL DEFAULT 0, "
+                        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+                        ")"
+                    )
+                    con.execute(
+                        "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
+                        (
+                            backups.RECOVERY_HOLD_KEY,
+                            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        ),
+                    )
                 _execute_migration_script(con, script)
                 con.execute(
                     "INSERT INTO schema_migrations(version) VALUES(?)", (version,)

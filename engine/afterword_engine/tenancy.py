@@ -64,6 +64,10 @@ def database_path_override(path: str | Path):
         _database_override.reset(token)
 
 
+def has_database_path_override() -> bool:
+    return _database_override.get() is not None
+
+
 def active_restore_epoch_binding(
     path: str | Path | None = None,
 ) -> _RestoreEpochBinding | None:

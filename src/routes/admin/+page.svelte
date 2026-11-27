@@ -18,9 +18,26 @@
 		timeStyle: 'short',
 		timeZone: 'UTC'
 	});
+	let selectedSnapshotOverride = $state('');
+	const selectedIdentitySnapshot = $derived(
+		data.identityBackup?.backups.some((item) => item.id === selectedSnapshotOverride)
+			? selectedSnapshotOverride
+			: (data.identityBackup?.backups[0]?.id ?? '<snapshot-id>')
+	);
+	function formatSnapshotSize(bytes: number) {
+		if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+		return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+	}
 
 	const accountsSectionError = $derived.by(() => {
-		if (!form?.error || !form.formId || form.formId === 'create') return undefined;
+		if (
+			!form?.error ||
+			!form.formId ||
+			form.formId === 'create' ||
+			form.formId === 'dismissIdentityHold'
+		) {
+			return undefined;
+		}
 		const renderedInRow = data.accounts.some(
 			(account) =>
 				form.formId === `setStatus-${account.id}` ||
@@ -301,18 +318,85 @@
 		{/each}
 	</section>
 	<section class="mt-8 card preset-tonal-surface p-6">
-		<h2 class="text-xl font-semibold">Account registry backups</h2>
+		<div class="flex flex-wrap items-center gap-3">
+			<h2 class="text-xl font-semibold">Account registry backups</h2>
+			{#if data.identityBackup}
+				{#if data.identityBackup.recovery_hold}
+					<span class="badge preset-tonal-warning">Recovery hold · backups paused</span>
+				{:else}
+					<span class="badge {data.identityBackup.enabled ? 'preset-tonal-success' : 'preset-tonal-surface'}">
+						{data.identityBackup.enabled ? `Every ${data.identityBackup.interval_hours} hours` : 'Scheduled backups off'}
+					</span>
+				{/if}
+			{/if}
+		</div>
+		{#if formSuccessBanner(form, 'dismissIdentityHold')}
+			<p class="mt-4 rounded-xl p-3 text-sm preset-tonal-success" role="status">{formSuccessBanner(form, 'dismissIdentityHold')}</p>
+		{/if}
+		{#if formErrorBanner(form, 'dismissIdentityHold')}
+			<p class="mt-4 rounded-xl p-3 text-sm preset-tonal-error" role="alert">{formErrorBanner(form, 'dismissIdentityHold')}</p>
+		{/if}
 		{#if data.identityBackup}
 			{@const backup = data.identityBackup}
 			<p class="mt-2 text-sm text-surface-700-300">
-				{backup.enabled ? `Scheduled every ${backup.interval_hours} hours.` : 'Scheduled backups are off.'}
+				{#if backup.recovery_hold}
+					Scheduled identity-registry snapshots and retention pruning are paused to protect existing snapshots.
+				{:else}
+					{backup.enabled ? `Scheduled every ${backup.interval_hours} hours.` : 'Scheduled backups are off.'}
+				{/if}
 				{backup.backups.length} snapshot{backup.backups.length === 1 ? '' : 's'} available.
 			</p>
+			{#if backup.recovery_hold}
+				<div class="mt-4 space-y-4 border-l-2 border-warning-500 preset-tonal-warning p-4 text-sm leading-6" role="alert">
+					{#if backup.recovery_hold_at}
+						<div>
+							<p class="font-semibold">Recovery hold active — scheduled identity backups are paused</p>
+							<p class="mt-1">
+								Bookward initialized a new account registry while {backup.backups.length === 1 ? '1 surviving snapshot was' : `${backup.backups.length} surviving snapshots were`} found in <code class="break-words wrap-anywhere">auth-registry</code>. Stop Bookward and run the offline recovery command below to restore prior accounts, or confirm keeping this new registry.
+							</p>
+						</div>
+						<form method="POST" action="?/dismissIdentityHold" use:enhance={enhanceForm} class="space-y-3 border-t border-warning-500/30 pt-3">
+							<ProfileField profileId={data.user?.profile_id} />
+							<label class="flex min-h-10 cursor-pointer items-center gap-3 text-xs leading-5">
+								<input class="checkbox size-6 shrink-0" type="checkbox" name="confirm" value="KEEP" required />
+								<span>Keep this current account registry and resume scheduled identity backups.</span>
+							</label>
+							<button class="btn btn-sm btn-reflow min-h-10 preset-filled-warning-500" type="submit">Keep current account registry &amp; resume backups</button>
+						</form>
+					{:else}
+						<div>
+							<p class="font-semibold">Scheduled identity backups paused — recovery hold status could not be read</p>
+							<p class="mt-1">
+								Bookward could not read recovery-hold status from the account registry, so scheduled identity snapshots and retention pruning are paused to protect existing snapshots until registry access recovers.
+							</p>
+						</div>
+					{/if}
+				</div>
+			{/if}
 			{#if backup.last_success_at}
-				<p class="mt-2 text-sm">Last successful backup <time datetime={backup.last_success_at}>{backupTime.format(new Date(backup.last_success_at))} UTC</time></p>
+				<p class="mt-3 text-sm">Last successful backup <time datetime={backup.last_success_at}>{backupTime.format(new Date(backup.last_success_at))} UTC</time></p>
 			{/if}
 			{#if backup.last_restore_at}
 				<p class="mt-2 text-sm">Last restore <time datetime={backup.last_restore_at}>{backupTime.format(new Date(backup.last_restore_at))} UTC</time></p>
+			{/if}
+			{#if backup.backups.length}
+				<div class="mt-4 space-y-3 border border-surface-300-700/50 p-4">
+					<label class="block text-sm font-medium">
+						Snapshot for offline CLI recovery
+						<select
+							class="select mt-2 w-full"
+							name="identityBackupId"
+							value={selectedIdentitySnapshot}
+							onchange={(event) => (selectedSnapshotOverride = (event.currentTarget as HTMLSelectElement).value)}
+						>
+							{#each backup.backups as item, index (item.id)}
+								<option value={item.id} selected={index === 0}>{backupTime.format(new Date(item.created_at))} UTC · {formatSnapshotSize(item.size_bytes)} · {item.id}</option>
+							{/each}
+						</select>
+					</label>
+					<p class="text-xs text-surface-700-300">Stop the engine before restoring the account registry:</p>
+					<pre class="overflow-x-auto rounded-lg bg-surface-950/10 p-3 text-xs"><code>docker compose run --rm engine python -m afterword_engine.auth_admin restore {selectedIdentitySnapshot} --confirm</code></pre>
+				</div>
 			{/if}
 			{#if backup.last_error}
 				<p class="mt-3 p-3 preset-tonal-error" role="alert">
