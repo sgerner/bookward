@@ -90,7 +90,7 @@ const SAFE_EXACT_5XX_MESSAGES = new Set([
 ]);
 
 const SAFE_INTEGRATION_502_PREFIX =
-  /^(?:Librarr (?:request|search|download) failed:|Unable to fetch models\.dev catalog:|The SSO provider\b|Google Books preview failed:)/;
+  /^(?:Librarr (?:request|search|download) failed:|Unable to fetch models\.dev catalog:|The SSO provider\b|Google Books preview failed:|LLM connection (?:check|test|verification) failed:)/;
 
 /**
  * Scrubs upstream error payloads before returning them to browsers or `/api/v1`
@@ -100,7 +100,8 @@ const SAFE_INTEGRATION_502_PREFIX =
  *   exception strings, proxy gateway messages, or upstream hostnames never leak
  *   through; only explicit user-facing recovery/config messages and `502`
  *   third-party integration prefixes (Librarr, models.dev, OIDC discovery,
- *   Google Books) are preserved when free of internal leaks.
+ *   Google Books, LLM reranker connection probes) are preserved when free of
+ *   internal leaks.
  * - `status < 500` preserves user-actionable validation/auth messages after
  *   redacting configured secrets, API/Bearer tokens, and URL credentials, while
  *   replacing stack traces, driver/OS exception names, and local filesystem

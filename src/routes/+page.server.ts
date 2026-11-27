@@ -136,10 +136,16 @@ type Overview = {
     digest: DigestSettings;
     llm_rerank?: {
       enabled: boolean;
+      mode?: string;
       provider: string;
       api_url: string;
       model: string;
       api_key_set: boolean;
+      last_status?: string;
+      last_error?: string;
+      last_attempt_at?: string;
+      last_success_at?: string;
+      cooldown_until?: string;
     };
     api_tokens: Array<{
       id: number;
@@ -331,6 +337,21 @@ export const load: PageServerLoad = async ({ url, locals }) => {
       librar_url: overview.settings.librarr_url,
       librar_connected: overview.settings.librarr_api_key_set ? 1 : 0,
       ...overview.settings,
+      llm_rerank: {
+        enabled: overview.settings.llm_rerank?.enabled ?? false,
+        mode: overview.settings.llm_rerank?.mode ?? "",
+        provider: overview.settings.llm_rerank?.provider ?? "",
+        api_url:
+          overview.settings.llm_rerank?.api_url ??
+          "https://api.openai.com/v1/chat/completions",
+        model: overview.settings.llm_rerank?.model ?? "gpt-4o-mini",
+        api_key_set: overview.settings.llm_rerank?.api_key_set ?? false,
+        last_status: overview.settings.llm_rerank?.last_status ?? "",
+        last_error: overview.settings.llm_rerank?.last_error ?? "",
+        last_attempt_at: overview.settings.llm_rerank?.last_attempt_at ?? "",
+        last_success_at: overview.settings.llm_rerank?.last_success_at ?? "",
+        cooldown_until: overview.settings.llm_rerank?.cooldown_until ?? "",
+      },
       source_sync_interval_hours: overview.settings.source_sync_interval_hours ?? 24,
       digest: overview.settings.digest,
       // Keep the UI compatible while an already-running engine is being
@@ -1294,6 +1315,7 @@ export const actions: Actions = {
   configureLlmRerank: async ({ request }) => {
     const data = await request.formData();
     const enabled = data.get("enabled") === "on";
+    const rawMode = data.get("mode");
     const provider = String(data.get("provider") || "").trim();
     const apiUrl = String(data.get("apiUrl") || "").trim();
     const model = String(data.get("model") || "").trim();
@@ -1305,18 +1327,61 @@ export const actions: Actions = {
       });
     }
     try {
-      await engine("/api/settings/llm-rerank", {
-        method: "PUT",
-        body: JSON.stringify({
-          enabled,
-          provider,
-          api_url: apiUrl,
-          model,
-          api_key: apiKey || null,
-          clear_api_key: clearApiKey,
-        }),
+      const response = await engine<{ saved: boolean; checked?: boolean }>(
+        "/api/settings/llm-rerank",
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            enabled,
+            ...(rawMode !== null ? { mode: String(rawMode).trim() } : {}),
+            provider,
+            api_url: apiUrl,
+            model,
+            api_key: apiKey || null,
+            clear_api_key: clearApiKey,
+          }),
+        },
+      );
+      return {
+        message: response.checked
+          ? "LLM reranker settings saved and verified."
+          : "LLM reranker settings saved.",
+      };
+    } catch (error) {
+      return fail(engineStatus(error), { message: message(error) });
+    }
+  },
+  testLlmRerank: async ({ request }) => {
+    const data = await request.formData();
+    const rawMode = data.get("mode");
+    const provider = String(data.get("provider") || "").trim();
+    const apiUrl = String(data.get("apiUrl") || "").trim();
+    const model = String(data.get("model") || "").trim();
+    const apiKey = String(data.get("apiKey") || "").trim();
+    const clearApiKey = data.get("clearApiKey") === "on";
+    if (!apiUrl || !model) {
+      return fail(400, {
+        message: "Select or enter both an LLM API URL and model.",
       });
-      return { message: "LLM reranker settings saved." };
+    }
+    try {
+      const result = await engine<{ ok: boolean; model?: string }>(
+        "/api/settings/llm-rerank/test",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            ...(rawMode !== null ? { mode: String(rawMode).trim() } : {}),
+            provider,
+            api_url: apiUrl,
+            model,
+            api_key: apiKey || null,
+            clear_api_key: clearApiKey,
+          }),
+        },
+      );
+      return {
+        message: `LLM connection verified (${result.model || model}).`,
+      };
     } catch (error) {
       return fail(engineStatus(error), { message: message(error) });
     }

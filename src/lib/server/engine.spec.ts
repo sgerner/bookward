@@ -136,6 +136,21 @@ describe('private engine client', () => {
 			'Google Books preview failed: HTTP 503'
 		);
 		expect(
+			sanitizeEngineMessage('LLM connection check failed: HTTP 401: Incorrect API key [redacted]', 502)
+		).toBe('LLM connection check failed: HTTP 401: Incorrect API key [redacted]');
+		expect(
+			sanitizeEngineMessage('LLM connection test failed: HTTP 401: Incorrect API key [redacted]', 502)
+		).toBe('LLM connection test failed: HTTP 401: Incorrect API key [redacted]');
+		expect(
+			sanitizeEngineMessage('LLM connection verification failed: timed out after 8s', 502)
+		).toBe('LLM connection verification failed: timed out after 8s');
+		expect(
+			sanitizeEngineMessage('LLM connection check failed: sqlite3.OperationalError /var/lib/engine.db', 502)
+		).toBe(ENGINE_UNAVAILABLE_MESSAGE);
+		expect(
+			sanitizeEngineMessage('LLM connection test failed: sqlite3.OperationalError /var/lib/engine.db', 502)
+		).toBe(ENGINE_UNAVAILABLE_MESSAGE);
+		expect(
 			sanitizeEngineMessage('Librarr request failed: FileNotFoundError /var/run/librarr.sock', 502)
 		).toBe(ENGINE_UNAVAILABLE_MESSAGE);
 	});

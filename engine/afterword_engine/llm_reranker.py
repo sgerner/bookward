@@ -4,26 +4,40 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
+import hmac
+import ipaddress
 import json
 import logging
 import math
 import re
+import secrets
 import threading
 import time
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 
 from .config import settings
-from .http_bounds import read_bounded_json_sync
+from .http_bounds import (
+    ERROR_BODY_MAX_BYTES,
+    JSON_CONTENT_TYPES,
+    read_bounded_bytes_sync,
+    read_bounded_json_sync,
+)
 from .identity import ReadIdentityIndex, book_identity, book_row_identity_match_keys
-from .security import safe_error_message, validate_public_url
+from .security import (
+    resolve_public_target,
+    safe_error_message,
+    validate_public_url,
+)
 from .tenancy import current_profile_id, profile_database_path
 
 LOGGER = logging.getLogger(__name__)
+
+LLM_RERANK_MODES: tuple[str, ...] = ("cloud", "ollama", "openai-compatible")
 
 MAX_LLM_TIMEOUT_SECONDS = 25.0
 MIN_LLM_TIMEOUT_SECONDS = 0.001
@@ -33,6 +47,12 @@ CACHE_TTL_SECONDS = 900.0
 MAX_CACHE_ENTRIES_PER_PROFILE = 32
 MAX_CACHED_PROFILES = 128
 MAX_DISLIKED_READS = 8
+LLM_CIRCUIT_COOLDOWN_SECONDS = 300.0
+
+_KEY_FINGERPRINT_SALT = secrets.token_bytes(16)
+_SAFE_LLM_PATH_RE = re.compile(r"^/[A-Za-z0-9._~:/=-]*$")
+_SAFE_LLM_QUERY_RE = re.compile(r"^[A-Za-z0-9._~:/?@!$&'()*+,;=%-]*$")
+_BARE_OPEN_LIBRARY_WORK = re.compile(r"^OL\d+W$", re.IGNORECASE)
 
 _DECISION_EVENT_TYPES = frozenset(
     {"save", "reject", "librarr_import", "maybe_later", "restore", "undo", "read"}
@@ -42,6 +62,485 @@ _RERANK_CACHE_LOCK = threading.Lock()
 _RERANK_CACHE_BY_PROFILE: OrderedDict[
     str, OrderedDict[str, tuple[float, str, list[dict[str, Any]]]]
 ] = OrderedDict()
+
+_STATE_LOCK = threading.Lock()
+_CIRCUIT_BREAKER: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_LAST_ERROR = threading.local()
+
+
+def last_rerank_error() -> str:
+    """Return the credential-redacted error recorded by the latest fallback on this thread."""
+    return str(getattr(_LAST_ERROR, "message", "") or "")
+
+
+def _set_last_rerank_error(message: str) -> None:
+    _LAST_ERROR.message = message
+
+
+def current_llm_profile_key() -> str:
+    """Return an isolated per-profile circuit-breaker scope key."""
+    profile = current_profile_id() or "legacy"
+    try:
+        db_path = str(profile_database_path())
+    except Exception:
+        db_path = settings.db
+    return f"{profile}::{db_path}"
+
+
+def _profile_cache_scope(profile_id: str | None = None) -> str:
+    explicit = (profile_id or "").strip()
+    if explicit:
+        return f"profile:{explicit}"
+    active = current_profile_id()
+    if active:
+        return f"profile:{active}"
+    return f"db:{profile_database_path()}"
+
+
+def normalize_llm_rerank_mode(
+    value: str | None,
+    *,
+    allow_blank: bool = True,
+) -> str:
+    """Validate and normalize an LLM reranker mode against ``LLM_RERANK_MODES``."""
+    if value is None:
+        return "" if allow_blank else "cloud"
+    cleaned = str(value).strip().lower()
+    if not cleaned:
+        return "" if allow_blank else "cloud"
+    if cleaned not in LLM_RERANK_MODES:
+        allowed = ", ".join(LLM_RERANK_MODES)
+        raise ValueError(
+            f"Unsupported LLM reranker mode {cleaned!r}; expected one of: {allowed}"
+        )
+    return cleaned
+
+
+def llm_rerank_allowed_hosts(raw: str | None = None) -> set[str]:
+    source = settings.llm_rerank_allowed_hosts if raw is None else raw
+    return {
+        host.strip().lower().strip("[]").rstrip(".")
+        for host in str(source or "").split(",")
+        if host.strip()
+    }
+
+
+llm_allowed_hosts = llm_rerank_allowed_hosts
+
+
+def _normalize_chat_url(url: str) -> str:
+    """Normalize an OpenAI-compatible base or chat-completions endpoint URL."""
+    cleaned = url.strip()
+    if not cleaned:
+        return ""
+    if "?" in cleaned or "#" in cleaned:
+        parts = urlsplit(cleaned)
+        norm_path = parts.path.rstrip("/")
+        if norm_path.endswith("/chat/completions"):
+            pass
+        elif norm_path.endswith(("/v1", "/openai")):
+            norm_path = f"{norm_path}/chat/completions"
+        return urlunsplit((parts.scheme, parts.netloc, norm_path, parts.query, ""))
+    cleaned = cleaned.rstrip("/")
+    if not cleaned:
+        return ""
+    if cleaned.endswith("/chat/completions"):
+        return cleaned
+    if cleaned.endswith(("/v1", "/openai")):
+        return f"{cleaned}/chat/completions"
+    return cleaned
+
+
+def normalized_llm_origin(url: str) -> str:
+    """Return canonical scheme://host[:non_default_port] for credential-reuse checks."""
+    cleaned = _normalize_chat_url(str(url or "").strip())
+    if not cleaned:
+        return ""
+    parsed = urlparse(cleaned)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if scheme not in {"http", "https"} or not host:
+        return ""
+    if parsed.username or parsed.password:
+        return ""
+    default_port = 443 if scheme == "https" else 80
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    formatted_host = f"[{host}]" if ":" in host else host
+    port_suffix = f":{port}" if port is not None and port != default_port else ""
+    return f"{scheme}://{formatted_host}{port_suffix}"
+
+
+def canonical_llm_url(url: str) -> str:
+    """Return canonical scheme://host[:non_default_port]/normalized-chat-path[?query]."""
+    origin = normalized_llm_origin(url)
+    if not origin:
+        return ""
+    normalized = _normalize_chat_url(str(url or "").strip())
+    parsed = urlparse(normalized)
+    path = parsed.path or "/"
+    query_suffix = f"?{parsed.query}" if parsed.query else ""
+    return f"{origin}{path}{query_suffix}"
+
+
+def is_custom_llm_endpoint(api_url: str | None) -> bool:
+    """Return whether ``api_url`` points to a non-default custom LLM endpoint."""
+    raw = str(api_url or "").strip()
+    if not raw:
+        return False
+    canonical_target = canonical_llm_url(raw)
+    canonical_default = canonical_llm_url(settings.llm_rerank_api_url or "")
+    if canonical_target and canonical_default:
+        return canonical_target != canonical_default
+    return _normalize_chat_url(raw) != _normalize_chat_url(
+        settings.llm_rerank_api_url or ""
+    )
+
+
+def resolve_llm_rerank_credentials(
+    api_url: str | None,
+    profile_api_key: str | None,
+) -> tuple[str, str]:
+    """Resolve ``(effective_api_url, effective_api_key)`` under one shared rule.
+
+    A non-empty profile API key always takes precedence. Otherwise, the host
+    environment key (``settings.llm_rerank_api_key``) is used only when the
+    endpoint matches ``settings.llm_rerank_api_url`` and is never forwarded to
+    a custom endpoint URL.
+    """
+    cleaned_url = (api_url or "").strip()
+    effective_url = cleaned_url or (settings.llm_rerank_api_url or "").strip()
+    own_key = (profile_api_key or "").strip()
+    if own_key:
+        return effective_url, own_key
+    if is_custom_llm_endpoint(effective_url):
+        # Custom profile URLs must never inherit default host credentials.
+        return effective_url, ""
+    return effective_url, (settings.llm_rerank_api_key or "").strip()
+
+
+def _validate_llm_url_structure(
+    url: str,
+    allowed_hosts: set[str] | None = None,
+    *,
+    has_api_key: bool = True,
+    normalize_chat_path: bool = True,
+) -> tuple[str, str, str, set[str]]:
+    cleaned = str(url or "").strip()
+    if not cleaned:
+        raise ValueError("LLM API URL is required")
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("LLM API URL must use HTTP or HTTPS")
+    if parsed.username or parsed.password:
+        raise ValueError("LLM API URL cannot contain credentials")
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("Invalid LLM API URL port") from exc
+    requested_host = (parsed.hostname or "").lower().rstrip(".")
+    if not requested_host:
+        raise ValueError("LLM API URL must include a hostname")
+    hosts = llm_rerank_allowed_hosts() if allowed_hosts is None else allowed_hosts
+    if parsed.scheme == "http" and has_api_key and requested_host not in hosts:
+        raise ValueError(
+            "LLM API URL must use HTTPS when an API key is configured unless the host is allowlisted"
+        )
+    if normalize_chat_path:
+        normalized = _normalize_chat_url(cleaned)
+    else:
+        parts = urlsplit(cleaned)
+        normalized = urlunsplit(
+            (parts.scheme, parts.netloc, parts.path or "/", parts.query, "")
+        )
+    norm_parsed = urlparse(normalized)
+    norm_path = norm_parsed.path or "/"
+    if ".." in norm_path.split("/") or not _SAFE_LLM_PATH_RE.fullmatch(norm_path):
+        raise ValueError("LLM API URL contains an invalid path")
+    if norm_parsed.query and not _SAFE_LLM_QUERY_RE.fullmatch(norm_parsed.query):
+        raise ValueError("LLM API URL contains invalid query characters")
+    return cleaned, normalized, requested_host, hosts
+
+
+def validate_llm_api_url(
+    url: str,
+    allowed_hosts: set[str] | None = None,
+    *,
+    has_api_key: bool = True,
+) -> str:
+    """Validate an LLM endpoint URL against SSRF and HTTPS guards and normalize its chat path."""
+    cleaned, normalized, requested_host, hosts = _validate_llm_url_structure(
+        url, allowed_hosts=allowed_hosts, has_api_key=has_api_key
+    )
+    parsed = urlparse(cleaned)
+    if requested_host not in hosts:
+        validate_public_url(
+            cleaned,
+            allow_http=(parsed.scheme == "http" and not has_api_key),
+        )
+    return normalized
+
+
+def _prepare_llm_request_target(
+    url: str,
+    allowed_hosts: set[str] | None = None,
+    *,
+    has_api_key: bool = True,
+    normalize_chat_path: bool = True,
+) -> tuple[str, dict[str, str], dict[str, str] | None]:
+    """Validate and pin an outbound LLM endpoint URL against SSRF, cleartext credential use, and DNS rebinding."""
+    _cleaned, normalized, requested_host, hosts = _validate_llm_url_structure(
+        url,
+        allowed_hosts=allowed_hosts,
+        has_api_key=has_api_key,
+        normalize_chat_path=normalize_chat_path,
+    )
+    parsed = urlparse(normalized)
+    if parsed.scheme == "https":
+        scheme = "https"
+        default_port = 443
+    elif parsed.scheme == "http":
+        scheme = "http"
+        default_port = 80
+    else:
+        raise ValueError("LLM API URL must use HTTP or HTTPS")
+
+    port = parsed.port
+    port_suffix = ""
+    if port is not None and port != default_port:
+        port_str = str(port)
+        if not port_str.isdigit():
+            raise ValueError("Invalid LLM API URL port")
+        port_suffix = f":{port_str}"
+
+    raw_path = parsed.path or "/"
+    if ".." in raw_path.split("/") or not _SAFE_LLM_PATH_RE.fullmatch(raw_path):
+        raise ValueError("LLM API URL contains an invalid path")
+
+    raw_query = parsed.query
+    if raw_query and not _SAFE_LLM_QUERY_RE.fullmatch(raw_query):
+        raise ValueError("LLM API URL contains invalid query characters")
+    query_suffix = f"?{raw_query}" if raw_query else ""
+
+    matched_allowed: str | None = None
+    for allowed_host in hosts:
+        if allowed_host and requested_host == allowed_host:
+            matched_allowed = allowed_host
+            break
+
+    if matched_allowed is not None:
+        connect_host = (
+            f"[{matched_allowed}]" if ":" in matched_allowed else matched_allowed
+        )
+        return (
+            f"{scheme}://{connect_host}{port_suffix}{raw_path}{query_suffix}",
+            {},
+            None,
+        )
+
+    if scheme == "http" and has_api_key:
+        raise ValueError(
+            "LLM API URL must use HTTPS when an API key is configured unless the host is allowlisted"
+        )
+
+    _, address, resolved_host = resolve_public_target(
+        normalized, allow_http=(scheme == "http" and not has_api_key)
+    )
+    try:
+        ipaddress.ip_address(resolved_host)
+        is_ip_literal = True
+    except ValueError:
+        is_ip_literal = False
+    connect_host = f"[{address}]" if ":" in address else address
+    formatted_host = f"[{resolved_host}]" if ":" in resolved_host else resolved_host
+    host_header = (
+        formatted_host if not port_suffix else f"{formatted_host}{port_suffix}"
+    )
+    extensions = (
+        {"sni_hostname": resolved_host}
+        if scheme == "https" and not is_ip_literal
+        else None
+    )
+    return (
+        f"{scheme}://{connect_host}{port_suffix}{raw_path}{query_suffix}",
+        {"Host": host_header},
+        extensions,
+    )
+
+
+def sanitize_llm_error(error: Any, api_key: str = "", limit: int = 300) -> str:
+    """Return a bounded, credential-redacted error message."""
+    raw = str(error or "").strip() or "Request failed"
+    secret = str(api_key or "").strip()
+    if secret and secret in raw:
+        raw = raw.replace(secret, "[redacted]")
+    redacted = safe_error_message(raw, limit=limit)
+    if secret and secret in redacted:
+        redacted = redacted.replace(secret, "[redacted]")[:limit]
+    return redacted
+
+
+def _derive_api_key_fingerprint(api_key: str) -> str:
+    """Derive a fast, non-reversible HMAC-SHA256 fingerprint using the process salt."""
+    if not api_key:
+        return ""
+    return hmac.digest(
+        api_key.encode("utf-8"),
+        _KEY_FINGERPRINT_SALT,
+        "sha256",
+    )[:16].hex()
+
+
+def _config_fingerprint(
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    top_k: int,
+    max_delta: float,
+    mode: str = "",
+) -> str:
+    try:
+        normalized_mode = normalize_llm_rerank_mode(mode, allow_blank=True)
+    except ValueError:
+        normalized_mode = ""
+    non_secret_payload = json.dumps(
+        {
+            "mode": normalized_mode,
+            "url": canonical_llm_url(api_url) or _normalize_chat_url(api_url),
+            "model": model.strip(),
+            "top_k": int(top_k),
+            "max_delta": round(float(max_delta), 4),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cfg_digest = hashlib.sha256(non_secret_payload.encode("utf-8")).hexdigest()[:24]
+    key_fp = _derive_api_key_fingerprint(api_key)
+    return f"{cfg_digest}:{key_fp}"
+
+
+def get_circuit_breaker_state(
+    profile_key: str,
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    top_k: int | None = None,
+    max_delta: float | None = None,
+    mode: str = "",
+) -> dict[str, Any] | None:
+    now = time.monotonic()
+    with _STATE_LOCK:
+        entry = _CIRCUIT_BREAKER.get(profile_key)
+        if not entry:
+            return None
+        if now >= float(entry.get("open_until") or 0.0):
+            _CIRCUIT_BREAKER.pop(profile_key, None)
+            return None
+    cfg_fp = _config_fingerprint(
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        top_k=settings.llm_rerank_top_k if top_k is None else top_k,
+        max_delta=settings.llm_rerank_max_delta if max_delta is None else max_delta,
+        mode=mode,
+    )
+    now = time.monotonic()
+    with _STATE_LOCK:
+        entry = _CIRCUIT_BREAKER.get(profile_key)
+        if not entry:
+            return None
+        if entry.get("cfg") != cfg_fp or now >= float(entry.get("open_until") or 0.0):
+            _CIRCUIT_BREAKER.pop(profile_key, None)
+            return None
+        _CIRCUIT_BREAKER.move_to_end(profile_key)
+        return dict(entry)
+
+
+def trip_circuit_breaker(
+    profile_key: str,
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    error: str,
+    cooldown_seconds: float = LLM_CIRCUIT_COOLDOWN_SECONDS,
+    top_k: int | None = None,
+    max_delta: float | None = None,
+    mode: str = "",
+) -> dict[str, Any]:
+    cfg_fp = _config_fingerprint(
+        api_url=api_url,
+        api_key=api_key,
+        model=model,
+        top_k=settings.llm_rerank_top_k if top_k is None else top_k,
+        max_delta=settings.llm_rerank_max_delta if max_delta is None else max_delta,
+        mode=mode,
+    )
+    cooldown = max(1.0, float(cooldown_seconds))
+    now_mono = time.monotonic()
+    cooldown_until = (
+        datetime.now(timezone.utc) + timedelta(seconds=cooldown)
+    ).isoformat(timespec="seconds")
+    record = {
+        "cfg": cfg_fp,
+        "open_until": now_mono + cooldown,
+        "cooldown_until": cooldown_until,
+        "error": error,
+    }
+    with _STATE_LOCK:
+        _CIRCUIT_BREAKER[profile_key] = record
+        _CIRCUIT_BREAKER.move_to_end(profile_key)
+        while len(_CIRCUIT_BREAKER) > MAX_CACHED_PROFILES:
+            _CIRCUIT_BREAKER.popitem(last=False)
+    return dict(record)
+
+
+def clear_circuit_breaker(profile_key: str | None = None) -> None:
+    target = current_llm_profile_key() if profile_key is None else profile_key
+    with _STATE_LOCK:
+        _CIRCUIT_BREAKER.pop(target, None)
+
+
+def clear_llm_rerank_cache(profile_id: str | None = None) -> None:
+    """Clear cached LLM rerank entries (and any open circuit-breaker state) globally or for a single profile."""
+    with _RERANK_CACHE_LOCK:
+        if profile_id is None:
+            _RERANK_CACHE_BY_PROFILE.clear()
+        else:
+            _RERANK_CACHE_BY_PROFILE.pop(_profile_cache_scope(profile_id), None)
+    with _STATE_LOCK:
+        if profile_id is None:
+            _CIRCUIT_BREAKER.clear()
+        else:
+            prefix = f"{profile_id.strip()}::"
+            for key in [k for k in _CIRCUIT_BREAKER if k.startswith(prefix)]:
+                _CIRCUIT_BREAKER.pop(key, None)
+
+
+def clear_llm_rerank_state(
+    profile_key: str | None = None,
+    *,
+    clear_all: bool = False,
+) -> None:
+    """Clear cached slates and circuit-breaker state for a profile or globally."""
+    if clear_all:
+        clear_llm_rerank_cache(None)
+        with _STATE_LOCK:
+            _CIRCUIT_BREAKER.clear()
+        return
+    target_breaker = current_llm_profile_key() if profile_key is None else profile_key
+    with _STATE_LOCK:
+        _CIRCUIT_BREAKER.pop(target_breaker, None)
+    if profile_key is None:
+        active_profile = current_profile_id() or "legacy"
+        clear_llm_rerank_cache(active_profile)
+    else:
+        profile_part = profile_key.split("::", 1)[0]
+        clear_llm_rerank_cache(profile_part)
 
 
 def _parse_datetime(value: object) -> datetime | None:
@@ -87,9 +586,6 @@ def _safe_float(value: object) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
-_BARE_OPEN_LIBRARY_WORK = re.compile(r"^OL\d+W$", re.IGNORECASE)
-
-
 def _normalize_ol_work_value(raw: object) -> object:
     if not raw:
         return raw
@@ -113,7 +609,9 @@ def _with_work_identity_fields(item: Mapping[str, Any]) -> dict[str, Any]:
     return projected
 
 
-def _work_match_keys(item: Mapping[str, Any], *, cid: int | None = None) -> set[tuple[str, ...]]:
+def _work_match_keys(
+    item: Mapping[str, Any], *, cid: int | None = None
+) -> set[tuple[str, ...]]:
     projected = _with_work_identity_fields(item)
     keys = set(book_row_identity_match_keys(projected))
     if not keys:
@@ -144,7 +642,9 @@ def _parse_genres(raw_genres: object, *, limit: int = 4) -> list[str]:
     return result
 
 
-def _event_chronological_key(seq_index: int, event: Mapping[str, Any]) -> tuple[int, float, int, int]:
+def _event_chronological_key(
+    seq_index: int, event: Mapping[str, Any]
+) -> tuple[int, float, int, int]:
     occurred = _parse_datetime(event.get("occurred_at") or event.get("created_at"))
     has_ts = 1 if occurred is not None else 0
     ts = occurred.timestamp() if occurred is not None else float("-inf")
@@ -152,7 +652,9 @@ def _event_chronological_key(seq_index: int, event: Mapping[str, Any]) -> tuple[
     return (has_ts, ts, event_id, seq_index)
 
 
-def _read_recency_key(seq_index: int, read_item: Mapping[str, Any]) -> tuple[int, float, int, int]:
+def _read_recency_key(
+    seq_index: int, read_item: Mapping[str, Any]
+) -> tuple[int, float, int, int]:
     read_dt = _parse_datetime(read_item.get("read_at")) or _parse_datetime(
         read_item.get("created_at")
     )
@@ -175,7 +677,9 @@ def _resolve_active_discovery_decisions(
             continue
         if raw.get("undone_at") or raw.get("undone"):
             continue
-        event_type = str(raw.get("event_type") or raw.get("action") or "").strip().casefold()
+        event_type = (
+            str(raw.get("event_type") or raw.get("action") or "").strip().casefold()
+        )
         if event_type not in _DECISION_EVENT_TYPES:
             continue
         indexed_events.append((_event_chronological_key(seq_idx, raw), dict(raw)))
@@ -185,7 +689,9 @@ def _resolve_active_discovery_decisions(
 
     work_records: list[dict[str, Any]] = []
     for order_key, event in indexed_events:
-        event_type = str(event.get("event_type") or event.get("action") or "").strip().casefold()
+        event_type = (
+            str(event.get("event_type") or event.get("action") or "").strip().casefold()
+        )
         cid_raw = event.get("candidate_id")
         cid = _safe_int(cid_raw, -1) if cid_raw is not None else -1
         title = " ".join(str(event.get("title") or "").split())[:120].strip()
@@ -404,7 +910,7 @@ def _build_rerank_prompt_data(
         "- Emit non-zero `delta` values only when directly supported by this profile's history, with a "
         "concise grounded reason.\n\n"
         "Return strict JSON:\n"
-        "{\"adjustments\": [{\"id\": <int>, \"delta\": <float>, \"reason\": <short string>}]}"
+        '{"adjustments": [{"id": <int>, "delta": <float>, "reason": <short string>}]}'
     )
 
     messages = [
@@ -419,6 +925,9 @@ def _build_rerank_prompt_data(
         + len(rejected_discovery)
     )
     return messages, user_payload, evidence_count
+
+
+_DEFAULT_PROMPT_DATA_FN = _build_rerank_prompt_data
 
 
 def build_rerank_prompt(
@@ -609,49 +1118,6 @@ def apply_llm_rerank_order(
     }
 
 
-def _normalize_chat_url(url: str) -> str:
-    """Normalize an OpenAI-compatible base or chat-completions endpoint URL."""
-    cleaned = url.strip().rstrip("/")
-    if not cleaned:
-        return ""
-    if cleaned.endswith("/chat/completions"):
-        return cleaned
-    if cleaned.endswith(("/v1", "/openai")):
-        return f"{cleaned}/chat/completions"
-    return cleaned
-
-
-def is_custom_llm_endpoint(api_url: str | None) -> bool:
-    """Return whether ``api_url`` points to a non-default custom LLM endpoint."""
-    normalized = _normalize_chat_url(api_url or "")
-    if not normalized:
-        return False
-    host_default = _normalize_chat_url(settings.llm_rerank_api_url or "")
-    return normalized != host_default
-
-
-def resolve_llm_rerank_credentials(
-    api_url: str | None,
-    profile_api_key: str | None,
-) -> tuple[str, str]:
-    """Resolve ``(effective_api_url, effective_api_key)`` under one shared rule.
-
-    A non-empty profile API key always takes precedence. Otherwise, the host
-    environment key (``settings.llm_rerank_api_key``) is used only when the
-    endpoint matches ``settings.llm_rerank_api_url`` and is never forwarded to
-    a custom endpoint URL.
-    """
-    cleaned_url = (api_url or "").strip()
-    effective_url = cleaned_url or (settings.llm_rerank_api_url or "").strip()
-    own_key = (profile_api_key or "").strip()
-    if own_key:
-        return effective_url, own_key
-    if is_custom_llm_endpoint(effective_url):
-        # Custom profile URLs must never inherit default host credentials.
-        return effective_url, ""
-    return effective_url, (settings.llm_rerank_api_key or "").strip()
-
-
 def _bounded_timeout(timeout_seconds: float | None) -> float:
     raw = (
         timeout_seconds
@@ -662,16 +1128,6 @@ def _bounded_timeout(timeout_seconds: float | None) -> float:
     if parsed is None or parsed <= 0:
         parsed = MAX_LLM_TIMEOUT_SECONDS
     return max(MIN_LLM_TIMEOUT_SECONDS, min(MAX_LLM_TIMEOUT_SECONDS, parsed))
-
-
-def _profile_cache_scope(profile_id: str | None = None) -> str:
-    explicit = (profile_id or "").strip()
-    if explicit:
-        return f"profile:{explicit}"
-    active = current_profile_id()
-    if active:
-        return f"profile:{active}"
-    return f"db:{profile_database_path()}"
 
 
 def _build_cache_key(
@@ -685,6 +1141,7 @@ def _build_cache_key(
     candidates: Sequence[Mapping[str, Any]],
     reads: Sequence[Mapping[str, Any]],
     interaction_events: Sequence[Mapping[str, Any]] | None,
+    mode: str = "",
 ) -> str:
     slate_fp = [
         (
@@ -716,9 +1173,9 @@ def _build_cache_key(
         )
         for d in _resolve_active_discovery_decisions(interaction_events)
     ]
-    material = {
+    material: dict[str, Any] = {
         "profile_scope": profile_scope,
-        "url": url,
+        "url": canonical_llm_url(url) or _normalize_chat_url(url),
         "model": model,
         "top_k": int(top_k),
         "max_delta": round(float(max_delta), 4),
@@ -727,7 +1184,15 @@ def _build_cache_key(
         "reads": reads_fp,
         "feedback": active_fp,
     }
-    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    try:
+        cleaned_mode = normalize_llm_rerank_mode(mode, allow_blank=True)
+    except ValueError:
+        cleaned_mode = ""
+    if cleaned_mode:
+        material["mode"] = cleaned_mode
+    encoded = json.dumps(
+        material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -767,7 +1232,6 @@ def _cache_put(
     now = time.monotonic()
     stored_items = [dict(item) for item in items if isinstance(item, Mapping)]
     with _RERANK_CACHE_LOCK:
-        # Prune empty/expired buckets before enforcing profile cap.
         for scope in list(_RERANK_CACHE_BY_PROFILE.keys()):
             b = _RERANK_CACHE_BY_PROFILE[scope]
             for k in [key for key, (exp, _kd, _it) in b.items() if exp <= now]:
@@ -790,15 +1254,6 @@ def _cache_put(
             bucket.popitem(last=False)
 
 
-def clear_llm_rerank_cache(profile_id: str | None = None) -> None:
-    """Clear cached LLM rerank entries globally or for a single profile."""
-    with _RERANK_CACHE_LOCK:
-        if profile_id is None:
-            _RERANK_CACHE_BY_PROFILE.clear()
-        else:
-            _RERANK_CACHE_BY_PROFILE.pop(_profile_cache_scope(profile_id), None)
-
-
 def _url_origin(url: str) -> tuple[str, str, int]:
     parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
@@ -807,22 +1262,76 @@ def _url_origin(url: str) -> tuple[str, str, int]:
     return scheme, host, port
 
 
-def _validate_redirect_target(origin_url: str, status_code: int, location: str) -> str:
+def _validate_redirect_target(
+    origin_url: str,
+    status_code: int,
+    location: str,
+    allowed_hosts: set[str] | None = None,
+    *,
+    has_api_key: bool = True,
+    resolve_dns: bool = True,
+) -> str:
     if not location:
         raise ValueError("LLM endpoint returned a redirect without a Location header")
     target = urljoin(origin_url, location)
     parsed = urlparse(target)
+    origin_scheme, _origin_host, _origin_port = _url_origin(origin_url)
     if (
-        parsed.scheme.lower() != "https"
+        parsed.scheme.lower() != origin_scheme
         or parsed.username
         or parsed.password
         or _url_origin(target) != _url_origin(origin_url)
     ):
         raise ValueError("Cross-origin redirects are not allowed for LLM requests")
     if status_code not in {307, 308}:
-        raise ValueError("Method-changing redirects are not allowed for LLM POST requests")
-    validate_public_url(target)
-    return target
+        raise ValueError(
+            "Method-changing redirects are not allowed for LLM POST requests"
+        )
+    _cleaned, normalized, requested_host, hosts = _validate_llm_url_structure(
+        target,
+        allowed_hosts=allowed_hosts,
+        has_api_key=has_api_key,
+        normalize_chat_path=False,
+    )
+    if resolve_dns and requested_host not in hosts:
+        validate_public_url(
+            normalized,
+            allow_http=(parsed.scheme == "http" and not has_api_key),
+        )
+    return normalized
+
+
+def _build_llm_post_request(
+    client: httpx.Client,
+    target_url: str,
+    *,
+    headers: dict[str, str],
+    json_body: dict[str, Any],
+    extensions: dict[str, str] | None,
+) -> Any:
+    request_kwargs: dict[str, Any] = {
+        "headers": headers,
+        "json": json_body,
+    }
+    if extensions:
+        try:
+            return client.build_request(
+                "POST",
+                target_url,
+                extensions=extensions,
+                **request_kwargs,
+            )
+        except TypeError:
+            return client.build_request(
+                "POST",
+                target_url,
+                **request_kwargs,
+            )
+    return client.build_request(
+        "POST",
+        target_url,
+        **request_kwargs,
+    )
 
 
 def _apply_parsed_payload(
@@ -845,17 +1354,221 @@ def _apply_parsed_payload(
     return reranked, {**diag, "cached": cached}
 
 
+def _extract_response_content(response: Any) -> dict[str, Any]:
+    status_code = int(getattr(response, "status_code", 200))
+    if 300 <= status_code < 400 or getattr(response, "is_redirect", False):
+        raise ValueError("Redirects are not allowed for the LLM endpoint")
+    if status_code >= 400:
+        detail = ""
+        try:
+            error_cap = min(settings.llm_rerank_max_bytes, ERROR_BODY_MAX_BYTES)
+            if error_cap > 0:
+                err_raw = read_bounded_bytes_sync(
+                    response,
+                    max_bytes=error_cap,
+                    allowed_content_types=JSON_CONTENT_TYPES,
+                    allow_missing_content_type=True,
+                )
+                err_body = json.loads(err_raw) if err_raw.strip() else None
+                if isinstance(err_body, Mapping):
+                    raw_err = err_body.get("error")
+                    if isinstance(raw_err, Mapping):
+                        detail = str(raw_err.get("message") or "").strip()
+                    elif isinstance(raw_err, str):
+                        detail = raw_err.strip()
+        except Exception:
+            detail = ""
+        if detail:
+            raise ValueError(f"HTTP {status_code}: {detail}")
+        response.raise_for_status()
+    else:
+        response.raise_for_status()
+
+    payload = read_bounded_json_sync(
+        response,
+        max_bytes=settings.llm_rerank_max_bytes,
+        size_error="LLM reranker response is too large",
+    )
+    if not isinstance(payload, Mapping):
+        raise ValueError("LLM endpoint returned a non-JSON-object response")
+    choices = payload.get("choices")
+    if (
+        not isinstance(choices, list)
+        or not choices
+        or not isinstance(choices[0], Mapping)
+    ):
+        raise ValueError("LLM endpoint returned no completion choices")
+    message = choices[0].get("message")
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("LLM endpoint returned an empty completion message")
+    parsed = json.loads(content)
+    if not isinstance(parsed, Mapping):
+        raise ValueError("LLM completion content must be a JSON object")
+    return dict(parsed)
+
+
 def _extract_response_payload(parsed: Any) -> tuple[str, list[dict[str, Any]]]:
     if not isinstance(parsed, Mapping):
         raise ValueError("LLM response JSON must be an object")
     if "adjustments" in parsed and isinstance(parsed["adjustments"], list):
         return "adjustments", [
-            dict(entry) for entry in parsed["adjustments"] if isinstance(entry, Mapping)
+            dict(entry)
+            for entry in parsed["adjustments"]
+            if isinstance(entry, Mapping)
         ]
     rankings = parsed.get("rankings")
     if isinstance(rankings, list):
-        return "rankings", [dict(entry) for entry in rankings if isinstance(entry, Mapping)]
-    return "rankings", []
+        return "rankings", [
+            dict(entry) for entry in rankings if isinstance(entry, Mapping)
+        ]
+    raise ValueError("LLM completion JSON did not contain adjustments or rankings")
+
+
+def probe_llm_reranker(
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    timeout_seconds: float | None = None,
+    allowed_hosts: set[str] | None = None,
+) -> dict[str, Any]:
+    """Send a lightweight JSON probe synchronously to verify live LLM endpoint connectivity and credentials."""
+    key = str(api_key or "").strip()
+    chosen_model = str(model or "").strip()
+    if not key:
+        raise ValueError("An API key is required to test the LLM reranker")
+    if not chosen_model:
+        raise ValueError("A model is required to test the LLM reranker")
+    target_url, host_headers, extensions = _prepare_llm_request_target(
+        api_url, allowed_hosts=allowed_hosts, has_api_key=bool(key)
+    )
+    timeout = _bounded_timeout(timeout_seconds)
+    probe_messages = [
+        {
+            "role": "system",
+            "content": 'Connection check. Return strict JSON: {"adjustments": []}',
+        },
+        {
+            "role": "user",
+            "content": '{"candidates": []}',
+        },
+    ]
+    request_headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        **host_headers,
+    }
+    request_json = {
+        "model": chosen_model,
+        "temperature": 0.0,
+        "response_format": {"type": "json_object"},
+        "messages": probe_messages,
+    }
+    try:
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            request = _build_llm_post_request(
+                client,
+                target_url,
+                headers=request_headers,
+                json_body=request_json,
+                extensions=extensions,
+            )
+            response = client.send(request, stream=True)
+            try:
+                parsed = _extract_response_content(response)
+                _extract_response_payload(parsed)
+            finally:
+                response.close()
+    except Exception as exc:
+        raise RuntimeError(sanitize_llm_error(exc, api_key=key)) from exc
+    return {"ok": True, "checked": True, "model": chosen_model}
+
+
+def try_cached_rerank(
+    reads: Sequence[dict[str, Any]],
+    candidates: Sequence[dict[str, Any]],
+    *,
+    interaction_events: Sequence[dict[str, Any]] | None = None,
+    profile_id: str | None = None,
+    api_url: str | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
+    top_k: int | None = None,
+    max_delta: float | None = None,
+    mode: str = "",
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    """Return a cached or non-network rerank result when no live HTTP call is needed."""
+    if (
+        rerank_with_llm_sync is not _DEFAULT_RERANK_SYNC_FN
+        or _build_rerank_prompt_data is not _DEFAULT_PROMPT_DATA_FN
+    ):
+        return None
+    safe_candidates = [dict(c) for c in candidates]
+    if api_key is None:
+        resolved_url, key = resolve_llm_rerank_credentials(api_url, None)
+    else:
+        resolved_url = (
+            api_url.strip()
+            if api_url is not None and api_url.strip()
+            else (settings.llm_rerank_api_url or "").strip()
+        )
+        key = api_key.strip()
+    url = _normalize_chat_url(resolved_url)
+    chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
+    k = top_k if top_k is not None else settings.llm_rerank_top_k
+    delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta
+
+    if not key or not url or not chosen_model or len(safe_candidates) < 2:
+        return safe_candidates, {"applied": False, "reason": "not_configured"}
+
+    try:
+        messages, _payload, evidence_count = _build_rerank_prompt_data(
+            reads,
+            safe_candidates,
+            interaction_events=interaction_events,
+            top_k=k,
+            max_delta=delta,
+        )
+    except Exception:
+        return None
+
+    if evidence_count == 0:
+        return safe_candidates, {
+            "applied": False,
+            "adjusted_count": 0,
+            "reason": "insufficient_evidence",
+        }
+
+    scope = _profile_cache_scope(profile_id)
+    cache_key = _build_cache_key(
+        profile_scope=scope,
+        url=url,
+        model=chosen_model,
+        top_k=k,
+        max_delta=delta,
+        messages=messages,
+        candidates=safe_candidates,
+        reads=reads,
+        interaction_events=interaction_events,
+        mode=mode,
+    )
+    cached_hit = _cache_get(scope, cache_key)
+    if cached_hit is None:
+        return None
+    kind, payload_items = cached_hit
+    return _apply_parsed_payload(
+        safe_candidates,
+        kind,
+        payload_items,
+        top_k=k,
+        max_delta=delta,
+        cached=True,
+    )
 
 
 def rerank_with_llm_sync(
@@ -870,9 +1583,13 @@ def rerank_with_llm_sync(
     top_k: int | None = None,
     max_delta: float | None = None,
     timeout_seconds: float | None = None,
+    allowed_hosts: set[str] | None = None,
+    mode: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Call the configured OpenAI-compatible LLM endpoint synchronously and rerank top-K candidates."""
+    _set_last_rerank_error("")
     safe_candidates = [dict(c) for c in candidates]
+    key = ""
     try:
         if api_key is None:
             resolved_url, key = resolve_llm_rerank_credentials(api_url, None)
@@ -883,14 +1600,20 @@ def rerank_with_llm_sync(
                 else (settings.llm_rerank_api_url or "").strip()
             )
             key = api_key.strip()
-        url = _normalize_chat_url(resolved_url)
-        chosen_model = (model if model is not None else settings.llm_rerank_model).strip()
+        chosen_model = (
+            model if model is not None else settings.llm_rerank_model
+        ).strip()
         k = top_k if top_k is not None else settings.llm_rerank_top_k
         delta = max_delta if max_delta is not None else settings.llm_rerank_max_delta
         timeout = _bounded_timeout(timeout_seconds)
 
-        if not key or not url or not chosen_model or len(safe_candidates) < 2:
+        if not key or not resolved_url or not chosen_model or len(safe_candidates) < 2:
             return safe_candidates, {"applied": False, "reason": "not_configured"}
+
+        target_url, host_headers, extensions = _prepare_llm_request_target(
+            resolved_url, allowed_hosts=allowed_hosts, has_api_key=bool(key)
+        )
+        url = _normalize_chat_url(resolved_url)
 
         messages, _payload, evidence_count = _build_rerank_prompt_data(
             reads,
@@ -917,6 +1640,7 @@ def rerank_with_llm_sync(
             candidates=safe_candidates,
             reads=reads,
             interaction_events=interaction_events,
+            mode=mode,
         )
         cached_hit = _cache_get(scope, cache_key)
         if cached_hit is not None:
@@ -941,39 +1665,50 @@ def rerank_with_llm_sync(
             "Content-Type": "application/json",
         }
 
-        validate_public_url(url)
         current_url = url
-        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-            payload: Any = None
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            parsed: dict[str, Any] | None = None
             for _hop in range(MAX_SAME_ORIGIN_REDIRECTS + 1):
-                request = client.build_request(
-                    "POST",
-                    current_url,
-                    headers=headers,
-                    json=request_body,
+                request = _build_llm_post_request(
+                    client,
+                    target_url,
+                    headers={**headers, **host_headers},
+                    json_body=request_body,
+                    extensions=extensions,
                 )
                 response = client.send(request, stream=True)
                 try:
-                    if 300 <= response.status_code < 400:
+                    if 300 <= int(getattr(response, "status_code", 200)) < 400:
                         current_url = _validate_redirect_target(
-                            url,
-                            response.status_code,
+                            current_url,
+                            int(response.status_code),
                             response.headers.get("location", "").strip(),
+                            allowed_hosts=allowed_hosts,
+                            has_api_key=bool(key),
+                            resolve_dns=False,
+                        )
+                        if _hop >= MAX_SAME_ORIGIN_REDIRECTS:
+                            raise ValueError("Too many redirects from LLM endpoint")
+                        target_url, host_headers, extensions = (
+                            _prepare_llm_request_target(
+                                current_url,
+                                allowed_hosts=allowed_hosts,
+                                has_api_key=bool(key),
+                                normalize_chat_path=False,
+                            )
                         )
                         continue
-                    response.raise_for_status()
-                    payload = read_bounded_json_sync(
-                        response,
-                        max_bytes=settings.llm_rerank_max_bytes,
-                        size_error="LLM reranker response is too large",
-                    )
+                    parsed = _extract_response_content(response)
                     break
                 finally:
                     response.close()
             else:
                 raise ValueError("Too many redirects from LLM endpoint")
-            content = payload["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
+            assert parsed is not None
             kind, payload_items = _extract_response_payload(parsed)
             reranked, diag = _apply_parsed_payload(
                 safe_candidates,
@@ -987,8 +1722,13 @@ def rerank_with_llm_sync(
                 _cache_put(scope, cache_key, kind, payload_items)
             return reranked, diag
     except Exception as exc:
-        LOGGER.warning(
-            "LLM reranker failed; falling back to base order: %s",
-            safe_error_message(exc),
-        )
-        return [dict(c) for c in safe_candidates], {"applied": False, "reason": "fallback"}
+        err = sanitize_llm_error(exc, api_key=key)
+        _set_last_rerank_error(err)
+        LOGGER.warning("LLM reranker failed; falling back to base order: %s", err)
+        return [dict(c) for c in safe_candidates], {
+            "applied": False,
+            "reason": "fallback",
+        }
+
+
+_DEFAULT_RERANK_SYNC_FN = rerank_with_llm_sync

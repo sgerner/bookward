@@ -316,6 +316,7 @@ Copy `.env.example` to `.env` for Docker, or export variables in the shell for a
 | `RETENTION_ENABLED` | Default for scheduled background pruning of aged unattributed telemetry, dismissed/stale embeddings, and terminal operational rows (`AFTERWORD_RETENTION_ENABLED` for local engine runs); defaults conservatively to `false` and can be toggled per profile in Settings. |
 | `EVIDENCE_ROTATION_ENABLED` | Default for rotating unreferenced scoring batches and oldest unattributed replay snapshots when the 512 MiB evidence budget crosses 80% (`AFTERWORD_EVIDENCE_ROTATION_ENABLED` for local engine runs); defaults conservatively to `false` and can be toggled per profile in Settings. |
 | `LIBRARR_ALLOWED_HOSTS` | Comma-separated private hostnames allowed to receive the Librarr API key. |
+| `LLM_RERANK_ALLOWED_HOSTS` | Optional comma-separated local runtime hostnames explicitly opted in for LLM reranking (`AFTERWORD_LLM_RERANK_ALLOWED_HOSTS` for local engine runs; empty by default). If an API key is configured for an allowlisted `http://` host, the key is sent unencrypted over HTTP. |
 
 The engine also persists source cadence and application settings in SQLite, so changes made in the UI survive restarts.
 

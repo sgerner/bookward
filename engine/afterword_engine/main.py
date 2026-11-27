@@ -160,7 +160,6 @@ from .quality import (
 )
 from . import llm_reranker
 from .llm_reranker import (
-    _normalize_chat_url,
     clear_llm_rerank_cache,
     is_custom_llm_endpoint,
     rerank_with_llm_sync as _default_rerank_with_llm_sync,
@@ -2433,6 +2432,7 @@ class GoogleBooksKeyIn(BaseModel):
 
 class LLMRerankSettingsIn(BaseModel):
     enabled: bool = False
+    mode: str | None = Field(default=None, max_length=40)
     provider: str = Field(default="", max_length=120)
     api_url: str = Field(default="", max_length=500)
     api_key: str | None = Field(default=None, max_length=500)
@@ -2440,16 +2440,56 @@ class LLMRerankSettingsIn(BaseModel):
     clear_api_key: bool = False
 
     def validate_values(self):
+        if self.mode is not None:
+            llm_reranker.normalize_llm_rerank_mode(self.mode, allow_blank=True)
         url = self.api_url.strip()
         if url:
-            parsed = urlparse(url)
-            if parsed.scheme != "https":
-                raise ValueError("LLM API URL must use HTTPS")
-            if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-                raise ValueError("LLM API URL cannot contain credentials, query parameters, or fragments")
-            validate_public_url(_normalize_chat_url(url))
+            llm_reranker.validate_llm_api_url(url, has_api_key=True)
         if self.enabled and (not url or not self.model.strip()):
             raise ValueError("LLM reranking requires both an API URL and a model")
+
+
+class LLMRerankTestIn(BaseModel):
+    mode: str | None = Field(default=None, max_length=40)
+    provider: str | None = Field(default=None, max_length=120)
+    api_url: str = Field(default="", max_length=500)
+    api_key: str | None = Field(default=None, max_length=500)
+    model: str = Field(default="", max_length=200)
+    clear_api_key: bool = False
+
+    def validate_values(self):
+        if self.mode is not None:
+            llm_reranker.normalize_llm_rerank_mode(self.mode, allow_blank=True)
+        url = self.api_url.strip()
+        if url:
+            llm_reranker.validate_llm_api_url(url, has_api_key=True)
+
+
+def _persist_llm_rerank_status(
+    *,
+    status: str,
+    error: str = "",
+    attempted_at: str | None = None,
+    private: dict | None = None,
+) -> dict[str, str]:
+    stamp = attempted_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    updates: dict[str, str] = {
+        "llm_rerank_last_status": status,
+        "llm_rerank_last_attempt_at": stamp,
+        "llm_rerank_last_error": error if status == "failed" else "",
+    }
+    if status == "succeeded":
+        updates["llm_rerank_last_success_at"] = stamp
+    with transaction() as con:
+        for key, value in updates.items():
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                (key, value),
+            )
+    if private is not None:
+        private.update(updates)
+    return updates
 
 
 def api_token_list():
@@ -2610,6 +2650,11 @@ def _prepare_tracked_recommendations(
     llm_events: list[dict[str, Any]] = []
     llm_cfg: dict[str, Any] = {}
     llm_active = False
+    llm_needs_network = False
+    cached_llm_result: tuple[list[dict[str, Any]], dict[str, Any]] | None = None
+    profile_id = current_profile_id() or "legacy"
+    profile_key = llm_reranker.current_llm_profile_key()
+    top_k = max(0, int(settings.llm_rerank_top_k))
     discovery_metadata = empty_discovery_slate_diagnostics("not_discovery_request")
     learning_metadata: dict[str, Any] = {
         "mode": "confidence_gated_live",
@@ -2680,25 +2725,86 @@ def _prepare_tracked_recommendations(
             if not is_filtered:
                 personalized_pool = [dict(item) for item in ranked]
             learning_metadata.update(diagnostics)
-            has_recommended = any(item.get("status") == "recommended" for item in ranked)
-            if not is_filtered and has_recommended:
+            recommended_candidates = [
+                item for item in ranked if item.get("status") == "recommended"
+            ]
+            if not is_filtered and recommended_candidates:
                 try:
                     llm_cfg = {
                         **effective_llm_rerank_settings(connection, private),
                         "top_k": settings.llm_rerank_top_k,
                         "max_delta": settings.llm_rerank_max_delta,
                     }
-                    llm_active = bool(llm_cfg["enabled"] and str(llm_cfg["api_key"]).strip())
-                    if llm_active:
-                        read_rows, llm_events = _load_llm_rerank_inputs(
-                            connection, interaction_events
+                    if llm_cfg["enabled"] and str(llm_cfg["api_key"]).strip():
+                        skip_zero_head = (
+                            top_k <= 0
+                            or (
+                                recommended_limit is not None
+                                and int(recommended_limit) <= 0
+                            )
+                            or (limit is not None and int(limit) <= 0)
                         )
+                        if skip_zero_head:
+                            learning_metadata["llm_rerank"] = {
+                                "applied": False,
+                                "reason": "skipped_zero_head",
+                            }
+                        elif int(offset) >= top_k:
+                            learning_metadata["llm_rerank"] = {
+                                "applied": False,
+                                "reason": "skipped_offset",
+                            }
+                        elif len(recommended_candidates) < 2:
+                            learning_metadata["llm_rerank"] = {
+                                "applied": False,
+                                "reason": "insufficient_candidates",
+                            }
+                        else:
+                            circuit = (
+                                None
+                                if rerank_with_llm_sync is not _default_rerank_with_llm_sync
+                                else llm_reranker.get_circuit_breaker_state(
+                                    profile_key,
+                                    api_url=llm_cfg["api_url"],
+                                    api_key=llm_cfg["api_key"],
+                                    model=llm_cfg["model"],
+                                    top_k=top_k,
+                                    max_delta=settings.llm_rerank_max_delta,
+                                    mode=llm_cfg.get("mode", ""),
+                                )
+                            )
+                            if circuit is not None:
+                                learning_metadata["llm_rerank"] = {
+                                    "applied": False,
+                                    "reason": "circuit_open",
+                                    "cooldown_until": circuit.get("cooldown_until", ""),
+                                }
+                            else:
+                                llm_active = True
+                                read_rows, llm_events = _load_llm_rerank_inputs(
+                                    connection, interaction_events
+                                )
+                                if rerank_with_llm_sync is _default_rerank_with_llm_sync:
+                                    cached_llm_result = llm_reranker.try_cached_rerank(
+                                        read_rows,
+                                        recommended_candidates,
+                                        interaction_events=llm_events,
+                                        profile_id=profile_id,
+                                        api_url=llm_cfg["api_url"],
+                                        api_key=llm_cfg["api_key"],
+                                        model=llm_cfg["model"],
+                                        top_k=top_k,
+                                        max_delta=settings.llm_rerank_max_delta,
+                                        mode=llm_cfg.get("mode", ""),
+                                    )
+                                llm_needs_network = cached_llm_result is None
                 except Exception as exc:
                     LOGGER.warning(
                         "Failed to load LLM rerank inputs; serving personalized base slate: %s",
                         safe_error_message(exc),
                     )
                     llm_active = False
+                    llm_needs_network = False
         except Exception:
             LOGGER.exception(
                 "Interaction personalization failed; serving the base ranking"
@@ -2717,7 +2823,9 @@ def _prepare_tracked_recommendations(
                     identity_context=identity_context,
                 )
                 pool_summary["recommended_total"] = len(fallback_recommended)
-                pool_summary["recommendation_genres"] = _distinct_genres(fallback_recommended)
+                pool_summary["recommendation_genres"] = _distinct_genres(
+                    fallback_recommended
+                )
             recommendations = recommendation_list(
                 connection,
                 status=status,
@@ -2781,10 +2889,15 @@ def _prepare_tracked_recommendations(
         "learning_metadata": learning_metadata,
         "discovery_metadata": discovery_metadata,
         "llm_active": llm_active,
+        "llm_needs_network": llm_needs_network,
+        "cached_llm_result": cached_llm_result,
         "llm_cfg": llm_cfg,
         "read_rows": read_rows,
         "llm_events": llm_events,
-        "profile_id": current_profile_id() or "legacy",
+        "profile_id": profile_id,
+        "profile_key": profile_key,
+        "top_k": top_k,
+        "private": private,
     }
 
 
@@ -2824,30 +2937,78 @@ def _complete_tracked_recommendations(
             ]
             if recommended:
                 if not is_filtered and prepared["llm_active"]:
-                    llm_cfg = prepared["llm_cfg"]
-                    unreranked_recommended = [dict(item) for item in recommended]
-                    rerank_fn = (
-                        rerank_with_llm_sync
-                        if rerank_with_llm_sync is not _default_rerank_with_llm_sync
-                        else llm_reranker.rerank_with_llm_sync
-                    )
-                    try:
-                        recommended, llm_diag = rerank_fn(
-                            prepared["read_rows"],
-                            recommended,
-                            interaction_events=prepared["llm_events"],
-                            profile_id=prepared["profile_id"],
-                            api_url=llm_cfg["api_url"],
-                            api_key=llm_cfg["api_key"],
-                            model=llm_cfg["model"],
+                    if prepared["cached_llm_result"] is not None:
+                        recommended, llm_diag = prepared["cached_llm_result"]
+                    else:
+                        llm_cfg = prepared["llm_cfg"]
+                        profile_key = prepared["profile_key"]
+                        llm_mode = llm_cfg.get("mode", "")
+                        unreranked_recommended = [dict(item) for item in recommended]
+                        rerank_fn = (
+                            rerank_with_llm_sync
+                            if rerank_with_llm_sync is not _default_rerank_with_llm_sync
+                            else llm_reranker.rerank_with_llm_sync
                         )
-                    except Exception as exc:
-                        LOGGER.warning(
-                            "LLM reranker failed; preserving personalized slate: %s",
-                            safe_error_message(exc),
-                        )
-                        recommended = unreranked_recommended
-                        llm_diag = {"applied": False, "reason": "fallback"}
+                        direct_exception: Exception | None = None
+                        try:
+                            rerank_kwargs: dict[str, Any] = {
+                                "interaction_events": prepared["llm_events"],
+                                "profile_id": prepared["profile_id"],
+                                "api_url": llm_cfg["api_url"],
+                                "api_key": llm_cfg["api_key"],
+                                "model": llm_cfg["model"],
+                            }
+                            if rerank_fn is llm_reranker._DEFAULT_RERANK_SYNC_FN:
+                                rerank_kwargs["mode"] = llm_mode
+                            recommended, llm_diag = rerank_fn(
+                                prepared["read_rows"],
+                                recommended,
+                                **rerank_kwargs,
+                            )
+                        except Exception as exc:
+                            direct_exception = exc
+                            LOGGER.warning(
+                                "LLM reranker failed; preserving personalized slate: %s",
+                                safe_error_message(exc),
+                            )
+                            recommended = unreranked_recommended
+                            llm_diag = {"applied": False, "reason": "fallback"}
+
+                        if llm_diag.get("applied") and not llm_diag.get("cached"):
+                            llm_reranker.clear_circuit_breaker(profile_key)
+                            _persist_llm_rerank_status(
+                                status="succeeded",
+                                error="",
+                                private=prepared.get("private"),
+                            )
+                        elif llm_diag.get("reason") == "fallback":
+                            raw_err = (
+                                direct_exception
+                                if direct_exception is not None
+                                else (
+                                    llm_reranker.last_rerank_error()
+                                    or "LLM reranking request failed"
+                                )
+                            )
+                            err_msg = llm_reranker.sanitize_llm_error(
+                                raw_err,
+                                api_key=llm_cfg["api_key"],
+                            )
+                            llm_reranker.trip_circuit_breaker(
+                                profile_key,
+                                api_url=llm_cfg["api_url"],
+                                api_key=llm_cfg["api_key"],
+                                model=llm_cfg["model"],
+                                error=err_msg,
+                                top_k=prepared["top_k"],
+                                max_delta=settings.llm_rerank_max_delta,
+                                mode=llm_mode,
+                            )
+                            _persist_llm_rerank_status(
+                                status="failed",
+                                error=err_msg,
+                                private=prepared.get("private"),
+                            )
                     llm_rerank_output = llm_diag
                     learning_metadata["llm_rerank"] = {
                         key: value
@@ -3074,7 +3235,7 @@ def tracked_recommendations(
             private=private,
             pool_summary=pool_summary,
         )
-        if not prepared["llm_active"]:
+        if not prepared["llm_needs_network"]:
             return _complete_tracked_recommendations(prepared, connection=read_con)
     # Release _LockedConnection before executing outbound LLM network I/O.
     return _complete_tracked_recommendations(prepared, connection=None)
@@ -3106,7 +3267,7 @@ def overview_payload(
             private=private,
             pool_summary=pool_summary,
         )
-        if prepared["llm_active"]:
+        if prepared["llm_needs_network"]:
             deferred_prepared = prepared
         else:
             recommendations, run_id = _complete_tracked_recommendations(
@@ -3145,6 +3306,9 @@ def overview_payload(
     if deferred_prepared is not None:
         recommendations, run_id = _complete_tracked_recommendations(
             deferred_prepared, connection=None
+        )
+        settings_payload["llm_rerank"] = safe_llm_rerank_settings(
+            connection=None, private=private
         )
     served_recommended = sum(
         1 for item in recommendations if item.get("status") == "recommended"
@@ -4965,6 +5129,51 @@ async def update_google_books_settings(payload: GoogleBooksKeyIn):
     }
 
 
+def _saved_llm_target_matches(
+    current: dict,
+    *,
+    target_url: str,
+    provider: str | None,
+    mode: str | None = None,
+) -> bool:
+    """Return True only when target_url, provider, and mode match the saved target.
+
+    Note: legacy rows storing a blank `llm_rerank_api_url` alongside a stored key
+    have `saved_origin == ""`, so enabled saves require providing a fresh API key
+    rather than implicitly binding the legacy key to `settings.llm_rerank_api_url`.
+    Likewise, saving with reranking disabled and a blank URL passes `target_url=""`,
+    which returns False and drops any stored key instead of leaving an unbound secret.
+    """
+    saved_url = (
+        current["llm_rerank_api_url"].strip()
+        if "llm_rerank_api_url" in current
+        else settings.llm_rerank_api_url.strip()
+    )
+    saved_provider = current.get("llm_rerank_provider", "").strip().lower()
+    try:
+        saved_mode = llm_reranker.normalize_llm_rerank_mode(
+            current.get("llm_rerank_mode", ""), allow_blank=True
+        )
+    except ValueError:
+        saved_mode = ""
+    req_provider = saved_provider if provider is None else provider.strip().lower()
+    req_mode = (
+        saved_mode
+        if mode is None
+        else llm_reranker.normalize_llm_rerank_mode(mode, allow_blank=True)
+    )
+    saved_origin = llm_reranker.normalized_llm_origin(saved_url)
+    target_origin = llm_reranker.normalized_llm_origin(target_url)
+    return (
+        bool(target_origin)
+        and target_origin == saved_origin
+        and llm_reranker.canonical_llm_url(target_url)
+        == llm_reranker.canonical_llm_url(saved_url)
+        and req_provider == saved_provider
+        and req_mode == saved_mode
+    )
+
+
 @app.get("/api/settings/llm-rerank")
 def get_llm_rerank_settings():
     return safe_llm_rerank_settings()
@@ -4972,35 +5181,128 @@ def get_llm_rerank_settings():
 
 @app.put("/api/settings/llm-rerank")
 def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
-    try:
-        payload.validate_values()
-    except ValueError as exc:
-        raise HTTPException(400, safe_error_message(exc)) from exc
     current = private_settings()
+    current_effective = effective_llm_rerank_settings(private=current)
+    stored_key = current.get("llm_rerank_api_key", "").strip()
+    env_key = settings.llm_rerank_api_key.strip()
+    provided_key = "" if payload.clear_api_key else (payload.api_key or "").strip()
+    saved_mode = current_effective.get("mode", "")
+    try:
+        effective_mode = (
+            saved_mode
+            if payload.mode is None
+            else llm_reranker.normalize_llm_rerank_mode(
+                payload.mode, allow_blank=True
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            400, llm_reranker.sanitize_llm_error(exc, api_key=provided_key)
+        ) from exc
+    req_url = payload.api_url.strip()
+    effective_url = req_url or settings.llm_rerank_api_url
+    effective_model = payload.model.strip() or settings.llm_rerank_model
+    same_saved_target = _saved_llm_target_matches(
+        current,
+        target_url=req_url if (not payload.enabled and not req_url) else effective_url,
+        provider=payload.provider,
+        mode=payload.mode,
+    )
+
     if payload.clear_api_key:
         profile_api_key = ""
-    elif payload.api_key is None or not payload.api_key.strip():
-        profile_api_key = (current.get("llm_rerank_api_key") or "").strip()
+        effective_key = ""
+    elif provided_key:
+        profile_api_key = provided_key
+        effective_key = provided_key
+    elif same_saved_target:
+        profile_api_key = stored_key
+        _, effective_key = resolve_llm_rerank_credentials(
+            effective_url, profile_api_key
+        )
     else:
-        profile_api_key = payload.api_key.strip()
+        profile_api_key = ""
+        effective_key = ""
 
-    cleaned_url = payload.api_url.strip()
-    effective_url, effective_key = resolve_llm_rerank_credentials(
-        cleaned_url, profile_api_key
-    )
+    try:
+        payload.validate_values()
+        if payload.enabled and effective_url:
+            llm_reranker.validate_llm_api_url(effective_url, has_api_key=True)
+    except ValueError as exc:
+        raise HTTPException(
+            400,
+            llm_reranker.sanitize_llm_error(
+                exc, api_key=effective_key or provided_key
+            ),
+        ) from exc
+
     if payload.enabled and not effective_key:
+        if not same_saved_target and not payload.clear_api_key and stored_key:
+            raise HTTPException(
+                400,
+                "Provide a new API key when changing the LLM API URL, provider, or mode",
+            )
         if is_custom_llm_endpoint(effective_url):
             raise HTTPException(
                 400, "A profile API key is required for custom LLM endpoint URLs"
             )
+        if not same_saved_target and not payload.clear_api_key and env_key:
+            raise HTTPException(
+                400,
+                "Provide a new API key when changing the LLM API URL, provider, or mode",
+            )
         raise HTTPException(400, "An API key is required when LLM reranking is enabled")
+
+    llm_changed = (
+        not current_effective["enabled"]
+        or llm_reranker.canonical_llm_url(effective_url)
+        != llm_reranker.canonical_llm_url(current_effective["api_url"])
+        or effective_model != current_effective["model"]
+        or effective_key != current_effective["api_key"]
+        or payload.provider.strip().lower()
+        != current_effective.get("provider", "").strip().lower()
+        or effective_mode != current_effective.get("mode", "").strip().lower()
+    )
+    checked = False
+    if payload.enabled and llm_changed:
+        try:
+            llm_reranker.probe_llm_reranker(
+                api_url=effective_url,
+                api_key=effective_key,
+                model=effective_model,
+            )
+            checked = True
+        except ValueError as exc:
+            raise HTTPException(
+                400, llm_reranker.sanitize_llm_error(exc, api_key=effective_key)
+            ) from exc
+        except Exception as exc:
+            err = llm_reranker.sanitize_llm_error(exc, api_key=effective_key)
+            raise HTTPException(502, f"LLM connection check failed: {err}") from exc
+
     values = {
         "llm_rerank_enabled": "1" if payload.enabled else "0",
+        "llm_rerank_mode": effective_mode,
         "llm_rerank_provider": payload.provider.strip(),
-        "llm_rerank_api_url": cleaned_url,
+        "llm_rerank_api_url": req_url,
         "llm_rerank_model": payload.model.strip(),
         "llm_rerank_api_key": profile_api_key,
     }
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    status_updates: dict[str, str] = {}
+    if checked:
+        status_updates = {
+            "llm_rerank_last_status": "succeeded",
+            "llm_rerank_last_attempt_at": now_iso,
+            "llm_rerank_last_success_at": now_iso,
+            "llm_rerank_last_error": "",
+        }
+    elif not payload.enabled:
+        status_updates = {
+            "llm_rerank_last_status": "",
+            "llm_rerank_last_error": "",
+        }
+
     with transaction() as con:
         for key, value in values.items():
             secret = key == "llm_rerank_api_key"
@@ -5010,8 +5312,118 @@ def update_llm_rerank_settings(payload: LLMRerankSettingsIn):
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=excluded.secret,updated_at=CURRENT_TIMESTAMP",
                 (key, stored, 1 if secret else 0),
             )
-    clear_llm_rerank_cache(current_profile_id() or "legacy")
-    return {"saved": True, "llm_rerank": safe_llm_rerank_settings()}
+        for key, value in status_updates.items():
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                (key, value),
+            )
+    if llm_changed or not payload.enabled:
+        llm_reranker.clear_llm_rerank_state()
+    else:
+        clear_llm_rerank_cache(current_profile_id() or "legacy")
+    return {
+        "saved": True,
+        "checked": checked,
+        "llm_rerank": safe_llm_rerank_settings(),
+    }
+
+
+@app.post("/api/settings/llm-rerank/test")
+def test_llm_rerank_settings(payload: LLMRerankTestIn = LLMRerankTestIn()):
+    current = private_settings()
+    current_effective = effective_llm_rerank_settings(private=current)
+    saved_url = (
+        current["llm_rerank_api_url"].strip()
+        if "llm_rerank_api_url" in current
+        else settings.llm_rerank_api_url.strip()
+    )
+    api_url = payload.api_url.strip() or saved_url
+    model = payload.model.strip() or current_effective["model"]
+    stored_key = current.get("llm_rerank_api_key", "").strip()
+    env_key = settings.llm_rerank_api_key.strip()
+    provided_key = "" if payload.clear_api_key else (payload.api_key or "").strip()
+    try:
+        payload.validate_values()
+        llm_mode = (
+            current_effective.get("mode", "")
+            if payload.mode is None
+            else llm_reranker.normalize_llm_rerank_mode(
+                payload.mode, allow_blank=True
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            400, llm_reranker.sanitize_llm_error(exc, api_key=provided_key)
+        ) from exc
+    same_saved_target = _saved_llm_target_matches(
+        current,
+        target_url=api_url,
+        provider=payload.provider,
+        mode=payload.mode,
+    )
+
+    if payload.clear_api_key:
+        api_key = ""
+    elif provided_key:
+        api_key = provided_key
+    elif same_saved_target:
+        _, api_key = resolve_llm_rerank_credentials(api_url, stored_key)
+    else:
+        api_key = ""
+
+    try:
+        if not api_url or not model:
+            raise ValueError("Testing LLM reranking requires both an API URL and a model")
+        normalized_url = llm_reranker.validate_llm_api_url(api_url, has_api_key=True)
+        if not api_key:
+            if not same_saved_target and not payload.clear_api_key and (stored_key or env_key):
+                raise ValueError(
+                    "Provide an API key when testing a different LLM API URL, provider, or mode"
+                )
+            raise ValueError("An API key is required to test the LLM reranker")
+    except ValueError as exc:
+        raise HTTPException(
+            400, llm_reranker.sanitize_llm_error(exc, api_key=api_key or provided_key)
+        ) from exc
+
+    matches_saved = (
+        same_saved_target
+        and llm_reranker.canonical_llm_url(normalized_url)
+        == llm_reranker.canonical_llm_url(current_effective["api_url"])
+        and model == current_effective["model"]
+        and api_key == current_effective["api_key"]
+    )
+    profile_key = llm_reranker.current_llm_profile_key()
+    try:
+        result = llm_reranker.probe_llm_reranker(
+            api_url=normalized_url,
+            api_key=api_key,
+            model=model,
+        )
+    except Exception as exc:
+        err = llm_reranker.sanitize_llm_error(exc, api_key=api_key)
+        if matches_saved or not current_effective["enabled"]:
+            _persist_llm_rerank_status(status="failed", error=err)
+        if matches_saved and current_effective["enabled"]:
+            llm_reranker.trip_circuit_breaker(
+                profile_key,
+                api_url=normalized_url,
+                api_key=api_key,
+                model=model,
+                error=err,
+                mode=llm_mode,
+            )
+        raise HTTPException(502, f"LLM connection test failed: {err}") from exc
+
+    if matches_saved or not current_effective["enabled"]:
+        _persist_llm_rerank_status(status="succeeded", error="")
+    if matches_saved:
+        llm_reranker.clear_circuit_breaker(profile_key)
+    return {
+        **result,
+        "llm_rerank": safe_llm_rerank_settings(),
+    }
 
 
 _MODELS_DEV_CACHE: dict[str, object] = {"expires_at": 0.0, "providers": []}
@@ -5734,9 +6146,16 @@ def effective_llm_rerank_settings(connection=None, private=None) -> dict:
         private.get("llm_rerank_api_url"),
         private.get("llm_rerank_api_key"),
     )
+    try:
+        normalized_mode = llm_reranker.normalize_llm_rerank_mode(
+            private.get("llm_rerank_mode", ""), allow_blank=True
+        )
+    except ValueError:
+        normalized_mode = ""
     return {
         "enabled": enabled,
         "provider": private.get("llm_rerank_provider", ""),
+        "mode": normalized_mode,
         "api_url": api_url,
         "api_key": api_key,
         "model": private.get("llm_rerank_model") or settings.llm_rerank_model,
@@ -5747,12 +6166,25 @@ def safe_llm_rerank_settings(connection=None, private=None) -> dict:
     if private is None:
         private = private_settings(connection)
     effective = effective_llm_rerank_settings(connection, private)
+    circuit = llm_reranker.get_circuit_breaker_state(
+        llm_reranker.current_llm_profile_key(),
+        api_url=effective["api_url"],
+        api_key=effective["api_key"],
+        model=effective["model"],
+        mode=effective.get("mode", ""),
+    )
     return {
         "enabled": effective["enabled"],
+        "mode": effective.get("mode", ""),
         "provider": effective["provider"],
         "api_url": effective["api_url"],
         "model": effective["model"],
         "api_key_set": bool(effective["api_key"]),
+        "last_status": private.get("llm_rerank_last_status", ""),
+        "last_error": private.get("llm_rerank_last_error", ""),
+        "last_attempt_at": private.get("llm_rerank_last_attempt_at", ""),
+        "last_success_at": private.get("llm_rerank_last_success_at", ""),
+        "cooldown_until": circuit.get("cooldown_until", "") if circuit else "",
     }
 
 
