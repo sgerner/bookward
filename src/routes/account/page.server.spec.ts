@@ -86,7 +86,7 @@ function assertNoPasswordEcho(result: unknown, ...submittedValues: string[]) {
 	}
 }
 
-describe('account page actions', () => {
+describe('account page server', () => {
 	beforeEach(() => {
 		engine.mockReset();
 	});
@@ -337,6 +337,191 @@ describe('account page actions', () => {
 			'bookward_session',
 			'rotated-session',
 			expect.objectContaining({ secure: true, path: '/' })
+		);
+	});
+
+	it('propagates enrollment verification state for SSO-only accounts while hiding surrogate usernames', async () => {
+		engine
+			.mockResolvedValueOnce({
+				password_enabled: false,
+				has_local_username: false,
+				enrollment_verified: true,
+				oidc_identities: [{ id: 1, issuer: 'https://idp.example', email: 'sso@example.test', created_at: '2026-10-01T00:00:00Z' }]
+			})
+			.mockResolvedValueOnce({ oidc_enabled: true });
+
+		const loaded = await load({
+			locals: {
+				user: {
+					id: 'sso-1',
+					profile_id: 'sso-profile',
+					username: 'oidc:1234567890abcdef',
+					has_local_username: false,
+					display_name: 'SSO Reader',
+					role: 'user',
+					must_change_password: false
+				}
+			},
+			url: new URL('https://bookward.test/account?enroll=1')
+		} as never);
+
+		expect(loaded).toMatchObject({
+			user: { username: '', has_local_username: false },
+			enrollmentVerified: true,
+			enrollConfirmed: true,
+			enrollError: false
+		});
+	});
+
+	it('preserves legacy oidc:-prefixed local accounts when has_local_username is true', async () => {
+		engine
+			.mockResolvedValueOnce({
+				password_enabled: true,
+				has_local_username: true,
+				enrollment_verified: false,
+				oidc_identities: []
+			})
+			.mockResolvedValueOnce({ oidc_enabled: false });
+
+		const loaded = await load({
+			locals: {
+				user: {
+					id: 'legacy-1',
+					profile_id: 'legacy-profile',
+					username: 'oidc:legacy-reader',
+					has_local_username: true,
+					display_name: 'Legacy Reader',
+					role: 'user',
+					must_change_password: false
+				}
+			},
+			url: new URL('https://bookward.test/account')
+		} as never);
+
+		expect(loaded).toMatchObject({
+			user: { username: 'oidc:legacy-reader', has_local_username: true },
+			enrollmentVerified: false
+		});
+
+		const cookies = { set: vi.fn() };
+		const currentCandidate = makeLongInput();
+		const updatedCandidate = makeLongInput();
+		engine.mockResolvedValueOnce({ session_token: 'rotated-legacy-session', max_age: 86400 });
+		const updated = await actions.changePassword!({
+			request: new Request('https://bookward.test/account?/changePassword', {
+				method: 'POST',
+				headers: { 'content-type': 'application/x-www-form-urlencoded' },
+				body: new URLSearchParams({
+					current_password: currentCandidate,
+					new_password: updatedCandidate
+				})
+			}),
+			cookies,
+			url: new URL('https://bookward.test/account?/changePassword'),
+			locals: {
+				user: {
+					id: 'legacy-1',
+					profile_id: 'legacy-profile',
+					username: 'oidc:legacy-reader',
+					has_local_username: true,
+					display_name: 'Legacy Reader',
+					role: 'user',
+					must_change_password: false
+				}
+			}
+		} as never);
+
+		expect(updated).toEqual({ formId: 'changePassword', message: 'Password updated.' });
+		expect(engine).toHaveBeenLastCalledWith(
+			'/auth/password/change',
+			expect.objectContaining({
+				method: 'POST',
+				body: JSON.stringify({
+					current_password: currentCandidate,
+					new_password: updatedCandidate
+				})
+			})
+		);
+	});
+
+	it('requires a non-oidc username when an SSO-only account enrolls a local password', async () => {
+		const cookies = { set: vi.fn() };
+		const enrolledCandidate = makeLongInput();
+		const ssoLocals = {
+			user: {
+				id: 'sso-1',
+				profile_id: 'sso-profile',
+				username: 'oidc:1234567890abcdef',
+				has_local_username: false,
+				display_name: 'SSO Reader',
+				role: 'user',
+				must_change_password: false
+			}
+		};
+
+		const missingUsername = await actions.changePassword!({
+			request: new Request('https://bookward.test/account?/changePassword', {
+				method: 'POST',
+				headers: { 'content-type': 'application/x-www-form-urlencoded' },
+				body: new URLSearchParams({ new_password: enrolledCandidate })
+			}),
+			cookies,
+			url: new URL('https://bookward.test/account?/changePassword'),
+			locals: ssoLocals
+		} as never);
+		expect(missingUsername).toMatchObject({
+			status: 400,
+			data: {
+				formId: 'changePassword',
+				fieldErrors: { username: 'Choose a username for local sign-in.' },
+				values: { username: '' }
+			}
+		});
+		assertNoPasswordEcho(missingUsername, enrolledCandidate);
+
+		const reservedUsername = await actions.changePassword!({
+			request: new Request('https://bookward.test/account?/changePassword', {
+				method: 'POST',
+				headers: { 'content-type': 'application/x-www-form-urlencoded' },
+				body: new URLSearchParams({ username: 'oidc:custom', new_password: enrolledCandidate })
+			}),
+			cookies,
+			url: new URL('https://bookward.test/account?/changePassword'),
+			locals: ssoLocals
+		} as never);
+		expect(reservedUsername).toMatchObject({
+			status: 400,
+			data: {
+				formId: 'changePassword',
+				fieldErrors: { username: "Usernames cannot start with 'oidc:'." },
+				values: { username: 'oidc:custom' }
+			}
+		});
+		assertNoPasswordEcho(reservedUsername, enrolledCandidate);
+
+		engine.mockResolvedValueOnce({ session_token: 'enrolled-session', max_age: 86400 });
+		const enrolled = await actions.changePassword!({
+			request: new Request('https://bookward.test/account?/changePassword', {
+				method: 'POST',
+				headers: { 'content-type': 'application/x-www-form-urlencoded' },
+				body: new URLSearchParams({ username: 'chosen-reader', new_password: enrolledCandidate })
+			}),
+			cookies,
+			url: new URL('https://bookward.test/account?/changePassword'),
+			locals: ssoLocals
+		} as never);
+
+		expect(enrolled).toEqual({ formId: 'changePassword', message: 'Password updated.' });
+		expect(engine).toHaveBeenCalledWith(
+			'/auth/password/change',
+			expect.objectContaining({
+				method: 'POST',
+				body: JSON.stringify({
+					username: 'chosen-reader',
+					current_password: '',
+					new_password: enrolledCandidate
+				})
+			})
 		);
 	});
 
