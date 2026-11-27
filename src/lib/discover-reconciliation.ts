@@ -457,7 +457,15 @@ export function createPendingSubmit(deps: {
     onRefreshDiscoverIfOffView,
   } = deps;
 
-  return async ({ formData }) => {
+  return async ({ formData, submitter }) => {
+    if (
+      typeof HTMLButtonElement !== "undefined" &&
+      submitter instanceof HTMLButtonElement &&
+      submitter.name &&
+      !formData.has(submitter.name)
+    ) {
+      formData.set(submitter.name, submitter.value);
+    }
     setPendingState(key, true);
     let change: OptimisticChange | void;
     try {

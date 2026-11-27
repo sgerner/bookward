@@ -436,6 +436,31 @@ describe('authentication boundary', () => {
 		expect(sessionInRoute).toBe('valid-session');
 	});
 
+	it('rejects cross-profile form actions and profile-bound GET fetches with HTTP 409', async () => {
+		mockSessionLookup('alice-profile');
+		const form = new URLSearchParams({ __profile_id: 'bob-profile', id: '15' });
+		const formMismatch = await handle({
+			event: eventFor(new Request('http://afterword.test/?/markRead', {
+				method: 'POST',
+				headers: {
+					origin: 'http://afterword.test',
+					'content-type': 'application/x-www-form-urlencoded'
+				},
+				body: form.toString()
+			}), 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+		expect(formMismatch.status).toBe(409);
+
+		const sliceMismatch = await handle({
+			event: eventFor(new Request('http://afterword.test/api/recommendations?status=maybe_later&limit=24&offset=0', {
+				headers: { 'x-bookward-profile': 'bob-profile' }
+			}), 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+		expect(sliceMismatch.status).toBe(409);
+	});
+
 	it('returns both detail and message on 401, 403, 409, and 503 JSON responses', async () => {
 		const unauthResponse = await handle({
 			event: eventFor(new Request('http://afterword.test/api/recommendations')),
