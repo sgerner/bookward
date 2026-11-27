@@ -20,4 +20,10 @@ describe("formatReadingSourceLabel", () => {
     expect(formatReadingSourceLabel("custom_import")).toBe("custom_import");
     expect(formatReadingSourceLabel("")).toBe("Unknown source");
   });
+
+  it("formats manual past reads added in Bookward", () => {
+    expect(formatReadingSourceLabel("manual_history")).toBe(
+      "Past read added in Bookward",
+    );
+  });
 });

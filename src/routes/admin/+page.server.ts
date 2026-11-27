@@ -1,11 +1,19 @@
-import { fail, redirect } from '@sveltejs/kit';
+import { error as httpError, fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { EngineError, engine } from '#lib/server/engine.js';
+import { formatWaitDuration } from '#lib/lockout-ui.js';
+import {
+	currentClientIp,
+	currentSessionToken,
+	resolveClientAddress,
+	withRequestContext
+} from '#lib/server/request-context.js';
 
 type Account = {
 	id: string;
 	profile_id: string;
 	username: string;
+	has_local_username?: boolean;
 	display_name: string;
 	role: 'admin' | 'user';
 	status: 'active' | 'disabled';
@@ -40,13 +48,44 @@ const failure = (
 	});
 
 export const load: PageServerLoad = async ({ locals }) => {
+	if (locals?.engineUnavailable) {
+		throw httpError(503, "Bookward's recommendation engine is unavailable.");
+	}
 	if (!locals.user) throw redirect(303, '/login');
 	if (locals.user.role !== 'admin') throw redirect(303, '/');
-	const [result, identityBackup] = await Promise.all([
-		engine<{ accounts: Account[] }>('/admin/accounts'),
-		engine<IdentityBackupStatus>('/admin/auth-backups').catch(() => null)
-	]);
-	return { accounts: result.accounts, current_user_id: locals.user.id, identityBackup };
+	let result: { accounts: Account[] };
+	let identityBackup: IdentityBackupStatus | null;
+	let methods: { password_enabled: boolean };
+	try {
+		[result, identityBackup, methods] = await Promise.all([
+			engine<{ accounts: Account[] }>('/admin/accounts'),
+			engine<IdentityBackupStatus>('/admin/auth-backups').catch(() => null),
+			engine<{ password_enabled: boolean }>('/auth/identities').catch(() => ({
+				password_enabled: true
+			}))
+		]);
+	} catch (error) {
+		if (error instanceof EngineError && error.status === 401) throw redirect(303, '/login');
+		if (error instanceof EngineError && error.status === 403) throw redirect(303, '/');
+		throw httpError(503, "Bookward's recommendation engine is unavailable.");
+	}
+	const accounts = result.accounts.map((account) => {
+		const hasLocal =
+			typeof account.has_local_username === 'boolean'
+				? account.has_local_username
+				: Boolean(account.username.trim()) && !account.username.trim().toLowerCase().startsWith('oidc:');
+		return {
+			...account,
+			username: hasLocal ? account.username : '',
+			has_local_username: hasLocal
+		};
+	});
+	return {
+		accounts,
+		current_user_id: locals.user.id,
+		identityBackup,
+		password_enabled: methods.password_enabled
+	};
 };
 
 export const actions: Actions = {
@@ -61,6 +100,8 @@ export const actions: Actions = {
 		const fieldErrors: Record<string, string> = {};
 		if (!username || username.length > 160 || hasControlCharacters(username)) {
 			fieldErrors.username = 'Enter a valid username.';
+		} else if (username.toLowerCase().startsWith('oidc:')) {
+			fieldErrors.username = "Usernames cannot start with 'oidc:'.";
 		}
 		if (display_name.length > 160) {
 			fieldErrors.display_name = 'Use 160 characters or fewer.';
@@ -161,19 +202,118 @@ export const actions: Actions = {
 			});
 		}
 		try {
-			const result = await engine<{ unlocked: boolean; username: string; cleared_attempts: number }>(
-				`/admin/accounts/${encodeURIComponent(account_id)}/unlock`,
-				{ method: 'POST', body: '{}' }
-			);
+			const result = await engine<{
+				unlocked: boolean;
+				username: string;
+				has_local_username?: boolean;
+				display_name?: string;
+				cleared_attempts: number;
+			}>(`/admin/accounts/${encodeURIComponent(account_id)}/unlock`, {
+				method: 'POST',
+				body: '{}'
+			});
+			const hasLocal =
+				typeof result.has_local_username === 'boolean'
+					? result.has_local_username
+					: Boolean(result.username.trim()) &&
+						!result.username.trim().toLowerCase().startsWith('oidc:');
+			const label = hasLocal ? result.username : result.display_name?.trim() || 'SSO-only account';
 			return {
 				formId,
 				message:
 					result.cleared_attempts > 0
-						? `Unlocked ${result.username} (${result.cleared_attempts} failed sign-in attempt${result.cleared_attempts === 1 ? '' : 's'} cleared).`
-						: `Sign-in lockouts cleared for ${result.username}.`
+						? `Unlocked ${label} (${result.cleared_attempts} failed sign-in attempt${result.cleared_attempts === 1 ? '' : 's'} cleared).`
+						: `Sign-in lockouts cleared for ${label}.`
 			};
 		} catch (error) {
 			return failure(formId, error);
+		}
+	},
+	deleteAccount: async (event) => {
+		const { request, locals, setHeaders } = event;
+		const form = await request.formData();
+		const account_id = String(form.get('account_id') || '').trim();
+		const confirm_username = String(form.get('confirm_username') || '').trim();
+		const hasCurrentPassword = form.has('current_password');
+		const current_password = String(form.get('current_password') || '');
+		const formId = account_id ? `deleteAccount-${account_id}` : 'deleteAccount';
+		if (!account_id) {
+			return fail(400, {
+				formId,
+				message: 'Choose a valid account.',
+				error: true as const,
+				fieldErrors: {}
+			});
+		}
+		const fieldErrors: Record<string, string> = {};
+		if (account_id !== locals.user?.id && !confirm_username) {
+			fieldErrors.confirm_username = 'Type the username to confirm deleting this account.';
+		}
+		if (account_id !== locals.user?.id && hasCurrentPassword && !current_password) {
+			fieldErrors.current_password = 'Enter your current password.';
+		}
+		if (Object.keys(fieldErrors).length > 0) {
+			return fail(400, {
+				formId,
+				message: fieldErrors.confirm_username ?? fieldErrors.current_password!,
+				error: true as const,
+				fieldErrors
+			});
+		}
+		const clientIp = currentClientIp() ?? resolveClientAddress(event);
+		try {
+			const deleted = await withRequestContext(
+				{ sessionToken: currentSessionToken(), clientIp },
+				() =>
+					engine<{
+						username?: string;
+						has_local_username?: boolean;
+						display_name?: string;
+					}>(
+						`/admin/accounts/${encodeURIComponent(account_id)}`,
+						{
+							method: 'DELETE',
+							body: JSON.stringify({
+								confirm_username: confirm_username || undefined,
+								current_password
+							})
+						},
+						10 * 60_000
+					)
+			);
+			const deletedHasLocal =
+				typeof deleted.has_local_username === 'boolean'
+					? deleted.has_local_username
+					: Boolean(deleted.username?.trim()) &&
+						!deleted.username!.trim().toLowerCase().startsWith('oidc:');
+			const deletedLabel = deletedHasLocal
+				? deleted.username || confirm_username
+				: deleted.display_name?.trim() || 'SSO-only account';
+			return {
+				formId: 'deleteAccount',
+				message: `Account ${deletedLabel} deleted.`
+			};
+		} catch (error) {
+			if (error instanceof EngineError && error.status === 429) {
+				const retryAfterSeconds = error.retryAfterSeconds ?? 900;
+				setHeaders?.({ 'retry-after': String(retryAfterSeconds) });
+				return fail(429, {
+					formId,
+					message: `Too many password attempts. Wait ${formatWaitDuration(retryAfterSeconds)} before trying again.`,
+					error: true as const,
+					fieldErrors: {},
+					rateLimited: true as const,
+					retryAfterSeconds
+				});
+			}
+			const status = error instanceof EngineError ? error.status : 503;
+			const msg = error instanceof Error ? error.message : 'Account operation failed.';
+			const mappedFieldErrors: Record<string, string> = /current password/i.test(msg)
+				? { current_password: msg }
+				: status === 400 && /confirm deleting this account/i.test(msg)
+					? { confirm_username: msg }
+					: {};
+			return failure(formId, error, mappedFieldErrors);
 		}
 	}
 };

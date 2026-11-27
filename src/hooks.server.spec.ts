@@ -436,6 +436,151 @@ describe('authentication boundary', () => {
 		expect(sessionInRoute).toBe('valid-session');
 	});
 
+	it('rejects cross-profile form actions and profile-bound GET fetches with HTTP 409', async () => {
+		mockSessionLookup('alice-profile');
+		const form = new URLSearchParams({ __profile_id: 'bob-profile', id: '15' });
+		const formMismatch = await handle({
+			event: eventFor(new Request('http://afterword.test/?/markRead', {
+				method: 'POST',
+				headers: {
+					origin: 'http://afterword.test',
+					'content-type': 'application/x-www-form-urlencoded'
+				},
+				body: form.toString()
+			}), 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+		expect(formMismatch.status).toBe(409);
+
+		const sliceMismatch = await handle({
+			event: eventFor(new Request('http://afterword.test/api/recommendations?status=maybe_later&limit=24&offset=0', {
+				headers: { 'x-bookward-profile': 'bob-profile' }
+			}), 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+		expect(sliceMismatch.status).toBe(409);
+	});
+
+	it('returns both detail and message on 401, 403, 409, and 503 JSON responses', async () => {
+		const unauthResponse = await handle({
+			event: eventFor(new Request('http://afterword.test/api/recommendations')),
+			resolve: vi.fn()
+		} as never);
+		expect(unauthResponse.status).toBe(401);
+		const unauthPayload = await unauthResponse.json();
+		expect(unauthPayload.detail).toContain('Authentication required');
+		expect(unauthPayload.message).toBe(unauthPayload.detail);
+
+		const crossOriginResponse = await handle({
+			event: eventFor(
+				new Request('http://afterword.test/api/telemetry', {
+					method: 'POST',
+					headers: { origin: 'https://attacker.test', 'content-type': 'application/json' },
+					body: '{}'
+				}),
+				'valid-session'
+			),
+			resolve: vi.fn()
+		} as never);
+		expect(crossOriginResponse.status).toBe(403);
+		const crossOriginPayload = await crossOriginResponse.json();
+		expect(crossOriginPayload.message).toBe(crossOriginPayload.detail);
+
+		mockSessionLookup('alice-profile');
+		const conflictResponse = await handle({
+			event: eventFor(
+				new Request('http://afterword.test/api/recommendations', {
+					headers: { 'x-bookward-profile': 'bob-profile' }
+				}),
+				'valid-session'
+			),
+			resolve: vi.fn()
+		} as never);
+		expect(conflictResponse.status).toBe(409);
+		const conflictPayload = await conflictResponse.json();
+		expect(conflictPayload.detail).toContain('different profile');
+		expect(conflictPayload.message).toBe(conflictPayload.detail);
+
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+		const outageApiEvent = eventFor(new Request('http://afterword.test/api/recommendations'), 'valid-session');
+		const outageResponse = await handle({
+			event: outageApiEvent,
+			resolve: vi.fn()
+		} as never);
+		expect(outageResponse.status).toBe(503);
+		const outagePayload = await outageResponse.json();
+		expect(outagePayload.message).toBe(outagePayload.detail);
+		expect((outageApiEvent as { cookies: { delete: ReturnType<typeof vi.fn> } }).cookies.delete).not.toHaveBeenCalled();
+	});
+
+	it('retains bookward_session and passes locals.engineUnavailable on page loads during engine outages', async () => {
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+
+		for (const pathname of ['/', '/login', '/account', '/admin']) {
+			const event = eventFor(new Request(`http://afterword.test${pathname}`), 'valid-session') as {
+				locals: App.Locals;
+				cookies: { delete: ReturnType<typeof vi.fn> };
+			};
+			const resolve = vi.fn().mockResolvedValue(new Response('<main id="main-content"></main>', { status: 503 }));
+			const response = await handle({ event: event as never, resolve } as never);
+
+			expect(response.status).toBe(503);
+			expect(event.locals.engineUnavailable).toBe(true);
+			expect(event.cookies.delete).not.toHaveBeenCalled();
+			expect(resolve).toHaveBeenCalledTimes(1);
+		}
+	});
+
+	it('fails closed with HTTP 503 on mutations during engine outages without clearing the session cookie', async () => {
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+		const event = eventFor(
+			new Request('http://afterword.test/?/decide', {
+				method: 'POST',
+				headers: {
+					origin: 'http://afterword.test',
+					accept: 'application/json',
+					'x-sveltekit-action': 'true',
+					'content-type': 'application/x-www-form-urlencoded'
+				},
+				body: new URLSearchParams({ __profile_id: 'alice-profile', id: '7', status: 'saved' })
+			}),
+			'valid-session'
+		) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+		const resolve = vi.fn();
+
+		const response = await handle({ event: event as never, resolve } as never);
+		expect(response.status).toBe(503);
+		expect(resolve).not.toHaveBeenCalled();
+		expect(event.cookies.delete).not.toHaveBeenCalled();
+	});
+
+	it('renders HTML with <main> on unhydrated 409 form posts while keeping the session active', async () => {
+		mockSessionLookup('alice-profile');
+		const event = eventFor(
+			new Request('http://afterword.test/auth/logout', {
+				method: 'POST',
+				headers: {
+					origin: 'http://afterword.test',
+					accept: 'text/html,application/xhtml+xml',
+					'content-type': 'application/x-www-form-urlencoded'
+				},
+				body: new URLSearchParams({ __profile_id: 'stale-profile' })
+			}),
+			'valid-session'
+		) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+		const resolve = vi.fn();
+
+		const response = await handle({ event: event as never, resolve } as never);
+		const body = await response.text();
+
+		expect(response.status).toBe(409);
+		expect(response.headers.get('content-type')).toContain('text/html');
+		expect(body).toContain('<main id="main-content"');
+		expect(body).toContain('This page belongs to a different profile. Reload before continuing.');
+		expect(resolve).not.toHaveBeenCalled();
+		expect(event.cookies.delete).not.toHaveBeenCalled();
+	});
+
 	it('propagates verified client IPs to unauthenticated and authenticated handlers and survives missing proxy headers', async () => {
 		let loginClientIp: string | undefined;
 		const loginEvent = {
@@ -728,6 +873,213 @@ describe('authentication boundary', () => {
 		).rejects.toMatchObject({
 			status: 413,
 			body: { message: expect.stringContaining('10 MB') }
+		});
+	});
+
+	it('enforces same-origin, profile_id binding, and 503 outage fail-closed on /auth/oidc/start?intent=enroll', async () => {
+		mockSessionLookup('alice-profile');
+
+		const crossSite = new Request(
+			'http://afterword.test/auth/oidc/start?intent=enroll&profile_id=alice-profile',
+			{ headers: { 'sec-fetch-site': 'cross-site' } }
+		);
+		const crossSiteResponse = await handle({
+			event: eventFor(crossSite, 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+		expect(crossSiteResponse.status).toBe(403);
+
+		const wrongProfile = new Request(
+			'http://afterword.test/auth/oidc/start?intent=enroll&profile_id=other-profile',
+			{ headers: { 'sec-fetch-site': 'same-origin' } }
+		);
+		const wrongProfileResponse = await handle({
+			event: eventFor(wrongProfile, 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+		expect(wrongProfileResponse.status).toBe(409);
+
+		const validEnroll = new Request(
+			'http://afterword.test/auth/oidc/start?intent=enroll&profile_id=alice-profile',
+			{ headers: { 'sec-fetch-site': 'same-origin' } }
+		);
+		const validResponse = await handle({
+			event: eventFor(validEnroll, 'valid-session'),
+			resolve: vi.fn(() => Promise.resolve(new Response('ok', { status: 302 })))
+		} as never);
+		expect(validResponse.status).toBe(302);
+
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+		const outageEnroll = new Request(
+			'http://afterword.test/auth/oidc/start?intent=enroll&profile_id=alice-profile',
+			{ headers: { 'sec-fetch-site': 'same-origin' } }
+		);
+		const outageResponse = await handle({
+			event: eventFor(outageEnroll, 'valid-session'),
+			resolve: vi.fn()
+		} as never);
+		expect(outageResponse.status).toBe(503);
+	});
+
+	it('allows POST /auth/logout to clear bookward_session and redirect 303 during an engine outage', async () => {
+		vi.stubEnv('ORIGIN', 'http://afterword.test');
+		vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed: ECONNREFUSED')));
+
+		const headerCases: Array<Record<string, string>> = [
+			{
+				origin: 'http://afterword.test',
+				accept: 'application/json',
+				'x-sveltekit-action': 'true',
+				'content-type': 'application/x-www-form-urlencoded'
+			},
+			{
+				origin: 'http://afterword.test',
+				accept: 'text/html,application/xhtml+xml',
+				'content-type': 'application/x-www-form-urlencoded'
+			}
+		];
+		for (const headers of headerCases) {
+			const event = eventFor(
+				new Request('http://afterword.test/auth/logout', {
+					method: 'POST',
+					headers,
+					body: new URLSearchParams({ __profile_id: 'alice-profile' })
+				}),
+				'valid-session'
+			) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+			const resolve = vi.fn();
+
+			await expect(handle({ event: event as never, resolve } as never)).rejects.toMatchObject({
+				status: 303,
+				location: '/login?manual=1'
+			});
+			expect(event.cookies.delete).toHaveBeenCalledWith('bookward_session', {
+				httpOnly: true,
+				secure: false,
+				sameSite: 'lax',
+				path: '/'
+			});
+			expect(resolve).not.toHaveBeenCalled();
+		}
+
+		vi.stubEnv('ORIGIN', '');
+		const httpsEvent = eventFor(
+			new Request('https://books.example.com/auth/logout', {
+				method: 'POST',
+				headers: {
+					origin: 'https://books.example.com',
+					accept: 'application/json',
+					'x-sveltekit-action': 'true',
+					'content-type': 'application/x-www-form-urlencoded'
+				},
+				body: new URLSearchParams({ __profile_id: 'alice-profile' })
+			}),
+			'valid-session'
+		) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+		await expect(handle({ event: httpsEvent as never, resolve: vi.fn() } as never)).rejects.toMatchObject({
+			status: 303,
+			location: '/login?manual=1'
+		});
+		expect(httpsEvent.cookies.delete).toHaveBeenCalledWith('bookward_session', {
+			httpOnly: true,
+			secure: true,
+			sameSite: 'lax',
+			path: '/'
+		});
+	});
+
+	it('returns JSON 401 for unauthenticated or expired enhanced SvelteKit actions outside /auth/* while redirecting native posts and /auth/logout', async () => {
+		vi.stubEnv('ORIGIN', 'http://afterword.test');
+
+		const noSessionAction = new Request('http://afterword.test/?/decide', {
+			method: 'POST',
+			headers: {
+				origin: 'http://afterword.test',
+				accept: 'application/json',
+				'x-sveltekit-action': 'true',
+				'content-type': 'application/x-www-form-urlencoded'
+			},
+			body: new URLSearchParams({ id: '7', status: 'saved' })
+		});
+		const noSessionResponse = await handle({
+			event: eventFor(noSessionAction),
+			resolve: vi.fn()
+		} as never);
+		expect(noSessionResponse.status).toBe(401);
+		await expect(noSessionResponse.json()).resolves.toEqual({
+			detail: 'Authentication required. Sign in again to continue.',
+			message: 'Authentication required. Sign in again to continue.'
+		});
+
+		vi.stubGlobal(
+			'fetch',
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ detail: 'Session expired' }), {
+					status: 401,
+					headers: { 'content-type': 'application/json' }
+				})
+			)
+		);
+		const expiredEvent = eventFor(
+			new Request('http://afterword.test/?/decide', {
+				method: 'POST',
+				headers: {
+					origin: 'http://afterword.test',
+					accept: 'application/json',
+					'x-sveltekit-action': 'true',
+					'content-type': 'application/x-www-form-urlencoded'
+				},
+				body: new URLSearchParams({ __profile_id: 'alice-profile', id: '7', status: 'saved' })
+			}),
+			'expired-session'
+		) as { cookies: { delete: ReturnType<typeof vi.fn> } };
+		const expiredResponse = await handle({
+			event: expiredEvent as never,
+			resolve: vi.fn()
+		} as never);
+		expect(expiredResponse.status).toBe(401);
+		expect(expiredEvent.cookies.delete).toHaveBeenCalledWith('bookward_session', {
+			httpOnly: true,
+			secure: false,
+			sameSite: 'lax',
+			path: '/'
+		});
+		await expect(expiredResponse.json()).resolves.toEqual({
+			detail: 'Authentication required. Sign in again to continue.',
+			message: 'Authentication required. Sign in again to continue.'
+		});
+
+		const nativePost = new Request('http://afterword.test/?/decide', {
+			method: 'POST',
+			headers: {
+				origin: 'http://afterword.test',
+				accept: 'text/html,application/xhtml+xml',
+				'content-type': 'application/x-www-form-urlencoded'
+			},
+			body: new URLSearchParams({ id: '7', status: 'saved' })
+		});
+		await expect(
+			handle({ event: eventFor(nativePost), resolve: vi.fn() } as never)
+		).rejects.toMatchObject({
+			status: 303,
+			location: `/login?next=${encodeURIComponent('/?/decide')}`
+		});
+
+		const logoutWithoutSession = new Request('http://afterword.test/auth/logout', {
+			method: 'POST',
+			headers: {
+				origin: 'http://afterword.test',
+				accept: 'application/json',
+				'x-sveltekit-action': 'true',
+				'content-type': 'application/x-www-form-urlencoded'
+			},
+			body: new URLSearchParams()
+		});
+		await expect(
+			handle({ event: eventFor(logoutWithoutSession), resolve: vi.fn() } as never)
+		).rejects.toMatchObject({
+			status: 303,
+			location: '/login?manual=1'
 		});
 	});
 });

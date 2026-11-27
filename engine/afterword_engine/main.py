@@ -24,7 +24,7 @@ from fastapi import APIRouter, Body, Depends, FastAPI, File, Header, HTTPExcepti
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, ValidationError, field_validator
+from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, ValidationError, field_validator, model_validator
 from .config import settings
 from .database import (
     DEFAULT_DIGEST_APP_URLS,
@@ -40,6 +40,7 @@ from .database import (
     private_setting,
     purge_demo_reads,
     recompute_candidate_sources,
+    reset_profile_history,
     row,
     rows,
     scheduler_fenced,
@@ -53,10 +54,12 @@ from .backups import (
     clear_interrupted_restore_journal,
     compact_database,
     create_backup,
+    has_pending_auth_backup_scrubs,
     has_restore_journal,
     identity_backup_status,
     recover_interrupted_restore,
     restore_backup,
+    retry_pending_auth_backup_scrubs,
 )
 from .decision_evidence import EVIDENCE_SCHEMA_VERSION, set_evidence_rotation_enabled
 from .maintenance import set_storage_retention_enabled
@@ -116,9 +119,11 @@ from .digest import (
 from .decision_evidence import retract_recommendation_outcome_evidence
 from .learning import (
     EVENT_TYPES,
+    HISTORICAL_READ_SOURCES,
     create_recommendation_run,
     build_decision_evidence,
     is_discovery_run_metadata,
+    reconcile_read_outcomes_in_connection,
     record_event_in_connection,
     record_events,
     sync_read_rating_in_connection,
@@ -128,6 +133,7 @@ from .learning import (
     _read_time,
     _validate_identifier,
 )
+from .read_dates import read_day
 from .interaction_personalization import (
     load_interaction_events,
     load_cached_candidate_vectors,
@@ -174,6 +180,7 @@ from .identity import (
 from .isbn import isbn_parts
 from . import profiles as identity_store
 from .tenancy import (
+    ProfileDeletedError,
     current_profile_id,
     current_session_id,
     profile_database_path,
@@ -208,6 +215,7 @@ class InitialAdminIn(LocalLoginIn):
 
 
 class PasswordChangeIn(BaseModel):
+    username: str | None = Field(default=None, max_length=160)
     current_password: str = Field(default="", max_length=1024)
     new_password: str = Field(min_length=12, max_length=1024)
 
@@ -221,6 +229,21 @@ class AccountCreateIn(BaseModel):
 
 class AccountPasswordIn(BaseModel):
     password: str = Field(min_length=12, max_length=1024)
+
+
+class AccountDeleteIn(BaseModel):
+    current_password: str = Field(default="", max_length=1024)
+    confirm: str | None = Field(default=None, max_length=32)
+
+
+class HistoryResetIn(BaseModel):
+    current_password: str = Field(default="", max_length=1024)
+    confirm: str | None = Field(default=None, max_length=32)
+
+
+class AdminAccountDeleteIn(BaseModel):
+    current_password: str = Field(default="", max_length=1024)
+    confirm_username: str | None = Field(default=None, max_length=160)
 
 
 class CandidateAuditIn(BaseModel):
@@ -304,13 +327,55 @@ def _require_admin(request):
     return account
 
 
-def _require_recent_authentication(account):
+def _require_recent_authentication(
+    account, message: str = "Sign in again before adding a login method"
+):
     try:
         authenticated_at = datetime.fromisoformat(account.get("session_created_at", ""))
     except (TypeError, ValueError):
         raise HTTPException(401, "Sign in again to confirm this change")
     if datetime.now(timezone.utc) - authenticated_at > timedelta(minutes=10):
-        raise HTTPException(401, "Sign in again before adding a login method")
+        raise HTTPException(401, message)
+
+
+def _verify_account_confirmation(account: dict, current_password: str, request: Request) -> None:
+    methods = identity_store.auth_methods(account["id"])
+    local_username = bool(
+        methods.get(
+            "has_local_username",
+            account.get(
+                "has_local_username",
+                identity_store.has_local_username(account.get("username")),
+            ),
+        )
+    )
+    if methods["password_enabled"] and local_username:
+        session_hash = account.get("session_token_hash") or hashlib.sha256(
+            (request.headers.get("x-bookward-session") or "").encode()
+        ).hexdigest()
+        try:
+            verified = identity_store.authenticate_local(
+                account["username"],
+                current_password,
+                f"session:{session_hash}",
+                scope="session",
+                client_address=_request_client_ip(request),
+            )
+        except identity_store.LoginRateLimitError as exc:
+            raise HTTPException(
+                429,
+                str(exc),
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
+        if not verified or verified["id"] != account["id"]:
+            raise HTTPException(401, "Current password is incorrect")
+    else:
+        _require_recent_authentication(account, "Sign in again to confirm this change")
+
+
+def _require_enrollment_verification(account):
+    if not identity_store.is_enrollment_verified(account.get("enrollment_verified_at")):
+        raise HTTPException(401, "Confirm with single sign-on before adding a local password")
 
 
 def _mark_private_no_store(response: Response) -> None:
@@ -519,6 +584,27 @@ def queue_digest_if_due():
     return None
 
 
+def _poll_source_schedule_for_profile(
+    profile_id: str, check_enrichment_retries: bool
+) -> None:
+    with profile_scope(profile_id):
+        lock = database_lock()
+        with lock.scheduler_guard() as can_schedule, bind_request_restore_epoch():
+            if not can_schedule or has_restore_journal():
+                return
+            with lock.try_shared() as acquired:
+                if not acquired:
+                    return
+                if (
+                    source_sync_is_due()
+                    and not active_job("sync")
+                    and not active_job("sync_due")
+                ):
+                    enqueue_job("sync_due", dedupe=True)
+                if check_enrichment_retries:
+                    _queue_due_enrichment_retries()
+
+
 async def source_scheduler_loop(stop):
     """Queue a single sync when permanent sources become due.
 
@@ -537,20 +623,21 @@ async def source_scheduler_loop(stop):
         check_enrichment_retries = current_monotonic >= next_enrichment_retry_check
         if check_enrichment_retries:
             next_enrichment_retry_check = current_monotonic + ENRICHMENT_RETRY_POLL_SECONDS
-        for profile_id in identity_store.profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(identity_store.profile_ids)
+        except Exception:
+            LOGGER.exception("Source scheduler could not enumerate profiles")
+            active_profiles = []
+        for profile_id in active_profiles:
+            if stop.is_set():
+                break
             try:
-                with profile_scope(profile_id), database_lock().scheduler_guard() as can_schedule, bind_request_restore_epoch():
-                    if not can_schedule:
-                        continue
-                    if (
-                        source_sync_is_due()
-                        and not active_job("sync")
-                        and not active_job("sync_due")
-                    ):
-                        enqueue_job("sync_due", dedupe=True)
-                    if check_enrichment_retries:
-                        _queue_due_enrichment_retries()
-            except RestoreEpochError:
+                await asyncio.to_thread(
+                    _poll_source_schedule_for_profile,
+                    profile_id,
+                    check_enrichment_retries,
+                )
+            except (ProfileDeletedError, RestoreEpochError):
                 continue
             except Exception:
                 # A transient profile database error must not stop schedules
@@ -562,6 +649,19 @@ async def source_scheduler_loop(stop):
             pass
 
 
+def _poll_digest_schedule_for_profile(profile_id: str) -> None:
+    with profile_scope(profile_id):
+        lock = database_lock()
+        with lock.scheduler_guard() as can_schedule, bind_request_restore_epoch():
+            if not can_schedule or has_restore_journal():
+                return
+            with lock.try_shared() as acquired:
+                if not acquired:
+                    return
+                if digest_is_due(private_settings()) and not active_job("digest"):
+                    enqueue_job("digest", dedupe=True)
+
+
 async def digest_scheduler_loop(stop):
     """Queue the configured weekly digest without relying on host cron."""
 
@@ -570,14 +670,17 @@ async def digest_scheduler_loop(stop):
     except TimeoutError:
         pass
     while not stop.is_set():
-        for profile_id in identity_store.profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(identity_store.profile_ids)
+        except Exception:
+            LOGGER.exception("Digest scheduler could not enumerate profiles")
+            active_profiles = []
+        for profile_id in active_profiles:
+            if stop.is_set():
+                break
             try:
-                with profile_scope(profile_id), database_lock().scheduler_guard() as can_schedule, bind_request_restore_epoch():
-                    if not can_schedule:
-                        continue
-                    if digest_is_due(private_settings()) and not active_job("digest"):
-                        enqueue_job("digest", dedupe=True)
-            except RestoreEpochError:
+                await asyncio.to_thread(_poll_digest_schedule_for_profile, profile_id)
+            except (ProfileDeletedError, RestoreEpochError):
                 continue
             except Exception:
                 LOGGER.exception("Digest scheduler failed for profile %s", profile_id)
@@ -638,6 +741,18 @@ def queue_goodreads_rss_if_due(current_time=None):
         return job_id
 
 
+def _poll_goodreads_rss_schedule_for_profile(profile_id: str) -> None:
+    with profile_scope(profile_id):
+        lock = database_lock()
+        with lock.scheduler_guard() as can_schedule, bind_request_restore_epoch():
+            if not can_schedule or has_restore_journal():
+                return
+            with lock.try_shared() as acquired:
+                if not acquired:
+                    return
+                queue_goodreads_rss_if_due()
+
+
 async def goodreads_rss_scheduler_loop(stop):
     """Queue the configured Goodreads feed each night without host cron."""
 
@@ -646,11 +761,19 @@ async def goodreads_rss_scheduler_loop(stop):
     except TimeoutError:
         pass
     while not stop.is_set():
-        for profile_id in identity_store.profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(identity_store.profile_ids)
+        except Exception:
+            LOGGER.exception("Goodreads RSS scheduler could not enumerate profiles")
+            active_profiles = []
+        for profile_id in active_profiles:
+            if stop.is_set():
+                break
             try:
-                with profile_scope(profile_id):
-                    queue_goodreads_rss_if_due()
-            except RestoreEpochError:
+                await asyncio.to_thread(
+                    _poll_goodreads_rss_schedule_for_profile, profile_id
+                )
+            except (ProfileDeletedError, RestoreEpochError):
                 continue
             except Exception:
                 LOGGER.exception("Goodreads RSS scheduler failed for profile %s", profile_id)
@@ -659,32 +782,204 @@ async def goodreads_rss_scheduler_loop(stop):
         except TimeoutError:
             pass
 
+
+def _finish_read_work_identities_job(result: dict[str, Any]) -> None:
+    if result["remaining"]:
+        enqueue_followup_job("read_work_identities")
+    if result["matched"]:
+        enqueue_job("read_metadata", dedupe=True)
+
+
+def _rated_publication_years() -> dict[int, tuple[Any, Any]]:
+    from .publication_year_metadata import attach_publication_years
+
+    rated = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
+    with connect() as con:
+        attach_publication_years(con, rated, [])
+    return {
+        item["id"]: (
+            item.get("first_publication_year"),
+            item.get("publication_work_id"),
+        )
+        for item in rated
+    }
+
+
+def _finish_read_metadata_job(
+    before_years: dict[int, tuple[Any, Any]],
+    has_remaining: bool,
+) -> str | None:
+    if has_remaining:
+        enqueue_followup_job("read_metadata")
+    if _rated_publication_years() != before_years:
+        return enqueue_job("score", dedupe=True)
+    return None
+
+
+def _load_association_job_inputs() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return safe_association_settings(), rows("SELECT * FROM reads ORDER BY id")
+
+
+def _enqueue_post_audit_jobs(*, check_followup: bool = True) -> None:
+    if check_followup:
+        _enqueue_candidate_quality_followup()
+    enqueue_job("read_work_identities", dedupe=True)
+
+
+def _prune_stale_embeddings(backend: str, model: str) -> None:
+    with transaction() as con:
+        con.execute(
+            "DELETE FROM embeddings WHERE backend != ? OR model != ?",
+            (backend, model),
+        )
+
+
+def _finish_candidate_metadata_job(has_metadata: bool) -> tuple[int, str | None]:
+    remaining = candidate_metadata_refresh_remaining()
+    score_job_id = enqueue_job("score", dedupe=True) if has_metadata else None
+    if remaining:
+        enqueue_followup_job("metadata")
+    return remaining, score_job_id
+
+
+def _enqueue_metadata_if_remaining() -> None:
+    if candidate_metadata_refresh_remaining():
+        enqueue_job("metadata", dedupe=True)
+
+
+def _finish_candidate_quality_batch_job(
+    quality: dict[str, Any],
+    *,
+    mode: str,
+    started_at: str,
+) -> dict[str, Any]:
+    stopped = bool(quality.get("stopped"))
+    remaining = finish_candidate_quality_batch(
+        mode=mode,
+        started_at=started_at,
+        stopped=stopped,
+    )
+    changed = bool(
+        quality.get("status_changed")
+        or quality.get("deduped")
+        or quality.get("enriched")
+    )
+    is_final_batch = remaining == 0 and not stopped
+    score_job_id = (
+        enqueue_followup_job("score")
+        if (changed or is_final_batch)
+        else None
+    )
+    followup_job_id = (
+        enqueue_followup_job("candidate_quality")
+        if remaining > 0
+        else None
+    )
+    if quality.get("audited") or is_final_batch:
+        enqueue_job("read_work_identities", dedupe=True)
+    return {
+        **quality,
+        "mode": mode,
+        "remaining": remaining,
+        "followup_job_id": followup_job_id,
+        "score_job_id": score_job_id,
+    }
+
+
+def _prepare_candidate_quality_recovery_job() -> tuple[str, float, str]:
+    profile_key = current_profile_id()
+    now_ts = _recovery_clock()
+    started = _get_quality_recovery_setting_float(
+        QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY
+    )
+    max_chain_age = (
+        QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS + ENRICHMENT_RETRY_POLL_SECONDS
+    )
+    if started is None or started > now_ts or (now_ts - started) > max_chain_age:
+        started = now_ts
+        _set_quality_recovery_settings(
+            **{
+                QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: f"{started:.6f}",
+                QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+            }
+        )
+    retry_cutoff = private_setting(QUALITY_RETRY_QUARANTINED_BEFORE_KEY, "").strip()
+    return profile_key, started, retry_cutoff
+
+
+def _finish_candidate_quality_recovery_job(
+    profile_key: str, started: float
+) -> bool:
+    after_ts = _recovery_clock()
+    followup_deferred = False
+    if _has_due_quality_recovery():
+        if (after_ts - started) < QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS:
+            _enqueue_candidate_quality_followup()
+        else:
+            _set_quality_recovery_settings(
+                **{
+                    QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
+                    QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: f"{after_ts + ENRICHMENT_RETRY_POLL_SECONDS:.6f}",
+                }
+            )
+            followup_deferred = True
+            LOGGER.info(
+                "Deferring remaining candidate quality recovery for profile %s after %.1fs continuous window",
+                profile_key,
+                QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS,
+            )
+    else:
+        _set_quality_recovery_settings(
+            **{
+                QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
+                QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+                QUALITY_RETRY_QUARANTINED_BEFORE_KEY: "",
+            }
+        )
+    enqueue_job("read_work_identities", dedupe=True)
+    return followup_deferred
+
+
+def _load_source_job_context(
+    source_id: int, kind: str
+) -> tuple[dict[str, Any] | None, int, set[str]]:
+    source = row("SELECT * FROM sources WHERE id=?", (source_id,))
+    if not source:
+        return None, 0, set()
+    started_generation = _source_scan_generation(source_id)
+    queued_before = {
+        item["id"]
+        for item in rows(
+            "SELECT id FROM jobs WHERE kind=? AND status='queued'",
+            (kind,),
+        )
+    }
+    return source, started_generation, queued_before
+
+
+def _record_source_scan_error(source_id: int, message: str) -> None:
+    with transaction() as con:
+        con.execute(
+            "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
+            (f"error:{message}", source_id),
+        )
+
+
 @fenced_async
 async def handle_job(kind: str):
-    config = private_settings()
+    config = await asyncio.to_thread(private_settings)
     if kind == "read_work_identities":
         result = await refresh_read_work_identities()
-        if result["remaining"]:
-            enqueue_followup_job("read_work_identities")
-        if result["matched"]:
-            enqueue_job("read_metadata", dedupe=True)
+        if result["remaining"] or result["matched"]:
+            await asyncio.to_thread(_finish_read_work_identities_job, result)
         return result
     if kind == "read_metadata":
-        from .publication_year_metadata import attach_publication_years
-
-        def rated_publication_years():
-            rated = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
-            with connect() as con:
-                attach_publication_years(con, rated, [])
-            return {item["id"]: (item.get("first_publication_year"), item.get("publication_work_id")) for item in rated}
-
-        before_years = rated_publication_years()
+        before_years = await asyncio.to_thread(_rated_publication_years)
         result = await refresh_read_metadata()
-        if result["remaining"]:
-            enqueue_followup_job("read_metadata")
-        score_job_id = (
-            enqueue_job("score", dedupe=True)
-            if rated_publication_years() != before_years else None
+        score_job_id = await asyncio.to_thread(
+            _finish_read_metadata_job,
+            before_years,
+            bool(result["remaining"]),
         )
         return {**result, "score_job_id": score_job_id}
     if kind == "digest":
@@ -694,7 +989,9 @@ async def handle_job(kind: str):
         if not url:
             return {"skipped": "not_configured"}
         result = await _sync_goodreads_rss(url)
-        result["job_id"] = enqueue_job("score", dedupe=True)
+        result["job_id"] = await asyncio.to_thread(
+            lambda: enqueue_job("score", dedupe=True)
+        )
         return result
     if kind in {"digest:manual", "digest:force"}:
         # Manual runs bypass the time window through the job kind; the same
@@ -708,8 +1005,7 @@ async def handle_job(kind: str):
         return await retry_delivery(delivery_id, config)
     if kind.startswith("association:"):
         provider_name = kind.partition(":")[2]
-        provider_settings = safe_association_settings()
-        reads = rows("SELECT * FROM reads ORDER BY id")
+        provider_settings, reads = await asyncio.to_thread(_load_association_job_inputs)
         if provider_name == "openlibrary":
             if not provider_settings["openlibrary_enabled"]:
                 return {"skipped": "disabled", "provider": provider_name}
@@ -733,8 +1029,7 @@ async def handle_job(kind: str):
         else:
             raise ValueError("Unknown association provider")
         quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
-        _enqueue_candidate_quality_followup()
-        enqueue_job("read_work_identities", dedupe=True)
+        await asyncio.to_thread(_enqueue_post_audit_jobs)
         return {
             "run_id": result.id,
             "provider": result.provider,
@@ -749,74 +1044,38 @@ async def handle_job(kind: str):
         # set first, then remove incompatible vectors only after success so an
         # unavailable remote provider cannot erase the previous cache.
         result = await rebuild_all_embeddings(config.get("embedding_backend"), config.get("embedding_model"), config.get("embedding_url"), config.get("embedding_api_key"))
-        with transaction() as con:
-            con.execute(
-                "DELETE FROM embeddings WHERE backend != ? OR model != ?",
-                (result["backend"], result["model"]),
-            )
+        await asyncio.to_thread(
+            _prune_stale_embeddings, result["backend"], result["model"]
+        )
         return {"embeddings": result["embeddings"], "scored": result["scored"]}
     if kind == "score":
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
-        return {"scored": scored, "digest_job_id": queue_digest_if_due()}
+        digest_job_id = await asyncio.to_thread(queue_digest_if_due)
+        return {"scored": scored, "digest_job_id": digest_job_id}
     if kind == "metadata":
         metadata = await refresh_missing_candidate_metadata()
-        remaining = candidate_metadata_refresh_remaining()
-        score_job_id = enqueue_job("score", dedupe=True) if metadata else None
-        if remaining:
-            enqueue_followup_job("metadata")
+        remaining, score_job_id = await asyncio.to_thread(
+            _finish_candidate_metadata_job, bool(metadata)
+        )
         return {"metadata": metadata, "remaining": remaining, "score_job_id": score_job_id}
     if kind == "candidate_quality":
-        mode, started_at = prepare_candidate_quality_batch()
+        mode, started_at = await asyncio.to_thread(prepare_candidate_quality_batch)
         quality = await audit_candidates(
             only_pending=(mode != "full"),
             limit=QUALITY_AUDIT_BATCH_SIZE,
             audited_before=started_at,
         )
-        stopped = bool(quality.get("stopped"))
-        remaining = finish_candidate_quality_batch(
-            mode=mode,
-            started_at=started_at,
-            stopped=stopped,
-        )
-        changed = bool(
-            quality.get("status_changed")
-            or quality.get("deduped")
-            or quality.get("enriched")
-        )
-        is_final_batch = remaining == 0 and not stopped
-        score_job_id = (
-            enqueue_followup_job("score")
-            if (changed or is_final_batch)
-            else None
-        )
-        followup_job_id = (
-            enqueue_followup_job("candidate_quality")
-            if remaining > 0
-            else None
-        )
-        if quality.get("audited") or is_final_batch:
-            enqueue_job("read_work_identities", dedupe=True)
-        return {
-            **quality,
-            "mode": mode,
-            "remaining": remaining,
-            "followup_job_id": followup_job_id,
-            "score_job_id": score_job_id,
-        }
-    if kind == "candidate_quality_recovery":
-        profile_key = current_profile_id()
-        now_ts = _recovery_clock()
-        started = _get_quality_recovery_setting_float(QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY)
-        max_chain_age = QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS + ENRICHMENT_RETRY_POLL_SECONDS
-        if started is None or started > now_ts or (now_ts - started) > max_chain_age:
-            started = now_ts
-            _set_quality_recovery_settings(
-                **{
-                    QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: f"{started:.6f}",
-                    QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
-                }
+        return await asyncio.to_thread(
+            lambda: _finish_candidate_quality_batch_job(
+                quality,
+                mode=mode,
+                started_at=started_at,
             )
-        retry_cutoff = private_setting(QUALITY_RETRY_QUARANTINED_BEFORE_KEY, "").strip()
+        )
+    if kind == "candidate_quality_recovery":
+        profile_key, started, retry_cutoff = await asyncio.to_thread(
+            _prepare_candidate_quality_recovery_job
+        )
         if retry_cutoff:
             quality = await audit_candidates(
                 only_pending=True,
@@ -826,33 +1085,11 @@ async def handle_job(kind: str):
             )
         else:
             quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
-        after_ts = _recovery_clock()
-        followup_deferred = False
-        if _has_due_quality_recovery():
-            if (after_ts - started) < QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS:
-                _enqueue_candidate_quality_followup()
-            else:
-                _set_quality_recovery_settings(
-                    **{
-                        QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
-                        QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: f"{after_ts + ENRICHMENT_RETRY_POLL_SECONDS:.6f}",
-                    }
-                )
-                followup_deferred = True
-                LOGGER.info(
-                    "Deferring remaining candidate quality recovery for profile %s after %.1fs continuous window",
-                    profile_key,
-                    QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS,
-                )
-        else:
-            _set_quality_recovery_settings(
-                **{
-                    QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
-                    QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
-                    QUALITY_RETRY_QUARANTINED_BEFORE_KEY: "",
-                }
-            )
-        enqueue_job("read_work_identities", dedupe=True)
+        followup_deferred = await asyncio.to_thread(
+            _finish_candidate_quality_recovery_job,
+            profile_key,
+            started,
+        )
         scored = await score_all(
             config.get("embedding_backend"),
             config.get("embedding_model"),
@@ -865,7 +1102,9 @@ async def handle_job(kind: str):
             source_id = int(kind.partition(":")[2])
         except ValueError as exc:
             raise ValueError("Invalid source job") from exc
-        source = row("SELECT * FROM sources WHERE id=?", (source_id,))
+        source, started_generation, queued_before = await asyncio.to_thread(
+            _load_source_job_context, source_id, kind
+        )
         if not source or source["kind"] == "builtin":
             raise ValueError("Source not found")
         if source["kind"] == "association":
@@ -879,14 +1118,6 @@ async def handle_job(kind: str):
         started_filters = normalize_source_filters(source.get("filters"))
         started_last_scanned_at = source["last_scanned_at"]
         started_last_attempted_at = source.get("last_attempted_at")
-        started_generation = _source_scan_generation(source_id)
-        queued_before = {
-            item["id"]
-            for item in rows(
-                "SELECT id FROM jobs WHERE kind=? AND status='queued'",
-                (kind,),
-            )
-        }
 
         def _concurrent_source_state():
             current = row("SELECT * FROM sources WHERE id=?", (source_id,))
@@ -925,18 +1156,13 @@ async def handle_job(kind: str):
                 or reset_during_run,
             )
 
-        try:
-            collected = await scan_source(source)
-        except RestoreEpochError:
-            raise
-        except Exception as exc:
-            message = safe_error_message(exc)
+        def _reconcile_failed_source_scan(error_message: str) -> None:
             current, url_changed, needs_rescan = _concurrent_source_state()
             with transaction() as con:
                 if not url_changed:
                     con.execute(
                         "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (f"error:{message}", source_id),
+                        (f"error:{error_message}", source_id),
                     )
                     if needs_rescan and current and current["lifecycle"] == "one_time":
                         con.execute(
@@ -955,46 +1181,56 @@ async def handle_job(kind: str):
                 and current["kind"] not in {"builtin", "association"}
             ):
                 enqueue_followup_job(kind)
+
+        def _reconcile_completed_source_scan() -> None:
+            current, url_changed, needs_rescan = _concurrent_source_state()
+            if needs_rescan and current:
+                with transaction() as con:
+                    if url_changed:
+                        con.execute(
+                            "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL, last_status=NULL WHERE id=?",
+                            (source_id,),
+                        )
+                    elif current["lifecycle"] == "one_time":
+                        con.execute(
+                            "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL WHERE id=?",
+                            (source_id,),
+                        )
+                if current["enabled"] and current["kind"] not in {"builtin", "association"}:
+                    enqueue_followup_job(kind)
+
+        try:
+            collected = await scan_source(source)
+        except RestoreEpochError:
             raise
-        current, url_changed, needs_rescan = _concurrent_source_state()
-        if needs_rescan and current:
-            with transaction() as con:
-                if url_changed:
-                    con.execute(
-                        "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL, last_status=NULL WHERE id=?",
-                        (source_id,),
-                    )
-                elif current["lifecycle"] == "one_time":
-                    con.execute(
-                        "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL WHERE id=?",
-                        (source_id,),
-                    )
-            if current["enabled"] and current["kind"] not in {"builtin", "association"}:
-                enqueue_followup_job(kind)
+        except Exception as exc:
+            message = safe_error_message(exc)
+            await asyncio.to_thread(_reconcile_failed_source_scan, message)
+            raise
+        await asyncio.to_thread(_reconcile_completed_source_scan)
         metadata = await refresh_missing_candidate_metadata()
-        if candidate_metadata_refresh_remaining():
-            enqueue_job("metadata", dedupe=True)
+        await asyncio.to_thread(_enqueue_metadata_if_remaining)
         quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
-        _enqueue_candidate_quality_followup()
-        enqueue_job("read_work_identities", dedupe=True)
+        await asyncio.to_thread(_enqueue_post_audit_jobs)
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
-        digest_job_id = queue_digest_if_due()
+        digest_job_id = await asyncio.to_thread(queue_digest_if_due)
         return {"collected":collected,"metadata":metadata,"quality":quality,"scored":scored,"source_id":source_id,"digest_job_id":digest_job_id}
     if kind in {"sync", "sync_due"}:
         total = 0
         errors = []
         if kind == "sync_due":
-            sources = source_sync_due_sources()
+            sources = await asyncio.to_thread(source_sync_due_sources)
             if not sources:
                 return {"skipped": "not_due", "collected": 0, "errors": []}
         else:
-            sources = rows(
+            sources = await asyncio.to_thread(
+                rows,
                 "SELECT * FROM sources WHERE enabled=1 "
                 "AND kind NOT IN ('builtin','association') "
                 "AND (lifecycle='permanent' OR ("
                 "lifecycle='one_time' AND last_scanned_at IS NULL "
                 "AND NOT (last_attempted_at IS NOT NULL AND COALESCE(last_status,'') IN ('empty:0','filtered:0'))"
-                "))"
+                "))",
             )
         for source in sources:
             try:
@@ -1003,22 +1239,18 @@ async def handle_job(kind: str):
                 raise
             except Exception as exc:
                 message = safe_error_message(exc)
-                with transaction() as con:
-                    con.execute(
-                        "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (f"error:{message}", source["id"]),
-                    )
+                await asyncio.to_thread(
+                    _record_source_scan_error, source["id"], message
+                )
                 errors.append({"id": source["id"], "name": source["name"], "error": message})
         if kind == "sync_due" and len(errors) == len(sources):
             return {"collected": total, "errors": errors, "skipped": "all_sources_failed"}
         metadata = await refresh_missing_candidate_metadata()
-        if candidate_metadata_refresh_remaining():
-            enqueue_job("metadata", dedupe=True)
+        await asyncio.to_thread(_enqueue_metadata_if_remaining)
         quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
-        _enqueue_candidate_quality_followup()
-        enqueue_job("read_work_identities", dedupe=True)
+        await asyncio.to_thread(_enqueue_post_audit_jobs)
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
-        digest_job_id = queue_digest_if_due()
+        digest_job_id = await asyncio.to_thread(queue_digest_if_due)
         return {"collected":total,"metadata":metadata,"quality":quality,"scored":scored,"errors":errors,"digest_job_id":digest_job_id}
     raise ValueError(f"Unsupported job kind: {kind}")
 
@@ -1026,18 +1258,29 @@ async def handle_job(kind: str):
 async def lifespan(app):
     _warn_if_shared_rate_limit_bucket()
     identity_store.initialize_auth()
-    ready_profiles: set[str] = set()
     try:
-        with profile_scope("legacy"):
-            recover_interrupted_restore()
-            initialize()
-            legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
-        identity_store.migrate_legacy_api_tokens(legacy_tokens)
-        ready_profiles.add("legacy")
+        identity_store.recover_incomplete_account_erasures()
     except Exception:
-        LOGGER.exception("Could not initialize profile legacy during startup")
+        LOGGER.warning("Could not complete interrupted account erasures during startup")
     if not has_restore_journal("legacy") or installation_key_path().is_file():
         auth_registry_key()
+    ready_profiles: set[str] = set()
+    legacy_active = "legacy" in identity_store.profile_ids()
+    if has_pending_auth_backup_scrubs():
+        try:
+            retry_pending_auth_backup_scrubs()
+        except Exception:
+            LOGGER.warning("Could not complete pending auth-backup scrubs during startup")
+    if legacy_active:
+        try:
+            with profile_scope("legacy"):
+                recover_interrupted_restore()
+                initialize(seed_demo=True)
+                legacy_tokens = rows("SELECT id,name,token_prefix,token_hash,created_at,last_used_at,revoked_at FROM api_tokens")
+            identity_store.migrate_legacy_api_tokens(legacy_tokens)
+            ready_profiles.add("legacy")
+        except Exception:
+            LOGGER.exception("Could not initialize profile legacy during startup")
     for profile_id in identity_store.profile_ids():
         if profile_id != "legacy":
             try:
@@ -1222,6 +1465,12 @@ async def authenticate_engine_request(request: Request, call_next):
         if has_restore_journal(token["profile_id"]):
             try:
                 await asyncio.to_thread(_recover_profile_for_request, token["profile_id"])
+            except ProfileDeletedError:
+                return JSONResponse(
+                    {"detail": "A valid API token is required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+                )
             except Exception:
                 LOGGER.exception(
                     "Authenticated profile is unavailable during API request recovery"
@@ -1232,19 +1481,25 @@ async def authenticate_engine_request(request: Request, call_next):
                     headers={"cache-control": "private, no-store"},
                 )
         derived_session_id = f"api-token:{int(token['id']):06d}"
-        with (
-            profile_scope(token["profile_id"]),
-            session_scope(derived_session_id),
-            bind_request_restore_epoch(),
-        ):
-            try:
+        try:
+            with (
+                profile_scope(token["profile_id"]),
+                session_scope(derived_session_id),
+                bind_request_restore_epoch(),
+            ):
                 response = await call_next(request)
-            except RestoreEpochError:
-                return JSONResponse(
-                    {"detail": "Profile database was restored during this request; retry the action."},
-                    status_code=409,
-                    headers={"cache-control": "private, no-store"},
-                )
+        except ProfileDeletedError:
+            return JSONResponse(
+                {"detail": "A valid API token is required"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+            )
+        except RestoreEpochError:
+            return JSONResponse(
+                {"detail": "Profile database was restored during this request; retry the action."},
+                status_code=409,
+                headers={"cache-control": "private, no-store"},
+            )
         _mark_private_no_store(response)
         return response
 
@@ -1278,6 +1533,12 @@ async def authenticate_engine_request(request: Request, call_next):
     ):
         try:
             await asyncio.to_thread(_recover_profile_for_request, account["profile_id"])
+        except ProfileDeletedError:
+            return JSONResponse(
+                {"detail": "Authentication required"},
+                status_code=401,
+                headers={"cache-control": "private, no-store"},
+            )
         except Exception:
             if not (request.method == "GET" and path == "/api/backups"):
                 LOGGER.exception(
@@ -1294,19 +1555,25 @@ async def authenticate_engine_request(request: Request, call_next):
         if raw_session
         else ""
     )
-    with (
-        profile_scope(account["profile_id"]),
-        session_scope(derived_session_id),
-        bind_request_restore_epoch(),
-    ):
-        try:
+    try:
+        with (
+            profile_scope(account["profile_id"]),
+            session_scope(derived_session_id),
+            bind_request_restore_epoch(),
+        ):
             response = await call_next(request)
-        except RestoreEpochError:
-            return JSONResponse(
-                {"detail": "Profile database was restored during this request; retry the action."},
-                status_code=409,
-                headers={"cache-control": "private, no-store"},
-            )
+    except ProfileDeletedError:
+        return JSONResponse(
+            {"detail": "Authentication required"},
+            status_code=401,
+            headers={"cache-control": "private, no-store"},
+        )
+    except RestoreEpochError:
+        return JSONResponse(
+            {"detail": "Profile database was restored during this request; retry the action."},
+            status_code=409,
+            headers={"cache-control": "private, no-store"},
+        )
     _mark_private_no_store(response)
     return response
 
@@ -1357,7 +1624,18 @@ def initial_admin_setup(payload: InitialAdminIn):
 @app.get("/auth/me")
 def auth_me(request: Request):
     account = _principal(request)
-    return {key: account[key] for key in ("id", "profile_id", "username", "display_name", "role", "must_change_password")}
+    return {
+        key: account[key]
+        for key in (
+            "id",
+            "profile_id",
+            "username",
+            "has_local_username",
+            "display_name",
+            "role",
+            "must_change_password",
+        )
+    }
 
 
 @app.post("/auth/logout")
@@ -1370,7 +1648,8 @@ def auth_logout(request: Request):
 def change_password(payload: PasswordChangeIn, request: Request):
     account = _principal(request)
     methods = identity_store.auth_methods(account["id"])
-    if methods["password_enabled"]:
+    local_username = bool(methods["has_local_username"])
+    if methods["password_enabled"] and local_username:
         session_hash = account.get("session_token_hash") or hashlib.sha256(
             (request.headers.get("x-bookward-session") or "").encode()
         ).hexdigest()
@@ -1391,15 +1670,33 @@ def change_password(payload: PasswordChangeIn, request: Request):
         if not verified or verified["id"] != account["id"]:
             raise HTTPException(401, "Current password is incorrect")
     else:
-        _require_recent_authentication(account)
-    identity_store.update_password(account["id"], payload.new_password)
-    raw, _ = identity_store.create_session(account["id"])
-    return {"changed": True, "session_token": raw, "max_age": identity_store.SESSION_IDLE_HOURS * 3600}
+        _require_enrollment_verification(account)
+    try:
+        identity_store.update_password(account["id"], payload.new_password, payload.username)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "That username is already in use") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    raw, updated = identity_store.create_session(account["id"])
+    return {
+        "changed": True,
+        "session_token": raw,
+        "max_age": identity_store.SESSION_IDLE_HOURS * 3600,
+        "username": updated["username"],
+        "has_local_username": updated["has_local_username"],
+    }
 
 
 @app.get("/auth/identities")
 def auth_identities(request: Request):
-    return identity_store.auth_methods(_principal(request)["id"])
+    account = _principal(request)
+    methods = identity_store.auth_methods(account["id"])
+    return {
+        **methods,
+        "enrollment_verified": bool(account.get("enrollment_verified")),
+    }
 
 
 @app.delete("/auth/identities/{identity_id}")
@@ -1411,6 +1708,49 @@ def auth_unlink_identity(identity_id: int, request: Request):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"unlinked": True, "identity_id": identity_id}
+
+
+@app.post("/auth/account/reset-history")
+def auth_reset_history(
+    request: Request,
+    payload: HistoryResetIn | None = Body(default=None),
+):
+    account = _principal(request)
+    if payload is None or payload.confirm != "RESET":
+        raise HTTPException(400, "Type RESET to confirm resetting your reading history")
+    _verify_account_confirmation(account, payload.current_password, request)
+    if has_restore_journal(account["profile_id"]):
+        try:
+            _recover_profile_for_request(account["profile_id"])
+        except Exception as exc:
+            raise HTTPException(503, RESTORE_FENCE_DETAIL) from exc
+    return reset_profile_history(account["profile_id"])
+
+
+@app.delete("/auth/account")
+def auth_delete_account(
+    request: Request,
+    payload: AccountDeleteIn | None = Body(default=None),
+):
+    account = _principal(request)
+    if payload is None or payload.confirm != "DELETE":
+        raise HTTPException(400, "Type DELETE to confirm deleting your account")
+    _verify_account_confirmation(account, payload.current_password, request)
+    try:
+        return identity_store.delete_account(
+            account["id"], actor_account_id=account["id"]
+        )
+    except PermissionError as exc:
+        raise HTTPException(401, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (OSError, sqlite3.Error, BackupError) as exc:
+        raise HTTPException(
+            503,
+            "Account access was revoked; remaining profile cleanup will finish automatically.",
+        ) from exc
 
 
 @app.get("/admin/accounts")
@@ -1436,7 +1776,10 @@ def admin_create_account(payload: AccountCreateIn, request: Request):
         identity_store.set_account_status(account["id"], "disabled")
         LOGGER.exception("Could not initialize profile database for account %s", account["id"])
         raise HTTPException(500, "The account was created but its profile could not be initialized") from exc
-    return {key: account[key] for key in ("id", "profile_id", "username", "display_name", "role", "status")}
+    return {
+        key: account[key]
+        for key in ("id", "profile_id", "username", "has_local_username", "display_name", "role", "status")
+    }
 
 
 @app.post("/admin/accounts/{account_id}/password")
@@ -1476,12 +1819,81 @@ def admin_set_account_status(account_id: str, payload: dict, request: Request):
         # Disabled profiles are excluded from startup/background work. Apply
         # any migrations accumulated while this account was disabled before
         # making its data available to a new session.
-        _ensure_profile_database(found["profile_id"])
+        try:
+            _ensure_profile_database(found["profile_id"])
+        except ProfileDeletedError as exc:
+            raise HTTPException(
+                400, "Account deletion is incomplete; retry deleting this account"
+            ) from exc
+        except BackupError as exc:
+            raise HTTPException(503, RESTORE_FENCE_DETAIL) from exc
     try:
         identity_store.set_account_status(account_id, status)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"updated": True, "account_id": account_id, "status": status}
+
+
+@app.delete("/admin/accounts/{account_id}")
+def admin_delete_account(
+    account_id: str,
+    request: Request,
+    payload: AdminAccountDeleteIn | None = Body(default=None),
+):
+    admin = _require_admin(request)
+    target = identity_store.account_by_id(account_id)
+    if not target:
+        raise HTTPException(404, "Account not found")
+    if target["role"] == "admin":
+        remaining_active_admins = [
+            item
+            for item in identity_store.accounts_list()
+            if item["role"] == "admin" and item["status"] == "active" and item["id"] != account_id
+        ]
+        if not remaining_active_admins:
+            raise HTTPException(400, "The installation must retain an active administrator")
+    if admin["id"] == account_id:
+        raise HTTPException(400, "Use Account settings to delete your own account")
+    target_has_local = (
+        bool(target["has_local_username"])
+        if "has_local_username" in target
+        else identity_store.has_local_username(target.get("username"))
+    )
+    expected_confirm = (
+        target["username"]
+        if target_has_local
+        else (str(target.get("display_name") or "").strip() or "DELETE")
+    )
+    submitted_confirm = (
+        payload.confirm_username.strip()
+        if payload is not None and payload.confirm_username is not None
+        else ""
+    )
+    accepted_confirms = {expected_confirm}
+    if not target_has_local:
+        accepted_confirms.add(target["username"])
+    if not submitted_confirm or submitted_confirm not in accepted_confirms:
+        raise HTTPException(
+            400, f"Type {expected_confirm} to confirm deleting this account"
+        )
+    _verify_account_confirmation(admin, payload.current_password, request)
+    try:
+        return identity_store.delete_account(
+            account_id,
+            actor_account_id=admin["id"],
+            require_active_admin_actor=True,
+        )
+    except PermissionError as exc:
+        raise HTTPException(401, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except (OSError, sqlite3.Error, BackupError) as exc:
+        raise HTTPException(
+            503,
+            "Account access was revoked, but profile cleanup could not complete immediately. Retry deleting this account or wait for background cleanup.",
+        ) from exc
 
 
 @app.delete("/admin/profiles/{profile_id}/restore-journal")
@@ -1492,8 +1904,13 @@ def admin_delete_restore_journal(profile_id: str, request: Request):
         and profile_id not in identity_store.profile_ids(active_only=False)
     ):
         raise HTTPException(404, "Profile not found")
-    with profile_scope(profile_id):
-        cleared = clear_interrupted_restore_journal()
+    try:
+        with profile_scope(profile_id):
+            cleared = clear_interrupted_restore_journal()
+    except ProfileDeletedError as exc:
+        raise HTTPException(
+            400, "Account deletion is incomplete; retry deleting this account"
+        ) from exc
     return {"cleared": cleared, "profile_id": profile_id}
 
 
@@ -1556,23 +1973,30 @@ async def _oidc_metadata():
 
 
 @app.get("/auth/oidc/start")
-async def oidc_start(request: Request, intent: Literal["login", "link"] = "login"):
+async def oidc_start(request: Request, intent: Literal["login", "link", "enroll"] = "login"):
     account = getattr(request.state, "account", None)
     if intent == "link" and not account:
         raise HTTPException(401, "Sign in before linking an SSO identity")
+    if intent == "enroll" and not account:
+        raise HTTPException(401, "Sign in before confirming single sign-on")
     if intent == "link":
         _require_recent_authentication(account)
+    if intent == "enroll":
+        methods = identity_store.auth_methods(account["id"])
+        if not methods["oidc_identities"]:
+            raise HTTPException(400, "Link a single sign-on identity before confirming with SSO")
     issuer, redirect_uri, metadata = await _oidc_metadata()
     state = secrets.token_urlsafe(32)
     csrf = secrets.token_urlsafe(32)
     nonce = secrets.token_urlsafe(32)
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    session_bound = intent in {"link", "enroll"}
     try:
         identity_store.create_oidc_transaction(
             state=state, csrf=csrf, nonce=nonce, verifier=verifier,
-            purpose=intent, account_id=account["id"] if intent == "link" else None,
-            session_token=request.headers.get("x-bookward-session") if intent == "link" else None,
+            purpose=intent, account_id=account["id"] if session_bound else None,
+            session_token=request.headers.get("x-bookward-session") if session_bound else None,
         )
     except RuntimeError as exc:
         raise HTTPException(429, "Too many pending SSO sign-ins. Try again shortly.") from exc
@@ -1586,6 +2010,9 @@ async def oidc_start(request: Request, intent: Literal["login", "link"] = "login
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
+    if intent == "enroll":
+        query_values["prompt"] = "login"
+        query_values["max_age"] = str(identity_store.ENROLLMENT_VERIFICATION_MINUTES * 60)
     authorization_endpoint = urlparse(metadata["authorization_endpoint"])
     query = urlencode(
         {**dict(parse_qsl(authorization_endpoint.query, keep_blank_values=True)), **query_values}
@@ -1657,6 +2084,17 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
         subject = claims.get("sub")
         if not isinstance(subject, str) or not subject or len(subject) > 255:
             raise ValueError("Invalid subject")
+        if transaction_record["purpose"] == "enroll":
+            auth_time = claims.get("auth_time")
+            now_epoch = time.time()
+            max_age_seconds = identity_store.ENROLLMENT_VERIFICATION_MINUTES * 60 + 60
+            if (
+                auth_time is None
+                or isinstance(auth_time, bool)
+                or not isinstance(auth_time, (int, float))
+                or not (now_epoch - max_age_seconds <= auth_time <= now_epoch + 60)
+            ):
+                raise ValueError("Missing or stale authentication time")
     except Exception as exc:
         LOGGER.info("Rejected OIDC callback: %s", type(exc).__name__)
         raise HTTPException(401, "The SSO provider could not verify this sign-in") from exc
@@ -1674,6 +2112,16 @@ async def oidc_callback(request: Request, code: str = Query(min_length=1, max_le
         except PermissionError as exc:
             raise HTTPException(409, str(exc)) from exc
         return {"linked": True, "account": current}
+    if transaction_record["purpose"] == "enroll":
+        current = getattr(request.state, "account", None)
+        if not current or current["id"] != transaction_record["account_id"]:
+            raise HTTPException(401, "Sign in again before confirming single sign-on")
+        matched = identity_store.account_for_oidc_identity(issuer, subject)
+        if not matched or matched["id"] != current["id"]:
+            raise HTTPException(403, "Sign in with an SSO identity already linked to this account")
+        if not identity_store.mark_session_enrollment_verified(request.headers.get("x-bookward-session")):
+            raise HTTPException(401, "Sign in again before confirming single sign-on")
+        return {"enroll_verified": True, "account": current}
 
     account = identity_store.account_for_oidc_identity(issuer, subject)
     if not account and settings.oidc_auto_provision:
@@ -1859,6 +2307,8 @@ class UndoFeedbackIn(BaseModel):
 
 class MarkReadIn(BaseModel):
     rating: int | None = Field(default=None, ge=1, le=5)
+    historical: bool = False
+    read_at: str | None = Field(default=None, max_length=64)
     session_id: str | None = Field(
         default=None,
         min_length=8,
@@ -1868,7 +2318,8 @@ class MarkReadIn(BaseModel):
 
 
 class ReadingHistoryRatingIn(BaseModel):
-    rating: int | None
+    rating: int | None = None
+    read_at: str | None = Field(default=None, max_length=64)
 
     @field_validator("rating", mode="before")
     @classmethod
@@ -1892,6 +2343,29 @@ class ReadingHistoryRatingIn(BaseModel):
                 return int(trimmed)
             raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
         raise ValueError("Rating must be a whole number between 1 and 5, or null for unrated")
+
+    @field_validator("read_at", mode="before")
+    @classmethod
+    def validate_read_at_type(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            if value.strip() == "":
+                raise HTTPException(
+                    400,
+                    "Use null to clear completion date, or provide YYYY-MM-DD",
+                )
+            return value
+        raise ValueError("Completion date must be a string (YYYY-MM-DD) or null")
+
+    @model_validator(mode="after")
+    def require_at_least_one_field(self) -> "ReadingHistoryRatingIn":
+        if not ({"rating", "read_at"} & self.model_fields_set):
+            raise ValueError("Provide rating or read_at to update")
+        return self
+
+
+UpdateReadIn = ReadingHistoryRatingIn
 
 
 class TelemetryEventIn(BaseModel):
@@ -2077,6 +2551,7 @@ def _format_recommendation_item(
     item: dict[str, Any], *, format_urls: bool = True
 ) -> dict[str, Any]:
     formatted = dict(item)
+    formatted["source_enabled"] = bool(formatted.get("source_enabled", 1))
     formatted["genres"] = _parse_json_list(formatted.get("genres"))
     formatted["explanation"] = normalize_explanation_items(
         _parse_json_list(formatted.get("explanation")),
@@ -2805,6 +3280,36 @@ def _complete_tracked_recommendations(
     return _result(recommendations, run_id, has_more)
 
 
+READS_RECENT_ORDER_SQL = (
+    "CASE WHEN read_at IS NULL OR TRIM(read_at)='' THEN 1 ELSE 0 END ASC, "
+    "CASE WHEN read_at IS NULL OR TRIM(read_at)='' "
+    "THEN COALESCE(julianday(created_at), 0) "
+    "ELSE COALESCE(julianday(replace(read_at, '/', '-')), 0) END DESC, "
+    "COALESCE(NULLIF(TRIM(read_at), ''), created_at) DESC, "
+    "id DESC"
+)
+
+
+def _normalize_read_at_input(raw_value: str | None) -> str | None:
+    if raw_value is None:
+        return None
+    cleaned = raw_value.strip()
+    if not cleaned:
+        return None
+    parsed_day = read_day(cleaned)
+    if parsed_day is None:
+        raise HTTPException(400, "Enter a valid completion date (YYYY-MM-DD)")
+    now_utc = datetime.now(timezone.utc)
+    if parsed_day > now_utc.date():
+        raise HTTPException(400, "Completion date cannot be in the future")
+    parsed_dt, day_precision = _read_time(cleaned)
+    if parsed_dt is not None and not day_precision:
+        if parsed_dt > now_utc + timedelta(minutes=5):
+            raise HTTPException(400, "Completion date cannot be in the future")
+        return parsed_dt.isoformat()
+    return parsed_day.isoformat()
+
+
 def tracked_recommendations_page(
     *,
     status: str | None = None,
@@ -2966,7 +3471,7 @@ def overview_payload(
         history_list = [
             dict(item)
             for item in connection.execute(
-                "SELECT * FROM reads ORDER BY COALESCE(read_at,created_at) DESC LIMIT 12"
+                f"SELECT * FROM reads ORDER BY {READS_RECENT_ORDER_SQL} LIMIT 12"
             ).fetchall()
         ]
         settings_payload = safe_settings(
@@ -3019,7 +3524,7 @@ def reading_history():
     with connect() as connection:
         items = [dict(item) for item in connection.execute(
             "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
-            "ORDER BY COALESCE(read_at,created_at) DESC,id DESC"
+            f"ORDER BY {READS_RECENT_ORDER_SQL}"
         ).fetchall()]
         existing_scores = []
         candidate_keys = list(dict.fromkeys(
@@ -3049,9 +3554,14 @@ def reading_history():
 
 @app.put("/api/reading-history/{read_id}")
 def update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn):
-    """Set, change, or clear a whole-star rating on an existing read entry."""
+    """Set, change, or clear rating and/or completion date on an existing read entry."""
     if read_id <= 0:
         raise HTTPException(404, "Read entry not found")
+    rating_updated = "rating" in payload.model_fields_set
+    read_at_updated = "read_at" in payload.model_fields_set
+    normalized_read_at = (
+        _normalize_read_at_input(payload.read_at) if read_at_updated else None
+    )
     with transaction() as con:
         existing = con.execute(
             "SELECT * FROM reads WHERE id=?",
@@ -3059,9 +3569,14 @@ def update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn)
         ).fetchone()
         if not existing:
             raise HTTPException(404, "Read entry not found")
+        new_rating = payload.rating if rating_updated else existing["rating"]
+        new_read_at = normalized_read_at if read_at_updated else existing["read_at"]
+        new_source = str(existing["source"] or "manual")
+        if read_at_updated and new_read_at is None and new_source == "manual":
+            new_source = "manual_history"
         con.execute(
-            "UPDATE reads SET rating=? WHERE id=?",
-            (payload.rating, read_id),
+            "UPDATE reads SET rating=?, read_at=?, source=? WHERE id=?",
+            (new_rating, new_read_at, new_source, read_id),
         )
         updated = dict(
             con.execute(
@@ -3070,7 +3585,11 @@ def update_reading_history_rating(read_id: int, payload: ReadingHistoryRatingIn)
             ).fetchone()
         )
         try:
-            sync_read_rating_in_connection(con, updated)
+            reconcile_read_outcomes_in_connection(
+                con,
+                updated,
+                read_at_updated=read_at_updated,
+            )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
     job_id = enqueue_followup_job("score")
@@ -3177,7 +3696,9 @@ async def _cached_rated_read_vectors(
         arr.setflags(write=False)
         frozen.append(arr)
     stored = tuple(frozen)
-    post_digest = _read_embedding_cache_digest(None, embedder.name, embedder.model)
+    post_digest = await asyncio.to_thread(
+        _read_embedding_cache_digest, None, embedder.name, embedder.model
+    )
     store_key = (tenant_key, (*embedder_base_key, post_digest), reads_state_key)
     _RATED_READ_VECTOR_CACHE[store_key] = stored
     _RATED_READ_VECTOR_CACHE.move_to_end(store_key)
@@ -3186,24 +3707,46 @@ async def _cached_rated_read_vectors(
     return stored
 
 
-@app.get("/api/reading-history/scores")
-async def reading_history_scores(
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(
-        default=READING_HISTORY_SCORE_MAX_LIMIT,
-        ge=1,
-        le=READING_HISTORY_SCORE_MAX_LIMIT,
-    ),
-):
-    """Rank a bounded slice of read books against the current reading profile."""
+def _load_reading_history_rater_inputs(
+    connection: sqlite3.Connection | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    if connection is None:
+        with connect() as owned:
+            return _load_reading_history_rater_inputs(owned)
+    config = private_settings(connection)
+    rated_reads = [
+        dict(item)
+        for item in connection.execute(
+            "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
+        ).fetchall()
+    ]
+    read_embedding_rows = [
+        dict(item)
+        for item in connection.execute(
+            "SELECT backend,model,entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
+            "FROM embeddings WHERE entity_type='read' ORDER BY backend,model,entity_id"
+        ).fetchall()
+    ]
+    return config, rated_reads, read_embedding_rows
+
+
+def _load_reading_history_score_inputs(
+    offset: int, limit: int
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     with connect() as connection:
         items = [dict(item) for item in connection.execute(
             "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
-            "ORDER BY COALESCE(read_at,created_at) DESC,id DESC LIMIT ? OFFSET ?",
+            f"ORDER BY {READS_RECENT_ORDER_SQL} LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()]
         if not items:
-            return []
+            return [], [], {}, [], []
         candidate_keys = list(dict.fromkeys(
             normalize_key(item["title"], item["author"]) for item in items
         ))
@@ -3221,20 +3764,31 @@ async def reading_history_scores(
             ).fetchall()]
             if candidate_keys else []
         )
-        config = private_settings(connection)
-        rated_reads = [
-            dict(item)
-            for item in connection.execute(
-                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
-            ).fetchall()
-        ]
-        read_embedding_rows = [
-            dict(item)
-            for item in connection.execute(
-                "SELECT backend,model,entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
-                "FROM embeddings WHERE entity_type='read' ORDER BY backend,model,entity_id"
-            ).fetchall()
-        ]
+        config, rated_reads, read_embedding_rows = _load_reading_history_rater_inputs(
+            connection
+        )
+    return items, existing_candidates, config, rated_reads, read_embedding_rows
+
+
+@app.get("/api/reading-history/scores")
+async def reading_history_scores(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(
+        default=READING_HISTORY_SCORE_MAX_LIMIT,
+        ge=1,
+        le=READING_HISTORY_SCORE_MAX_LIMIT,
+    ),
+):
+    """Rank a bounded slice of read books against the current reading profile."""
+    (
+        items,
+        existing_candidates,
+        config,
+        rated_reads,
+        read_embedding_rows,
+    ) = await asyncio.to_thread(_load_reading_history_score_inputs, offset, limit)
+    if not items:
+        return []
     candidates_by_identity = {}
     for candidate in existing_candidates:
         key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
@@ -3285,7 +3839,8 @@ async def reading_history_scores(
             persist=False,
             expected_dimensions=_vector_dimensions(read_vectors),
         )
-        ranked = rank_candidates(
+        ranked = await asyncio.to_thread(
+            rank_candidates,
             rated_reads,
             read_vectors,
             virtual_candidates,
@@ -3395,7 +3950,8 @@ def _recommendation_rows(
         else " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC, c.id DESC"
     )
     query = (
-        "SELECT c.*,s.name source_name,q.metadata_confidence,"
+        "SELECT c.*,s.name source_name,COALESCE(s.enabled, 0) source_enabled,"
+        "q.metadata_confidence,q.quality_status,"
         "q.work_id quality_work_id,"
         "q.provider quality_provider,q.provider_id AS quality_provider_id,"
         "q.isbn13 quality_isbn13,"
@@ -3520,6 +4076,7 @@ def recommendation_list(
             include_imported=effective_include_imported,
         )
     for item in result:
+        item["source_enabled"] = bool(item.get("source_enabled", 1))
         item["genres"] = _parse_json_list(item.get("genres"))
         item["explanation"] = normalize_explanation_items(
             _parse_json_list(item.get("explanation")),
@@ -3567,41 +4124,84 @@ def recommendations(
     return values
 
 
-def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=None):
+def _mark_candidate_read_in_connection(
+    con,
+    candidate,
+    rating=None,
+    session_id=None,
+    *,
+    historical: bool = False,
+    read_at: str | None = None,
+    rating_provided: bool = False,
+    read_at_provided: bool = False,
+):
     existing = con.execute(
-        "SELECT id,rating,read_at,source FROM reads WHERE title=? AND author=?",
+        "SELECT id,rating,read_at,source,isbn,openlibrary_work_id,created_at "
+        "FROM reads WHERE title=? AND author=?",
         (candidate["title"], candidate["author"]),
     ).fetchone()
     already_present = existing is not None
     existing_is_real = bool(existing and existing["source"] != "demo")
-    saved_rating = rating if rating is not None else existing["rating"] if existing_is_real else None
     purge_demo_reads(con)
-    read_at = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     openlibrary_work_id = book_openlibrary_work_id(candidate)
     isbn13, _isbn10 = isbn_parts(
         candidate["quality_isbn13"], candidate["quality_isbn10"]
     )
-    con.execute(
-        "INSERT INTO reads(title,author,rating,read_at,isbn,source,"
-        "openlibrary_work_id,openlibrary_lookup_attempted_at) "
-        "VALUES(?,?,?,?,?,'manual',?,"
-        "CASE WHEN ?!='' THEN CURRENT_TIMESTAMP ELSE NULL END) "
-        "ON CONFLICT(title,author) DO UPDATE SET "
-        "rating=COALESCE(excluded.rating,reads.rating),"
-        "read_at=COALESCE(reads.read_at,excluded.read_at),"
-        "isbn=COALESCE(reads.isbn,excluded.isbn)",
-        (
-            candidate["title"],
-            candidate["author"],
-            rating,
-            read_at,
-            isbn13 or None,
-            openlibrary_work_id,
-            openlibrary_work_id,
-        ),
-    )
+    if not existing_is_real:
+        target_source = "manual_history" if historical else "manual"
+        target_rating = rating
+        target_read_at = (
+            read_at
+            if (historical or read_at_provided or read_at is not None)
+            else now_iso
+        )
+        con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,isbn,source,"
+            "openlibrary_work_id,openlibrary_lookup_attempted_at) "
+            "VALUES(?,?,?,?,?,?,?,"
+            "CASE WHEN ?!='' THEN CURRENT_TIMESTAMP ELSE NULL END)",
+            (
+                candidate["title"],
+                candidate["author"],
+                target_rating,
+                target_read_at,
+                isbn13 or None,
+                target_source,
+                openlibrary_work_id,
+                openlibrary_work_id,
+            ),
+        )
+    else:
+        target_rating = (
+            rating
+            if rating_provided or rating is not None
+            else existing["rating"]
+        )
+        if read_at_provided:
+            target_read_at = read_at
+        elif existing["read_at"] is not None:
+            target_read_at = existing["read_at"]
+        elif historical:
+            target_read_at = None
+        else:
+            target_read_at = now_iso
+        target_source = str(existing["source"] or "manual")
+        if read_at_provided and target_read_at is None and target_source == "manual":
+            target_source = "manual_history"
+        target_isbn = existing["isbn"] or (isbn13 or None)
+        con.execute(
+            "UPDATE reads SET rating=?, read_at=?, isbn=?, source=? WHERE id=?",
+            (
+                target_rating,
+                target_read_at,
+                target_isbn,
+                target_source,
+                existing["id"],
+            ),
+        )
     read = con.execute(
-        "SELECT id,rating,read_at,source,isbn,openlibrary_work_id "
+        "SELECT id,title,author,rating,read_at,source,isbn,openlibrary_work_id,created_at "
         "FROM reads WHERE title=? AND author=?",
         (candidate["title"], candidate["author"]),
     ).fetchone()
@@ -3613,13 +4213,34 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
             (openlibrary_work_id, read["id"]),
         )
         read = con.execute(
-            "SELECT id,rating,read_at,source,isbn,openlibrary_work_id "
+            "SELECT id,title,author,rating,read_at,source,isbn,openlibrary_work_id,created_at "
             "FROM reads WHERE id=?",
             (read["id"],),
         ).fetchone()
+    manual_event_key = f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}"
+    read_event_key = f"read:{int(read['id']):08d}"
+    candidate_read_event_key = f"read:{int(read['id']):08d}:{int(candidate['id'])}"
+    existing_read_event = con.execute(
+        "SELECT event_key,candidate_id FROM recommendation_events "
+        "WHERE event_key IN (?,?,?) ORDER BY id",
+        (manual_event_key, read_event_key, candidate_read_event_key),
+    ).fetchall()
+    if any(str(item["event_key"]) == manual_event_key for item in existing_read_event):
+        try:
+            reconcile_read_outcomes_in_connection(
+                con,
+                dict(read),
+                read_at_updated=read_at_provided,
+                force_historical=bool(historical),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return read, already_present
+
+    saved_rating = read["rating"]
     read_time, day_precision = _read_time(read["read_at"])
     impression = None
-    if read_time is not None:
+    if not historical and read_time is not None:
         prior_impressions = con.execute(
             "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at,"
             "r.metadata AS run_metadata "
@@ -3639,17 +4260,16 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
             None,
         )
     label, label_kind, confidence = _read_label({"rating": saved_rating})
-    event_metadata = {
+    event_metadata: dict[str, Any] = {
         "read_source": str(read["source"] or "unknown")[:32],
-        "time_precision": "day" if day_precision else "timestamp",
+        "time_precision": (
+            "unknown"
+            if read_time is None
+            else ("day" if day_precision else "timestamp")
+        ),
     }
-    read_event_key = f"read:{int(read['id']):08d}"
-    candidate_read_event_key = f"read:{int(read['id']):08d}:{int(candidate['id'])}"
-    existing_read_event = con.execute(
-        "SELECT event_key,candidate_id FROM recommendation_events "
-        "WHERE event_key IN (?,?) ORDER BY id",
-        (read_event_key, candidate_read_event_key),
-    ).fetchall()
+    if historical:
+        event_metadata["historical"] = True
     matched_existing_key = next(
         (
             str(item["event_key"])
@@ -3661,10 +4281,10 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
     event_key = (
         matched_existing_key
         if matched_existing_key is not None
-        else f"manual-read:{int(candidate['id'])}:{int(read['id']):08d}"
+        else manual_event_key
     )
     try:
-        record_event_in_connection(
+        recorded = record_event_in_connection(
             con,
             event_key=event_key,
             candidate_id=int(candidate["id"]),
@@ -3673,15 +4293,37 @@ def _mark_candidate_read_in_connection(con, candidate, rating=None, session_id=N
             source="manual_read",
             run_id=str(impression["run_id"]) if impression is not None else None,
             metadata=event_metadata,
-            occurred_at=read["read_at"] or read_at,
+            occurred_at=read["read_at"] or now_iso,
             label=label if impression is not None else None,
             label_kind=label_kind if impression is not None else None,
             confidence=confidence if impression is not None else None,
             read_id=int(read["id"]) if impression is not None else None,
+            clear_read_outcome=impression is None,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    if impression is None:
+        con.execute(
+            "DELETE FROM recommendation_outcomes WHERE read_id=? OR event_id=?",
+            (int(read["id"]), int(recorded["id"])),
+        )
     return read, already_present
+
+
+def _ensure_candidate_restorable(candidate) -> None:
+    if not int(candidate["source_enabled"]):
+        source_label = str(candidate["source_name"] or "its source").strip()
+        raise HTTPException(
+            409,
+            f"Cannot return this book to Discover while {source_label} is disabled. "
+            "Re-enable the source in Sources, or Shortlist or Mark Read from History.",
+        )
+    if str(candidate["quality_status"]) != "accepted":
+        raise HTTPException(
+            409,
+            "Cannot return this book to Discover because it has not passed catalog quality checks. "
+            "You can still Shortlist or Mark Read from History.",
+        )
 
 
 def _clear_explicit_feedback_outcomes(
@@ -3735,10 +4377,18 @@ def feedback(candidate_id: int, payload: FeedbackIn):
     }[payload.action]
     with transaction() as con:
         candidate = con.execute(
-            "SELECT status FROM candidates WHERE id=?", (candidate_id,)
+            "SELECT c.status, COALESCE(s.enabled, 0) AS source_enabled, "
+            "s.name AS source_name, COALESCE(q.quality_status, 'pending') AS quality_status "
+            "FROM candidates c "
+            "LEFT JOIN sources s ON s.id=c.source_id "
+            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            "WHERE c.id=?",
+            (candidate_id,),
         ).fetchone()
         if not candidate:
             raise HTTPException(404, "Recommendation not found")
+        if payload.action == "restore":
+            _ensure_candidate_restorable(candidate)
         previous_status = str(candidate["status"])
         con.execute("UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (status,candidate_id))
         feedback_id = con.execute(
@@ -3816,7 +4466,8 @@ def _undo_feedback_in_connection(con, candidate_id: int, decision_id: int):
     }[decision["action"]]
     if current["status"] != expected_status:
         raise HTTPException(409, "The recommendation changed after this decision")
-    previous_status = str(decision["previous_status"])
+    raw_previous_status = str(decision["previous_status"])
+    previous_status = "new" if raw_previous_status == "hidden" else raw_previous_status
     con.execute(
         "UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
         (previous_status, candidate_id),
@@ -3867,6 +4518,11 @@ def undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
 
 @app.post("/api/recommendations/{candidate_id}/read")
 def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
+    normalized_read_at = (
+        _normalize_read_at_input(payload.read_at)
+        if "read_at" in payload.model_fields_set
+        else None
+    )
     with transaction() as con:
         candidate = con.execute(
             "SELECT c.id,c.title,c.author,c.source_url,"
@@ -3884,6 +4540,10 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
             candidate,
             rating=payload.rating,
             session_id=payload.session_id,
+            historical=bool(payload.historical),
+            read_at=normalized_read_at,
+            rating_provided="rating" in payload.model_fields_set,
+            read_at_provided="read_at" in payload.model_fields_set,
         )
         con.execute(
             "UPDATE candidates SET status='read',updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -3902,6 +4562,8 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
         "read_id": int(read["id"]),
         "status": "read",
         "rating": read["rating"],
+        "read_at": read["read_at"],
+        "source": read["source"],
         "job_id": job_id,
         "read_work_identities_job_id": read_work_identities_job_id,
         "read_metadata_job_id": read_metadata_job_id,
@@ -3921,12 +4583,21 @@ def bulk_feedback(payload: BulkFeedbackIn):
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
         placeholders = ",".join("?" for _ in ids)
+        rows_found = con.execute(
+            "SELECT c.id, c.status, COALESCE(s.enabled, 0) AS source_enabled, "
+            "s.name AS source_name, COALESCE(q.quality_status, 'pending') AS quality_status "
+            "FROM candidates c "
+            "LEFT JOIN sources s ON s.id=c.source_id "
+            "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            f"WHERE c.id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        if payload.action == "restore":
+            for item in rows_found:
+                _ensure_candidate_restorable(item)
         candidate_rows = {
             int(item["id"]): str(item["status"])
-            for item in con.execute(
-                f"SELECT id,status FROM candidates WHERE id IN ({placeholders})",
-                ids,
-            ).fetchall()
+            for item in rows_found
         }
         found = [candidate_id for candidate_id in ids if candidate_id in candidate_rows]
         run_candidate_ids: set[int] = set()
@@ -4325,11 +4996,54 @@ def update_goodreads_rss_settings(payload: GoodreadsRSSSettingsIn):
         except ValueError as exc:
             raise HTTPException(400, safe_error_message(exc)) from exc
     with transaction() as con:
+        existing_row = con.execute(
+            "SELECT value,secret FROM settings WHERE key='goodreads_rss_url'"
+        ).fetchone()
+        previous_url = ""
+        if existing_row and existing_row["value"]:
+            try:
+                previous_url = (
+                    unseal(existing_row["value"])
+                    if existing_row["secret"]
+                    else str(existing_row["value"])
+                ).strip()
+            except Exception:
+                previous_url = ""
         con.execute(
             "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_url',?,1) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1,updated_at=CURRENT_TIMESTAMP",
             (seal(url) if url else "",),
         )
+        if not url or (previous_url and previous_url != url):
+            previous_rss_shelves = [
+                dict(row)
+                for row in con.execute(
+                    "SELECT shelf, title, author, additional_authors, isbn, openlibrary_work_id "
+                    "FROM goodreads_shelf_items WHERE source='goodreads_rss'"
+                ).fetchall()
+            ]
+            con.execute(
+                "DELETE FROM goodreads_shelf_items WHERE source='goodreads_rss'"
+            )
+            ingestion.purge_deleted_shelf_evidence(con, previous_rss_shelves)
+            if not url:
+                for key, value in (
+                    ("goodreads_rss_last_sync_at", ""),
+                    ("goodreads_rss_last_status", ""),
+                    ("goodreads_rss_last_attempt_at", ""),
+                    ("goodreads_rss_last_error", ""),
+                    ("goodreads_rss_last_scheduled_date", ""),
+                ):
+                    con.execute(
+                        "INSERT INTO settings(key,value,secret) VALUES(?,?,0) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=0,updated_at=CURRENT_TIMESTAMP",
+                        (key, value),
+                    )
+            else:
+                con.execute(
+                    "INSERT INTO settings(key,value,secret) VALUES('goodreads_rss_last_scheduled_date','',0) "
+                    "ON CONFLICT(key) DO UPDATE SET value='',secret=0,updated_at=CURRENT_TIMESTAMP"
+                )
     return {"saved": True, "configured": bool(url)}
 
 
@@ -5039,7 +5753,8 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
             candidate_rows = {
                 int(item["id"]): dict(item)
                 for item in connection.execute(
-                    "SELECT c.*,s.name source_name,q.metadata_confidence,"
+                    "SELECT c.*,s.name source_name,COALESCE(s.enabled,1) source_enabled,"
+                    "q.metadata_confidence,q.quality_status,"
                     "q.work_id quality_work_id,"
                     "q.provider quality_provider,q.provider_id AS quality_provider_id,"
                     "q.isbn13 quality_isbn13,"
@@ -5103,12 +5818,12 @@ def retry_digest_delivery(delivery_id: str):
     return {"job_id": enqueue_job(f"notification_retry:{delivery_id}", dedupe=True)}
 
 @app.post("/api/sync")
-async def sync():
-    return {"job_id":enqueue_job("sync", dedupe=True)}
+def sync():
+    return {"job_id": enqueue_job("sync", dedupe=True)}
 
 @app.post("/api/score")
-async def score():
-    return {"job_id":enqueue_job("score", dedupe=True)}
+def score():
+    return {"job_id": enqueue_job("score", dedupe=True)}
 
 def _has_resumable_manual_sweep() -> bool:
     if private_setting(QUALITY_SWEEP_ACTIVE_KEY, "") == "1":
@@ -5116,6 +5831,32 @@ def _has_resumable_manual_sweep() -> bool:
     if active_job("candidate_quality"):
         return True
     return bool(get_candidate_quality_sweep_status().get("can_retry"))
+
+
+def _queue_candidate_audit(
+    *,
+    effective_mode: Literal["incremental", "full"] | None,
+    effective_retry: bool,
+    effective_retry_quarantined: bool,
+) -> dict[str, Any]:
+    if effective_retry_quarantined or (
+        effective_retry and effective_mode is None and not _has_resumable_manual_sweep()
+    ):
+        cutoff = _utc_audit_timestamp()
+        settings_updates = {
+            QUALITY_RETRY_QUARANTINED_BEFORE_KEY: cutoff,
+            QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+        }
+        if not active_job("candidate_quality_recovery"):
+            settings_updates[QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY] = ""
+        _set_quality_recovery_settings(**settings_updates)
+        return {
+            "job_id": enqueue_job("candidate_quality_recovery", dedupe=True),
+            "mode": "incremental",
+            "retry_quarantined": True,
+            "quarantine_retry_days": CATALOG_QUARANTINE_RETRY_DAYS,
+        }
+    return configure_candidate_quality_sweep(mode=effective_mode, retry=effective_retry)
 
 
 @app.post("/api/candidates/audit")
@@ -5161,32 +5902,21 @@ async def candidate_audit(
             count_only=effective_count_only,
             retry_quarantined=bool(effective_retry or effective_retry_quarantined),
         )
-    if effective_retry_quarantined or (
-        effective_retry and effective_mode is None and not _has_resumable_manual_sweep()
-    ):
-        cutoff = _utc_audit_timestamp()
-        settings_updates = {
-            QUALITY_RETRY_QUARANTINED_BEFORE_KEY: cutoff,
-            QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
-        }
-        if not active_job("candidate_quality_recovery"):
-            settings_updates[QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY] = ""
-        _set_quality_recovery_settings(**settings_updates)
-        return {
-            "job_id": enqueue_job("candidate_quality_recovery", dedupe=True),
-            "mode": "incremental",
-            "retry_quarantined": True,
-            "quarantine_retry_days": CATALOG_QUARANTINE_RETRY_DAYS,
-        }
-    return configure_candidate_quality_sweep(mode=effective_mode, retry=effective_retry)
+    return await asyncio.to_thread(
+        lambda: _queue_candidate_audit(
+            effective_mode=effective_mode,
+            effective_retry=effective_retry,
+            effective_retry_quarantined=effective_retry_quarantined,
+        )
+    )
 
 @app.get("/api/candidates/quality")
 def candidate_quality():
     return quality_summary()
 
 @app.post("/api/embeddings/rebuild")
-async def rebuild_embeddings():
-    return {"job_id":enqueue_job("rebuild_embeddings", dedupe=True)}
+def rebuild_embeddings():
+    return {"job_id": enqueue_job("rebuild_embeddings", dedupe=True)}
 
 @app.get("/api/jobs/{job_id}")
 def job(job_id:str):
@@ -5605,6 +6335,7 @@ def api_root():
             "recommendations": "GET /api/v1/recommendations",
             "feedback": "POST /api/v1/recommendations/{id}/feedback",
             "undo": "POST /api/v1/recommendations/{id}/undo",
+            "mark_read": "POST /api/v1/recommendations/{id}/read",
             "sources": "GET /api/v1/sources",
             "sync": "POST /api/v1/sync",
         },
@@ -5690,6 +6421,11 @@ def api_undo_feedback(candidate_id: int, payload: UndoFeedbackIn):
     return undo_feedback(candidate_id, payload)
 
 
+@api_v1.post("/recommendations/{candidate_id}/read")
+def api_mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
+    return mark_recommendation_read(candidate_id, payload)
+
+
 @api_v1.post("/telemetry/events")
 def api_telemetry_events(payload: TelemetryBatchIn):
     return telemetry_events(payload)
@@ -5741,13 +6477,13 @@ async def api_goodreads_rss(payload: UrlIn):
 
 
 @api_v1.post("/sync")
-async def api_sync():
-    return await sync()
+def api_sync():
+    return sync()
 
 
 @api_v1.post("/score")
-async def api_score():
-    return await score()
+def api_score():
+    return score()
 
 
 @api_v1.get("/associations/settings")

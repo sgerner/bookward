@@ -88,7 +88,10 @@ type Overview = {
     metadata_confidence: number;
     explanation: string[];
     status: string;
+    source_id?: number | null;
     source_name: string | null;
+    source_enabled?: boolean;
+    quality_status?: string | null;
   }>;
   recommendation_genres?: string[];
   decisions?: Overview["recommendations"];
@@ -240,6 +243,9 @@ const distinctGenres = (items: Array<{ genres: string[] }>) => {
 };
 
 export const load: PageServerLoad = async ({ url, request, locals }) => {
+  if (locals?.engineUnavailable) {
+    throw httpError(503, "Bookward's recommendation engine is unavailable.");
+  }
   const fallbackBackupStatus: BackupStatus = {
     enabled: false,
     interval_hours: 0,
@@ -289,11 +295,8 @@ export const load: PageServerLoad = async ({ url, request, locals }) => {
   let overview: Overview;
   try {
     overview = await overviewRequest;
-  } catch (cause) {
-    throw httpError(
-      503,
-      `Bookward's recommendation engine is unavailable. ${message(cause)}`,
-    );
+  } catch {
+    throw httpError(503, "Bookward's recommendation engine is unavailable.");
   }
   const [backupStatus, rawCatalogQuality] = await Promise.all([
     backupStatusRequest,
@@ -423,6 +426,30 @@ const sourceFiltersFromForm = (data: FormData): SourceFilters => ({
 const optionalFormText = (data: FormData, key: string) => {
   const value = formText(data, key);
   return value || undefined;
+};
+const parseReadAtDateInput = (
+  raw: string,
+): { ok: true; value: string | undefined } | { ok: false; message: string } => {
+  const cleaned = raw.trim();
+  if (!cleaned) return { ok: true, value: undefined };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
+    return { ok: false, message: "Enter a valid completion date (YYYY-MM-DD)." };
+  }
+  const [year, month, day] = cleaned.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  if (
+    Number.isNaN(parsed.valueOf()) ||
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() + 1 !== month ||
+    parsed.getUTCDate() !== day
+  ) {
+    return { ok: false, message: "Enter a valid completion date (YYYY-MM-DD)." };
+  }
+  const todayUtc = new Date().toISOString().slice(0, 10);
+  if (cleaned > todayUtc) {
+    return { ok: false, message: "Completion date cannot be in the future." };
+  }
+  return { ok: true, value: cleaned };
 };
 const updateSourceLifecycle = async (
   rawId: FormDataEntryValue | null,
@@ -654,7 +681,7 @@ export const actions: Actions = {
           : {}),
       };
     } catch (error) {
-      return fail(502, { message: message(error) });
+      return fail(engineStatus(error), { message: message(error) });
     }
   },
   undoDecision: async ({ request }) => {
@@ -697,19 +724,35 @@ export const actions: Actions = {
     const id = idSchema.safeParse(data.get("id"));
     const rawRating = formText(data, "rating");
     const rating = rawRating ? Number(rawRating) : undefined;
+    const historical = ["1", "true", "on"].includes(
+      formText(data, "historical").toLowerCase(),
+    );
+    const parsedReadAt = parseReadAtDateInput(formText(data, "read_at"));
     if (
       !id.success ||
       (rating !== undefined && (!Number.isInteger(rating) || rating < 1 || rating > 5))
     ) {
       return fail(400, { message: "Choose a valid book and an optional rating from 1 to 5." });
     }
+    if (!parsedReadAt.ok) {
+      return fail(400, { message: parsedReadAt.message });
+    }
     try {
       await engine(`/api/recommendations/${id.data}/read`, {
         method: "POST",
         body: JSON.stringify({
           ...(rating === undefined ? {} : { rating }),
+          ...(historical ? { historical: true } : {}),
+          ...(parsedReadAt.value === undefined ? {} : { read_at: parsedReadAt.value }),
         }),
       });
+      if (historical) {
+        return {
+          message: rating === undefined
+            ? "Added past read to your reading history."
+            : `Added past read to your reading history with a ${rating}-star rating.`,
+        };
+      }
       return {
         message: rating === undefined
           ? "Marked Read and added to your history."

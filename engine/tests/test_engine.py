@@ -235,10 +235,10 @@ def test_source_scheduler_ignores_association_provider_records(database):
 
 
 def test_expensive_job_requests_reuse_active_queue_entries(database):
-    first_sync = asyncio.run(sync())
-    second_sync = asyncio.run(sync())
-    first_score = asyncio.run(score())
-    second_score = asyncio.run(score())
+    first_sync = sync()
+    second_sync = sync()
+    first_score = score()
+    second_score = score()
 
     assert first_sync == second_sync
     assert first_score == second_score

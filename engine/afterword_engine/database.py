@@ -1,6 +1,10 @@
 import functools
 import json
+import logging
+import os
+import re
 import sqlite3
+import tempfile
 import threading
 import time
 import weakref
@@ -17,16 +21,20 @@ from .covers import (
 )
 from .identity import ReadIdentityIndex, book_identity, book_identity_matches, normalize_key
 from .isbn import isbn_parts_from_amazon_url
-from .secrets import unseal
+from .secrets import installation_key_path, unseal
 from .tenancy import (
+    ProfileDeletedError,
     active_restore_epoch_binding,
     bound_restore_epoch,
+    current_profile_id,
     profile_database_path,
+    profile_scope,
     restore_epoch_latch_scope,
     restore_epoch_scope,
     restore_fence_bypassed,
 )
 
+LOGGER = logging.getLogger(__name__)
 METADATA_PROVENANCE_MAX_BYTES = 8192
 SEEDED_DEFAULT_SOURCES_KEY = "seeded_default_source_urls"
 RESTORE_EPOCH_KEY = "restore_epoch"
@@ -1524,6 +1532,87 @@ MIGRATIONS = [
         DROP TABLE temp._m31_demo_reads;
         """,
     ),
+    (
+        32,
+        """
+        -- DYNAMIC_GOODREADS_SHELF_ITEMS_REBUILD
+        DROP TABLE IF EXISTS goodreads_shelf_items_v2;
+        CREATE TABLE goodreads_shelf_items_v2 (
+            id INTEGER PRIMARY KEY,
+            shelf TEXT NOT NULL CHECK(shelf IN ('to-read', 'currently-reading')),
+            source TEXT NOT NULL DEFAULT 'goodreads_csv' CHECK(source IN ('goodreads_csv', 'goodreads_rss', 'legacy')),
+            title TEXT NOT NULL,
+            author TEXT NOT NULL,
+            isbn TEXT,
+            openlibrary_work_id TEXT,
+            added_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            additional_authors TEXT NOT NULL DEFAULT '',
+            UNIQUE(source, title, author)
+        );
+        INSERT INTO goodreads_shelf_items_v2(
+            shelf, source, title, author, isbn, openlibrary_work_id, added_at, updated_at, additional_authors
+        )
+        SELECT
+            shelf,
+            'legacy',
+            title,
+            author,
+            isbn,
+            openlibrary_work_id,
+            added_at,
+            updated_at,
+            additional_authors
+        FROM (
+            SELECT shelf, title, author, isbn, openlibrary_work_id, added_at, updated_at, additional_authors
+            FROM goodreads_shelf_items
+            ORDER BY updated_at ASC, id ASC
+            LIMIT -1
+        )
+        WHERE 1=1
+        ON CONFLICT(source, title, author) DO UPDATE SET
+            shelf=excluded.shelf,
+            isbn=COALESCE(excluded.isbn, goodreads_shelf_items_v2.isbn),
+            openlibrary_work_id=COALESCE(NULLIF(excluded.openlibrary_work_id, ''), goodreads_shelf_items_v2.openlibrary_work_id),
+            added_at=COALESCE(excluded.added_at, goodreads_shelf_items_v2.added_at),
+            updated_at=excluded.updated_at,
+            additional_authors=COALESCE(NULLIF(excluded.additional_authors, ''), goodreads_shelf_items_v2.additional_authors, excluded.additional_authors);
+        DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf;
+        DROP INDEX IF EXISTS idx_goodreads_shelf_items_source_shelf;
+        DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author;
+        DROP TABLE goodreads_shelf_items;
+        ALTER TABLE goodreads_shelf_items_v2 RENAME TO goodreads_shelf_items;
+        CREATE INDEX idx_goodreads_shelf_items_shelf
+            ON goodreads_shelf_items(shelf, updated_at DESC);
+        CREATE INDEX idx_goodreads_shelf_items_source_shelf
+            ON goodreads_shelf_items(source, shelf);
+        CREATE INDEX idx_goodreads_shelf_items_title_author
+            ON goodreads_shelf_items(title, author);
+        UPDATE candidates
+        SET status='new', score=0, explanation='[]', score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
+        WHERE status='hidden'
+          AND NOT EXISTS (
+              SELECT 1 FROM feedback f
+              WHERE f.candidate_id = candidates.id
+                AND f.undone_at IS NULL
+                AND f.action IN ('reject', 'maybe_later')
+                AND f.id = (
+                    SELECT MAX(f2.id) FROM feedback f2
+                    WHERE f2.candidate_id = candidates.id
+                      AND f2.undone_at IS NULL
+                )
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM recommendation_events e
+              WHERE e.candidate_id = candidates.id
+                AND e.event_type IN ('reject', 'maybe_later')
+                AND e.id = (
+                    SELECT MAX(e2.id) FROM recommendation_events e2
+                    WHERE e2.candidate_id = candidates.id
+                )
+          );
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -1582,14 +1671,108 @@ class _ActiveWorkerJob:
     done: threading.Event
 
 
+TOMBSTONE_SUFFIX = ".bookward-deleted"
+
+
+def _tombstone_marker_path(db_path: Path) -> Path:
+    return db_path.parent / f".{db_path.name}{TOMBSTONE_SUFFIX}"
+
+
+def _is_tombstoned_on_disk(db_path: Path) -> bool:
+    if db_path == Path(settings.db):
+        return False
+    return _tombstone_marker_path(db_path).is_file()
+
+
+def _read_tombstone_marker(db_path: Path) -> dict:
+    marker = _tombstone_marker_path(db_path)
+    if marker.is_symlink() or not marker.is_file():
+        return {}
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_tombstone_marker(db_path: Path, **fields) -> None:
+    if db_path == Path(settings.db):
+        return
+    marker = _tombstone_marker_path(db_path)
+    marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if marker.parent.name == "profiles":
+        try:
+            marker.parent.chmod(0o700)
+        except OSError:
+            pass
+    existing = _read_tombstone_marker(db_path)
+    payload = {
+        **existing,
+        "deleted_at": existing.get("deleted_at")
+        or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "scrub_pending": existing.get("scrub_pending", True),
+        **fields,
+    }
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=".bookward-tombstone-", suffix=".tmp", dir=marker.parent
+    )
+    os.fchmod(descriptor, 0o600)
+    temporary = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(json.dumps(payload, sort_keys=True).encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, marker)
+        os.chmod(marker, 0o600)
+        _fsync_directory_if_present(marker.parent)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def read_tombstone_marker(profile_id: str) -> dict | None:
+    if profile_id == "legacy":
+        return None
+    db_path = profile_database_path(profile_id)
+    if not _is_tombstoned_on_disk(db_path):
+        return None
+    return _read_tombstone_marker(db_path)
+
+
+def update_tombstone_marker(profile_id: str, **fields) -> None:
+    if profile_id == "legacy":
+        return
+    db_path = profile_database_path(profile_id)
+    if not _is_tombstoned_on_disk(db_path):
+        return
+    _write_tombstone_marker(db_path, **fields)
+
+
+def is_profile_tombstoned(profile_id: str) -> bool:
+    if profile_id == "legacy":
+        return False
+    db_path = profile_database_path(profile_id)
+    return database_lock(db_path).is_deleted
+
+
+def is_database_deleted(path: str | Path | None = None) -> bool:
+    return database_lock(path).is_deleted
+
+
 class _ProfileDatabaseLock:
-    """Coordinate shared readers, exclusive writers, and restore quiescence per profile DB.
+    """Coordinate shared readers, exclusive writers, restore quiescence, and tombstones.
 
     ``shared()``, ``try_shared()``, and ``is_locked()`` allow concurrent readers
-    (including shared online backups) when idle, while refusing new readers both
-    during exclusive writer acquisition and during ``quiesce()``'s drain window
-    (``_restoring_count > 0``). ``acquire(deadline=None)`` blocks without a
-    timeout by default and raises ``BackupError`` when a restore deadline expires.
+    (including shared online backups) when idle, while refusing new readers
+    during exclusive writer acquisition, ``quiesce()``'s drain window
+    (``_restoring_count > 0``), and profile erasure (``_closing_for_delete`` /
+    ``_deleted``). ``acquire(deadline=None)`` blocks without a timeout by
+    default and raises ``BackupError`` when a restore deadline expires.
+
+    Live connection draining assumes a single engine process (``engine/Dockerfile``
+    runs ``uvicorn`` without ``--workers``); ``TOMBSTONE_SUFFIX`` persists deleted
+    profile markers on disk so restarts never recreate erased ``.sqlite3`` or key files.
     """
 
     def __init__(self):
@@ -1599,10 +1782,21 @@ class _ProfileDatabaseLock:
         self._waiting_writers = 0
         self._connections = 0
         self._connections_by_thread: dict[int, int] = {}
+        self._closing_for_delete = False
+        self._deleted = False
         self._restoring_count = 0
         self._quiesce_deadlines: dict[int, list[float]] = {}
         self._active_jobs: set[_ActiveWorkerJob] = set()
         self._active_schedulers: set[tuple[object, int]] = set()
+
+    def _mark_deleted(self) -> None:
+        with self._condition:
+            self._deleted = True
+
+    @property
+    def is_deleted(self) -> bool:
+        with self._condition:
+            return self._deleted
 
     def is_restoring(self) -> bool:
         with self._condition:
@@ -1613,7 +1807,9 @@ class _ProfileDatabaseLock:
         with self._condition:
             owns_connection = self._connections_by_thread.get(owner, 0) > 0
             return (
-                (self._restoring_count > 0 and self._writer != owner)
+                self._deleted
+                or (self._closing_for_delete and self._writer != owner)
+                or (self._restoring_count > 0 and self._writer != owner)
                 or self._writer not in (None, owner)
                 or (
                     bool(self._waiting_writers)
@@ -1627,6 +1823,8 @@ class _ProfileDatabaseLock:
         owner = threading.get_ident()
         entry = (object(), owner)
         with self._condition:
+            if self._deleted or (self._closing_for_delete and self._writer != owner):
+                raise ProfileDeletedError("Profile has been deleted")
             owns_connection = self._connections_by_thread.get(owner, 0) > 0
             if (
                 self._restoring_count > 0
@@ -1658,6 +1856,10 @@ class _ProfileDatabaseLock:
             done=done,
         )
         with self._condition:
+            if self._deleted or self._closing_for_delete:
+                cancel_callback()
+                done.set()
+                raise ProfileDeletedError("Profile has been deleted")
             if self._restoring_count > 0:
                 cancel_immediately = True
             else:
@@ -1683,6 +1885,8 @@ class _ProfileDatabaseLock:
         current_thread = threading.get_ident()
         deadline = time.monotonic() + max(0.0, timeout)
         with self._condition:
+            if self._deleted or self._closing_for_delete:
+                raise ProfileDeletedError("Profile has been deleted")
             self._restoring_count += 1
             self._quiesce_deadlines.setdefault(current_thread, []).append(deadline)
             jobs_to_cancel = list(self._active_jobs)
@@ -1717,16 +1921,27 @@ class _ProfileDatabaseLock:
     def acquire_connection(self) -> int:
         owner = threading.get_ident()
         with self._condition:
+            if self._deleted:
+                raise ProfileDeletedError("Profile has been deleted")
             owns_connection = self._connections_by_thread.get(owner, 0) > 0
+            if self._closing_for_delete and self._writer != owner and not owns_connection:
+                raise ProfileDeletedError("Profile has been deleted")
             while (
-                self._writer not in (None, owner)
-                or (
-                    self._waiting_writers
-                    and self._writer != owner
-                    and not owns_connection
+                not self._deleted
+                and (
+                    self._writer not in (None, owner)
+                    or (
+                        (self._waiting_writers or self._closing_for_delete)
+                        and self._writer != owner
+                        and not owns_connection
+                    )
                 )
             ):
                 self._condition.wait()
+            if self._deleted or (
+                self._closing_for_delete and self._writer != owner and not owns_connection
+            ):
+                raise ProfileDeletedError("Profile has been deleted")
             self._connections += 1
             self._connections_by_thread[owner] = (
                 self._connections_by_thread.get(owner, 0) + 1
@@ -1754,12 +1969,21 @@ class _ProfileDatabaseLock:
             self.release_connection(owner)
 
     @contextmanager
-    def try_shared(self):
+    def try_shared(self, *, allow_during_quiesce: bool = False):
         owner = threading.get_ident()
         with self._condition:
+            if self._deleted:
+                raise ProfileDeletedError("Profile has been deleted")
             owns_connection = self._connections_by_thread.get(owner, 0) > 0
+            if self._closing_for_delete and self._writer != owner and not owns_connection:
+                raise ProfileDeletedError("Profile has been deleted")
+            restoring_blocked = (
+                self._restoring_count > 0
+                and self._writer != owner
+                and not allow_during_quiesce
+            )
             if (
-                (self._restoring_count > 0 and self._writer != owner)
+                restoring_blocked
                 or self._writer not in (None, owner)
                 or (
                     self._waiting_writers
@@ -1783,9 +2007,13 @@ class _ProfileDatabaseLock:
     def acquire(self, deadline: float | None = None) -> None:
         owner = threading.get_ident()
         with self._condition:
+            if self._deleted:
+                raise ProfileDeletedError("Profile has been deleted")
             if self._writer == owner:
                 self._write_depth += 1
                 return
+            if self._closing_for_delete:
+                raise ProfileDeletedError("Profile has been deleted")
             effective_deadline = deadline
             if effective_deadline is None:
                 stack = self._quiesce_deadlines.get(owner)
@@ -1793,7 +2021,11 @@ class _ProfileDatabaseLock:
                     effective_deadline = stack[-1]
             self._waiting_writers += 1
             try:
-                while self._writer is not None or self._connections:
+                while (
+                    not self._deleted
+                    and not self._closing_for_delete
+                    and (self._writer is not None or self._connections)
+                ):
                     if effective_deadline is not None:
                         remaining = effective_deadline - time.monotonic()
                         if remaining <= 0:
@@ -1805,6 +2037,8 @@ class _ProfileDatabaseLock:
                         self._condition.wait(timeout=remaining)
                     else:
                         self._condition.wait()
+                if self._deleted or self._closing_for_delete:
+                    raise ProfileDeletedError("Profile has been deleted")
                 self._writer = owner
                 self._write_depth = 1
             finally:
@@ -1830,6 +2064,43 @@ class _ProfileDatabaseLock:
                 self._writer = None
                 self._condition.notify_all()
 
+    @contextmanager
+    def tombstone(self, key: str | None = None, metadata: dict | None = None):
+        owner = threading.get_ident()
+        with self._condition:
+            jobs_to_cancel = list(self._active_jobs)
+            if self._writer == owner:
+                self._write_depth += 1
+                self._closing_for_delete = True
+                self._deleted = True
+                for job_handle in jobs_to_cancel:
+                    job_handle.cancel()
+            else:
+                self._closing_for_delete = True
+                self._waiting_writers += 1
+                self._condition.notify_all()
+                try:
+                    for job_handle in jobs_to_cancel:
+                        job_handle.cancel()
+                    while self._writer is not None or self._connections:
+                        self._condition.wait()
+                    self._writer = owner
+                    self._write_depth = 1
+                    self._deleted = True
+                finally:
+                    self._waiting_writers -= 1
+                    self._condition.notify_all()
+        if key is not None:
+            with _DATABASE_LOCKS_GUARD:
+                _TOMBSTONED_LOCKS[key] = self
+                _DATABASE_LOCKS[key] = self
+        try:
+            if key is not None:
+                _write_tombstone_marker(Path(key), **(metadata or {}))
+            yield self
+        finally:
+            self.release()
+
     def __enter__(self):
         self.acquire()
         return self
@@ -1841,6 +2112,7 @@ class _ProfileDatabaseLock:
 _DATABASE_LOCKS: weakref.WeakValueDictionary[str, _ProfileDatabaseLock] = (
     weakref.WeakValueDictionary()
 )
+_TOMBSTONED_LOCKS: dict[str, _ProfileDatabaseLock] = {}
 _DATABASE_LOCKS_GUARD = threading.Lock()
 _DATABASE_SETUP_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = (
     weakref.WeakValueDictionary()
@@ -1852,9 +2124,17 @@ _RESTORE_GENERATIONS: dict[str, int] = {}
 def database_lock(path: str | Path | None = None) -> _ProfileDatabaseLock:
     """Return the process lock for one profile database file."""
 
-    key = str(Path(path) if path is not None else profile_database_path())
+    resolved_path = Path(path) if path is not None else profile_database_path()
+    key = str(resolved_path)
     with _DATABASE_LOCKS_GUARD:
-        return _DATABASE_LOCKS.setdefault(key, _ProfileDatabaseLock())
+        tombstoned = _TOMBSTONED_LOCKS.get(key)
+        if tombstoned is not None:
+            return tombstoned
+        lock = _DATABASE_LOCKS.setdefault(key, _ProfileDatabaseLock())
+        if _is_tombstoned_on_disk(resolved_path):
+            lock._mark_deleted()
+            _TOMBSTONED_LOCKS[key] = lock
+        return lock
 
 
 def recorded_restore_epoch(path: str | Path | None = None) -> int:
@@ -1918,6 +2198,8 @@ class _LockedConnection(sqlite3.Connection):
 
 def connect():
     db_path = profile_database_path()
+    if database_lock(db_path).is_deleted:
+        raise ProfileDeletedError("Profile has been deleted")
     if not restore_fence_bypassed():
         from .backups import has_restore_journal
 
@@ -2191,6 +2473,193 @@ def persist_metadata_field_provenance(
     return written
 
 
+_SQLITE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _quote_sqlite_ident(name: str) -> str:
+    if not _SQLITE_IDENT_RE.fullmatch(name):
+        raise sqlite3.DatabaseError(f"Unsafe SQLite identifier in schema migration: {name!r}")
+    return f'"{name}"'
+
+
+def _rebuild_goodreads_shelf_items_migration(con: sqlite3.Connection) -> None:
+    """Rebuild goodreads_shelf_items with neutral 'legacy' provenance while preserving extra columns."""
+
+    table_info = con.execute("PRAGMA table_info(goodreads_shelf_items)").fetchall()
+    existing_names = {str(col[1]) for col in table_info}
+    core_columns = {
+        "id",
+        "shelf",
+        "source",
+        "title",
+        "author",
+        "isbn",
+        "openlibrary_work_id",
+        "added_at",
+        "updated_at",
+    }
+    extra_cols = [col for col in table_info if str(col[1]) not in core_columns]
+    extra_ddls = []
+    extra_quoted = []
+    extra_conflict_updates = []
+    for col in extra_cols:
+        col_name = str(col[1])
+        col_type = str(col[2] or "").strip()
+        notnull = bool(col[3])
+        dflt_value = col[4]
+        qname = _quote_sqlite_ident(col_name)
+        parts = [qname]
+        if col_type:
+            parts.append(col_type)
+        if notnull:
+            parts.append("NOT NULL")
+        if dflt_value is not None:
+            parts.append(f"DEFAULT {dflt_value}")
+        extra_ddls.append(" ".join(parts))
+        extra_quoted.append(qname)
+        extra_conflict_updates.append(
+            f"{qname}=COALESCE(NULLIF(excluded.{qname}, ''), goodreads_shelf_items_v2.{qname}, excluded.{qname})"
+        )
+
+    canonical_index_names = {
+        "idx_goodreads_shelf_items_shelf",
+        "idx_goodreads_shelf_items_source_shelf",
+        "idx_goodreads_shelf_items_title_author",
+    }
+    extra_index_sqls = [
+        str(idx_row[1])
+        for idx_row in con.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='goodreads_shelf_items' AND sql IS NOT NULL"
+        ).fetchall()
+        if str(idx_row[0]) not in canonical_index_names
+    ]
+
+    extra_ddl_clause = (
+        ",\n            " + ",\n            ".join(extra_ddls) if extra_ddls else ""
+    )
+    con.execute("DROP TABLE IF EXISTS goodreads_shelf_items_v2")
+    con.execute(
+        f"""
+        CREATE TABLE goodreads_shelf_items_v2 (
+            id INTEGER PRIMARY KEY,
+            shelf TEXT NOT NULL CHECK(shelf IN ('to-read', 'currently-reading')),
+            source TEXT NOT NULL DEFAULT 'goodreads_csv' CHECK(source IN ('goodreads_csv', 'goodreads_rss', 'legacy')),
+            title TEXT NOT NULL,
+            author TEXT NOT NULL,
+            isbn TEXT,
+            openlibrary_work_id TEXT,
+            added_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP{extra_ddl_clause},
+            UNIQUE(source, title, author)
+        )
+        """
+    )
+
+    has_source = "source" in existing_names
+    inner_cols = ["shelf"]
+    if has_source:
+        inner_cols.append("source")
+    inner_cols.extend(
+        ["title", "author", "isbn", "openlibrary_work_id", "added_at", "updated_at", *extra_quoted]
+    )
+    outer_select_cols = [
+        "shelf",
+        (
+            "CASE WHEN source IN ('goodreads_csv', 'goodreads_rss', 'legacy') THEN source ELSE 'legacy' END"
+            if has_source
+            else "'legacy'"
+        ),
+        "title",
+        "author",
+        "isbn",
+        "openlibrary_work_id",
+        "added_at",
+        "updated_at",
+        *extra_quoted,
+    ]
+    target_cols = [
+        "shelf",
+        "source",
+        "title",
+        "author",
+        "isbn",
+        "openlibrary_work_id",
+        "added_at",
+        "updated_at",
+        *extra_quoted,
+    ]
+    conflict_updates = [
+        "shelf=excluded.shelf",
+        "isbn=COALESCE(excluded.isbn, goodreads_shelf_items_v2.isbn)",
+        "openlibrary_work_id=COALESCE(NULLIF(excluded.openlibrary_work_id, ''), goodreads_shelf_items_v2.openlibrary_work_id)",
+        "added_at=COALESCE(excluded.added_at, goodreads_shelf_items_v2.added_at)",
+        "updated_at=excluded.updated_at",
+        *extra_conflict_updates,
+    ]
+    con.execute(
+        f"""
+        INSERT INTO goodreads_shelf_items_v2({", ".join(target_cols)})
+        SELECT {", ".join(outer_select_cols)}
+        FROM (
+            SELECT {", ".join(inner_cols)}
+            FROM goodreads_shelf_items
+            ORDER BY updated_at ASC, id ASC
+            LIMIT -1
+        )
+        WHERE 1=1
+        ON CONFLICT(source, title, author) DO UPDATE SET
+            {", ".join(conflict_updates)}
+        """
+    )
+    con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf")
+    con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_source_shelf")
+    con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author")
+    con.execute("DROP TABLE goodreads_shelf_items")
+    con.execute("ALTER TABLE goodreads_shelf_items_v2 RENAME TO goodreads_shelf_items")
+    con.execute(
+        "CREATE INDEX idx_goodreads_shelf_items_shelf "
+        "ON goodreads_shelf_items(shelf, updated_at DESC)"
+    )
+    con.execute(
+        "CREATE INDEX idx_goodreads_shelf_items_source_shelf "
+        "ON goodreads_shelf_items(source, shelf)"
+    )
+    con.execute(
+        "CREATE INDEX idx_goodreads_shelf_items_title_author "
+        "ON goodreads_shelf_items(title, author)"
+    )
+    for index_sql in extra_index_sqls:
+        con.execute(index_sql)
+    con.execute(
+        """
+        UPDATE candidates
+        SET status='new', score=0, explanation='[]', score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
+        WHERE status='hidden'
+          AND NOT EXISTS (
+              SELECT 1 FROM feedback f
+              WHERE f.candidate_id = candidates.id
+                AND f.undone_at IS NULL
+                AND f.action IN ('reject', 'maybe_later')
+                AND f.id = (
+                    SELECT MAX(f2.id) FROM feedback f2
+                    WHERE f2.candidate_id = candidates.id
+                      AND f2.undone_at IS NULL
+                )
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM recommendation_events e
+              WHERE e.candidate_id = candidates.id
+                AND e.event_type IN ('reject', 'maybe_later')
+                AND e.id = (
+                    SELECT MAX(e2.id) FROM recommendation_events e2
+                    WHERE e2.candidate_id = candidates.id
+                )
+          )
+        """
+    )
+
+
 def purge_demo_reads(con: sqlite3.Connection) -> int:
     """Purge synthetic cold-start demo reads, derived evidence, and stale candidate status."""
 
@@ -2372,6 +2841,9 @@ def purge_demo_reads(con: sqlite3.Connection) -> int:
 def _execute_migration_script(con: sqlite3.Connection, script: str) -> None:
     """Execute complete SQL statements on the caller's active transaction."""
 
+    if "-- DYNAMIC_GOODREADS_SHELF_ITEMS_REBUILD" in script:
+        _rebuild_goodreads_shelf_items_migration(con)
+        return
     start = 0
     for index, character in enumerate(script):
         if character == ";" and sqlite3.complete_statement(script[start : index + 1]):
@@ -2384,8 +2856,20 @@ def _execute_migration_script(con: sqlite3.Connection, script: str) -> None:
         con.execute(pending)
 
 
+def _validate_migrations() -> None:
+    versions = [version for version, _ in MIGRATIONS]
+    expected = list(range(1, len(MIGRATIONS) + 1))
+    if versions != expected:
+        raise RuntimeError(
+            f"MIGRATIONS must have unique sequential versions 1..{len(MIGRATIONS)}, got {versions}"
+        )
+
+
 def initialize(*, seed_demo: bool = True):
+    _validate_migrations()
     db_path = profile_database_path()
+    if database_lock(db_path).is_deleted:
+        raise ProfileDeletedError("Profile has been deleted")
     db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with connect() as con:
         con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
@@ -2759,3 +3243,213 @@ def row(query: str, params=()):
     with connect() as con:
         found = con.execute(query, params).fetchone()
         return dict(found) if found else None
+
+
+_LEGACY_PERSONAL_TABLES = (
+    "recommendation_outcomes",
+    "recommendation_events",
+    "recommendation_impressions",
+    "recommendation_runs",
+    "scoring_batch_reads",
+    "scoring_batch_candidates",
+    "scoring_batch_vectors",
+    "scoring_batches",
+    "recommendation_evidence_vectors",
+    "feedback",
+    "librarr_imports",
+    "digest_items",
+    "notification_deliveries",
+    "association_evidence",
+    "association_runs",
+    "association_requests",
+    "association_cache",
+    "read_metadata",
+    "candidate_quality",
+    "metadata_field_provenance",
+    "embeddings",
+    "goodreads_shelf_items",
+    "reads",
+    "candidate_sources",
+    "candidates",
+    "sources",
+    "settings",
+    "jobs",
+    "api_tokens",
+)
+
+
+def _fsync_directory_if_present(directory: Path) -> None:
+    if not directory.is_dir():
+        return
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _vacuum_and_checkpoint_unlocked(db_path: Path) -> None:
+    if not db_path.is_file():
+        return
+    con = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+    try:
+        con.execute("PRAGMA busy_timeout=5000")
+        con.execute("VACUUM")
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    finally:
+        con.close()
+
+
+def erase_profile_database(
+    profile_id: str, *, tombstone_metadata: dict | None = None
+) -> None:
+    """Unlink a non-legacy profile database/key or wipe personal rows in legacy."""
+
+    from .backups import (
+        _RESTORE_JOURNAL_ERRORS,
+        _remove_sidecars,
+        _restore_journal_key_path,
+        _restore_journal_path,
+    )
+    from .decision_evidence import purge_recommendation_evidence
+    from .llm_reranker import clear_llm_rerank_cache
+
+    clear_llm_rerank_cache(profile_id)
+    if profile_id != "legacy":
+        db_path = profile_database_path(profile_id)
+        lock = database_lock(db_path)
+        with lock.tombstone(str(db_path), metadata=tombstone_metadata):
+            if db_path.is_file():
+                try:
+                    checkpoint = sqlite3.connect(db_path, timeout=30)
+                    try:
+                        checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    finally:
+                        checkpoint.close()
+                except sqlite3.Error:
+                    LOGGER.warning(
+                        "Could not checkpoint WAL before unlinking deleted profile %s",
+                        profile_id,
+                    )
+            db_path.unlink(missing_ok=True)
+            _remove_sidecars(db_path)
+            journal = _restore_journal_path(db_path)
+            journal.unlink(missing_ok=True)
+            _restore_journal_key_path(journal).unlink(missing_ok=True)
+            _RESTORE_JOURNAL_ERRORS.pop(str(journal), None)
+            with profile_scope(profile_id):
+                key_path = installation_key_path()
+            if key_path != Path(settings.db).with_name("secret.key"):
+                key_path.unlink(missing_ok=True)
+            record_restore_epoch(0, db_path)
+            _fsync_directory_if_present(db_path.parent)
+        return
+
+    db_path = profile_database_path("legacy")
+    with database_lock(db_path):
+        journal = _restore_journal_path(db_path)
+        journal.unlink(missing_ok=True)
+        _restore_journal_key_path(journal).unlink(missing_ok=True)
+        _RESTORE_JOURNAL_ERRORS.pop(str(journal), None)
+        if not db_path.is_file():
+            record_restore_epoch(0, db_path)
+            return
+        con = sqlite3.connect(db_path, timeout=30)
+        try:
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA foreign_keys=ON")
+            con.execute("PRAGMA busy_timeout=5000")
+            con.execute("PRAGMA secure_delete=ON")
+            tables = {
+                item[0]
+                for item in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            con.execute("BEGIN IMMEDIATE")
+            if {"recommendation_runs", "scoring_batches", "recommendation_evidence_vectors"} <= tables:
+                purge_recommendation_evidence(con, clear_all_evidence=True)
+            for table in _LEGACY_PERSONAL_TABLES:
+                if table in tables:
+                    con.execute(f"DELETE FROM {table}")
+            if "recommendation_evidence_budget" in tables:
+                con.execute(
+                    "UPDATE recommendation_evidence_budget SET used_bytes=0 WHERE id=1"
+                )
+            con.commit()
+        except Exception:
+            if con.in_transaction:
+                con.rollback()
+            raise
+        finally:
+            con.close()
+        record_restore_epoch(0, db_path)
+        _vacuum_and_checkpoint_unlocked(db_path)
+        with profile_scope("legacy"):
+            _restrict_database_files()
+
+
+def reset_profile_history(profile_id: str | None = None) -> dict[str, int | bool]:
+    """Purge reading history, derived scores, and recommendation evidence while keeping backups."""
+
+    from .decision_evidence import purge_recommendation_evidence
+    from .llm_reranker import clear_llm_rerank_cache
+
+    selected = profile_id if profile_id is not None else (current_profile_id() or "legacy")
+    with profile_scope(selected):
+        db_path = profile_database_path()
+        with database_lock(db_path):
+            with transaction() as con:
+                con.execute("PRAGMA secure_delete=ON")
+                purged = purge_recommendation_evidence(con, clear_all_evidence=True)
+                reads_removed = con.execute("DELETE FROM reads").rowcount
+                con.execute("DELETE FROM read_metadata")
+                con.execute(
+                    "DELETE FROM metadata_field_provenance WHERE entity_type='read'"
+                )
+                con.execute("DELETE FROM goodreads_shelf_items")
+                con.execute("DELETE FROM librarr_imports")
+                con.execute("DELETE FROM embeddings")
+                con.execute("DELETE FROM association_evidence")
+                con.execute("DELETE FROM association_runs")
+                con.execute("DELETE FROM association_requests")
+                con.execute("DELETE FROM association_cache")
+                con.execute("DELETE FROM digest_items")
+                con.execute("DELETE FROM notification_deliveries")
+                con.execute(
+                    "DELETE FROM settings WHERE key='goodreads_rss_last_scheduled_date'"
+                )
+                con.execute(
+                    "DELETE FROM jobs WHERE status='queued' "
+                    "AND kind IN ('score','read_work_identities','read_metadata','goodreads_rss')"
+                )
+                candidates_reset = con.execute(
+                    """UPDATE candidates
+                    SET score=0,
+                        explanation='[]',
+                        score_batch_id=NULL,
+                        status=CASE
+                            WHEN EXISTS (
+                                SELECT 1 FROM candidate_quality q
+                                WHERE q.candidate_id=candidates.id
+                                  AND q.quality_status='rejected'
+                            ) THEN 'rejected'
+                            ELSE 'new'
+                        END,
+                        updated_at=CURRENT_TIMESTAMP"""
+                ).rowcount
+                con.execute(
+                    "UPDATE recommendation_evidence_budget SET used_bytes=0 WHERE id=1"
+                )
+            _vacuum_and_checkpoint_unlocked(db_path)
+            _restrict_database_files()
+    clear_llm_rerank_cache(selected)
+    return {
+        "reset": True,
+        "reads_removed": max(0, int(reads_removed)),
+        "candidates_reset": max(0, int(candidates_reset)),
+        **purged,
+    }
