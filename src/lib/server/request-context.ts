@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 
 export type RequestContext = { sessionToken?: string; clientIp?: string };
 const requestContext = new AsyncLocalStorage<RequestContext>();
+const formDataByRequest = new WeakMap<Request, Promise<FormData>>();
 
 type SocketPlatform = {
 	req?: {
@@ -88,4 +89,22 @@ export function setCurrentSessionToken(sessionToken: string | undefined): void {
 
 export function currentClientIp(): string | undefined {
 	return requestContext.getStore()?.clientIp;
+}
+
+export function requestFormData(request: Request): Promise<FormData> {
+	let cached = formDataByRequest.get(request);
+	if (!cached) {
+		const parse = request.formData.bind(request);
+		cached = parse();
+		formDataByRequest.set(request, cached);
+		Object.defineProperty(request, 'formData', {
+			configurable: true,
+			value: () => cached!
+		});
+	}
+	return cached;
+}
+
+export function hasCachedFormData(request: Request): boolean {
+	return formDataByRequest.has(request);
 }

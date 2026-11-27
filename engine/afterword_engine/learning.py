@@ -118,27 +118,90 @@ def _validate_value(value: float | None) -> float | None:
     return number
 
 
+DISCOVERY_RUN_STATUSES = frozenset({"", "recommended", "all"})
+NON_DISCOVERY_ITEM_STATUSES = frozenset(
+    {
+        "saved",
+        "imported",
+        "rejected",
+        "maybe_later",
+        "decisions",
+        "excluded",
+        "read",
+    }
+)
+
+
+def is_discovery_run_metadata(raw_metadata: Any) -> bool:
+    """Return True when run metadata belongs to a discovery recommendation run."""
+
+    if raw_metadata is None or raw_metadata == "":
+        return True
+    if isinstance(raw_metadata, str):
+        try:
+            parsed = json.loads(raw_metadata)
+        except (TypeError, ValueError):
+            return False
+    elif isinstance(raw_metadata, Mapping):
+        parsed = raw_metadata
+    else:
+        return False
+    if not isinstance(parsed, Mapping):
+        return False
+    status = parsed.get("status")
+    if status is None:
+        return True
+    return isinstance(status, str) and status.strip() in DISCOVERY_RUN_STATUSES
+
+
 def create_recommendation_run(
     recommendations: Iterable[dict[str, Any]],
     *,
+    run_id: str | None = None,
     session_id: str = "",
+    exploration_seed: str | None = None,
     status: str | None = None,
     limit: int | None = None,
+    offset: int = 0,
     ranking_metadata: dict[str, Any] | None = None,
     discovery_slate_metadata: dict[str, Any] | None = None,
     decision_evidence: dict[str, Any] | None = None,
 ) -> str:
-    """Persist a ranked response and return its opaque run identifier.
+    """Persist a ranked discovery slate and return its opaque run identifier.
 
     Callers may attach the exact marginal ``propensity`` emitted by an
     exploration policy.  Deterministic responses default to one.
     """
 
+    if run_id is not None:
+        _validate_identifier(run_id, "recommendation run")
     if session_id:
         _validate_identifier(session_id, "session identifier")
+    if exploration_seed:
+        _validate_identifier(exploration_seed, "exploration seed")
+    if isinstance(offset, bool) or int(offset) < 0:
+        raise ValueError("Recommendation offset must be a non-negative integer")
+    if status is not None and (
+        not isinstance(status, str) or status.strip() not in DISCOVERY_RUN_STATUSES
+    ):
+        raise ValueError("Recommendation runs may only be created for discovery slates")
     items = list(recommendations)
-    run_id = str(uuid.uuid4())
-    metadata = {"status": status or "all"}
+    for item in items:
+        item_status = item.get("status")
+        if (
+            isinstance(item_status, str)
+            and item_status.strip() in NON_DISCOVERY_ITEM_STATUSES
+        ):
+            raise ValueError(
+                "Recommendation exposure runs may not log shortlist, imported, or archived items"
+            )
+    resolved_run_id = run_id or str(uuid.uuid4())
+    page_offset = int(offset)
+    metadata: dict[str, Any] = {"status": "recommended", "offset": page_offset}
+    if exploration_seed:
+        metadata["exploration_seed"] = exploration_seed
+    if status and status != "recommended":
+        metadata["request_status"] = status
     if limit is not None:
         metadata["limit"] = int(limit)
     if ranking_metadata:
@@ -151,7 +214,7 @@ def create_recommendation_run(
             "INSERT INTO recommendation_runs(id,policy,policy_version,session_id,candidate_count,metadata,created_at) "
             "VALUES(?,?,?,?,?,?,?)",
             (
-                run_id,
+                resolved_run_id,
                 POLICY,
                 POLICY_VERSION,
                 session_id,
@@ -160,7 +223,7 @@ def create_recommendation_run(
                 now,
             ),
         )
-        for rank, item in enumerate(items, 1):
+        for rank, item in enumerate(items, page_offset + 1):
             try:
                 propensity = float(item.get("propensity", 1.0))
             except (TypeError, ValueError) as exc:
@@ -170,15 +233,16 @@ def create_recommendation_run(
             con.execute(
                 "INSERT INTO recommendation_impressions(run_id,candidate_id,rank,score,propensity,presented_at) "
                 "VALUES(?,?,?,?,?,?)",
-                (run_id, int(item["id"]), rank, float(item.get("score") or 0), propensity, now),
+                (resolved_run_id, int(item["id"]), rank, float(item.get("score") or 0), propensity, now),
             )
         try:
             con.execute("SAVEPOINT archive_served_exposures")
             archive_served_exposures(
                 con,
-                run_id=run_id,
+                run_id=resolved_run_id,
                 recommendations=items,
                 presented_at=now,
+                offset=page_offset,
             )
             con.execute("RELEASE SAVEPOINT archive_served_exposures")
         except Exception:
@@ -188,13 +252,13 @@ def create_recommendation_run(
         if decision_evidence is not None:
             try:
                 con.execute("SAVEPOINT persist_decision_evidence")
-                persist_run_evidence(con, run_id=run_id, evidence=decision_evidence)
+                persist_run_evidence(con, run_id=resolved_run_id, evidence=decision_evidence)
                 con.execute("RELEASE SAVEPOINT persist_decision_evidence")
             except Exception:
                 con.execute("ROLLBACK TO SAVEPOINT persist_decision_evidence")
                 con.execute("RELEASE SAVEPOINT persist_decision_evidence")
                 LOGGER.warning("Recommendation decision evidence persistence failed")
-    return run_id
+    return resolved_run_id
 
 
 def _candidate_exists(con, candidate_id: int) -> bool:
@@ -203,8 +267,11 @@ def _candidate_exists(con, candidate_id: int) -> bool:
 
 def _run_impression(con, run_id: str, candidate_id: int):
     return con.execute(
-        "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
-        "FROM recommendation_impressions WHERE run_id=? AND candidate_id=?",
+        "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at,"
+        "r.metadata AS run_metadata "
+        "FROM recommendation_impressions i "
+        "LEFT JOIN recommendation_runs r ON r.id=i.run_id "
+        "WHERE i.run_id=? AND i.candidate_id=?",
         (run_id, candidate_id),
     ).fetchone()
 
@@ -257,13 +324,22 @@ def _existing_event_matches(
 
 def _find_latest_impression(con, candidate_id: int, run_id: str | None = None):
     if run_id:
-        return _run_impression(con, run_id, candidate_id)
-    return con.execute(
-        "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
-        "FROM recommendation_impressions WHERE candidate_id=? "
-        "ORDER BY COALESCE(visible_at,presented_at) DESC, id DESC LIMIT 1",
+        matched = _run_impression(con, run_id, candidate_id)
+        if matched is not None and is_discovery_run_metadata(matched["run_metadata"]):
+            return matched
+    rows = con.execute(
+        "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at,"
+        "r.metadata AS run_metadata "
+        "FROM recommendation_impressions i "
+        "JOIN recommendation_runs r ON r.id=i.run_id "
+        "WHERE i.candidate_id=? "
+        "ORDER BY COALESCE(i.visible_at,i.presented_at) DESC, i.id DESC",
         (candidate_id,),
-    ).fetchone()
+    ).fetchall()
+    return next(
+        (row for row in rows if is_discovery_run_metadata(row["run_metadata"])),
+        None,
+    )
 
 
 def _record_outcome(
@@ -581,19 +657,6 @@ def _impression_precedes(impression, read_time: datetime, day_precision: bool) -
     return impression_time.date() < read_time.date() if day_precision else impression_time < read_time
 
 
-def _latest_preceding_impression(con, candidate_id: int, read_time: datetime, day_precision: bool):
-    impression_rows = con.execute(
-        "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
-        "FROM recommendation_impressions WHERE candidate_id=? "
-        "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
-        (candidate_id,),
-    )
-    return next(
-        (item for item in impression_rows.fetchall() if _impression_precedes(item, read_time, day_precision)),
-        None,
-    )
-
-
 def _read_label(read: dict[str, Any]):
     rating = read.get("rating")
     if rating is None:
@@ -607,6 +670,34 @@ def _read_label(read: dict[str, Any]):
     if rating <= 2:
         return 0.0, "rating_negative", 1.0
     return 0.5, "rating_neutral", 0.25
+
+
+def _latest_preceding_impression(
+    con,
+    candidate_id: int,
+    read_time: datetime | None,
+    day_precision: bool,
+):
+    if read_time is None:
+        return None
+    impression_rows = con.execute(
+        "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at,"
+        "r.metadata AS run_metadata "
+        "FROM recommendation_impressions i "
+        "JOIN recommendation_runs r ON r.id=i.run_id "
+        "WHERE i.candidate_id=? "
+        "ORDER BY COALESCE(i.visible_at,i.presented_at) DESC,i.id DESC",
+        (candidate_id,),
+    ).fetchall()
+    return next(
+        (
+            item
+            for item in impression_rows
+            if is_discovery_run_metadata(item["run_metadata"])
+            and _impression_precedes(item, read_time, day_precision)
+        ),
+        None,
+    )
 
 
 def _impression_sort_key(impression) -> tuple[datetime, int]:
@@ -760,18 +851,38 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
         )
         needed_candidate_ids.update(matched_by_id)
 
-    impression_rows_by_candidate: dict[int, list[sqlite3.Row]] = {}
+    raw_impressions: list[sqlite3.Row] = []
     sorted_candidate_ids = sorted(needed_candidate_ids)
     for start in range(0, len(sorted_candidate_ids), IMPRESSION_QUERY_CHUNK_SIZE):
         chunk = sorted_candidate_ids[start : start + IMPRESSION_QUERY_CHUNK_SIZE]
         placeholders = ",".join("?" for _ in chunk)
-        for item in con.execute(
-            "SELECT id,run_id,candidate_id,rank,score,propensity,presented_at,visible_at "
-            f"FROM recommendation_impressions WHERE candidate_id IN ({placeholders}) "
-            "ORDER BY candidate_id, COALESCE(visible_at,presented_at) DESC, id DESC",
+        raw_impressions.extend(
+            con.execute(
+                "SELECT id,run_id,candidate_id,rank,score,propensity,presented_at,visible_at "
+                f"FROM recommendation_impressions WHERE candidate_id IN ({placeholders}) "
+                "ORDER BY candidate_id, COALESCE(visible_at,presented_at) DESC, id DESC",
+                chunk,
+            ).fetchall()
+        )
+    discovery_run_ids: set[str] = set()
+    needed_run_ids = sorted(
+        {str(item["run_id"]) for item in raw_impressions if item["run_id"]}
+    )
+    for start in range(0, len(needed_run_ids), IMPRESSION_QUERY_CHUNK_SIZE):
+        chunk = needed_run_ids[start : start + IMPRESSION_QUERY_CHUNK_SIZE]
+        placeholders = ",".join("?" for _ in chunk)
+        for run_row in con.execute(
+            f"SELECT id,metadata FROM recommendation_runs WHERE id IN ({placeholders})",
             chunk,
         ).fetchall():
-            impression_rows_by_candidate.setdefault(int(item["candidate_id"]), []).append(item)
+            if is_discovery_run_metadata(run_row["metadata"]):
+                discovery_run_ids.add(str(run_row["id"]))
+    impression_rows_by_candidate: dict[int, list[sqlite3.Row]] = {}
+    for item in raw_impressions:
+        if str(item["run_id"]) in discovery_run_ids:
+            impression_rows_by_candidate.setdefault(
+                int(item["candidate_id"]), []
+            ).append(item)
 
     for (
         read,
@@ -958,15 +1069,25 @@ def sync_read_rating_in_connection(con, read: dict[str, Any]) -> dict[str, int]:
                 if run_id is not None
                 else None
             )
+            if impression is not None and not is_discovery_run_metadata(
+                impression["run_metadata"]
+            ):
+                impression = None
             if impression is None:
                 impression = con.execute(
-                    "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at "
+                    "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at,"
+                    "r.metadata AS run_metadata "
                     "FROM recommendation_outcomes o "
                     "JOIN recommendation_impressions i ON i.id=o.impression_id "
+                    "JOIN recommendation_runs r ON r.id=i.run_id "
                     "WHERE o.event_id=? AND o.read_id=? "
                     "ORDER BY o.id DESC LIMIT 1",
                     (event_id, read_id),
                 ).fetchone()
+                if impression is not None and not is_discovery_run_metadata(
+                    impression["run_metadata"]
+                ):
+                    impression = None
             existing_value = ev.get("value")
             value_changed = (existing_value is None) != (rating_value is None) or (
                 existing_value is not None
@@ -980,10 +1101,20 @@ def sync_read_rating_in_connection(con, read: dict[str, Any]) -> dict[str, int]:
                     "UPDATE recommendation_events SET value=?,occurred_at=? WHERE id=?",
                     (rating_value, timestamp, event_id),
                 )
+                fallback_run_id = run_id
+                if fallback_run_id:
+                    run_meta_row = con.execute(
+                        "SELECT metadata FROM recommendation_runs WHERE id=?",
+                        (fallback_run_id,),
+                    ).fetchone()
+                    if run_meta_row is not None and not is_discovery_run_metadata(
+                        run_meta_row["metadata"]
+                    ):
+                        fallback_run_id = None
                 archive_run_id = (
                     str(impression["run_id"])
                     if impression is not None and impression["run_id"] is not None
-                    else run_id
+                    else fallback_run_id
                 )
                 if archive_run_id:
                     archived_revision = archive_recommendation_event(
@@ -1073,7 +1204,9 @@ def sync_read_rating_in_connection(con, read: dict[str, Any]) -> dict[str, int]:
             "outcomes_updated": 0,
         }
 
-    impression = _latest_preceding_impression(con, int(candidate["id"]), read_time, day_precision)
+    impression = _latest_preceding_impression(
+        con, int(candidate["id"]), read_time, day_precision
+    )
     if impression is None:
         return {
             "events_updated": 0,

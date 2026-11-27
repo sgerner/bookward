@@ -982,7 +982,7 @@ def test_goodreads_import_runs_read_attribution(database):
     with transaction() as con:
         source_id = con.execute("SELECT id FROM sources WHERE is_default=1 LIMIT 1").fetchone()[0]
         con.execute(
-            "INSERT INTO candidates(title,author,source_id,normalized_key) VALUES(?,?,?,?)",
+            "INSERT INTO candidates(title,author,status,source_id,normalized_key) VALUES(?,?,'recommended',?,?)",
             ("Imported later", "A Reader", source_id, "imported later a reader"),
         )
         candidate_id = con.execute("SELECT id FROM candidates WHERE title='Imported later'").fetchone()[0]
@@ -1177,6 +1177,740 @@ def test_mark_read_from_shortlist_uses_verified_isbn_persistence(database):
     assert row(
         "SELECT isbn,rating,source FROM reads WHERE title='Finished Work' AND author='A Reader'"
     ) == {"isbn": "9780593418574", "rating": None, "source": "manual"}
+
+
+def test_overview_logs_at_most_24_recommended_and_excludes_non_discovery_from_exploration(
+    database,
+):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("DELETE FROM candidates")
+        for index in range(30):
+            cid = con.execute(
+                "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+                "VALUES(?,?,?,'recommended',?,?)",
+                (
+                    f"Discovery Book {index + 1}",
+                    f"Author {index + 1}",
+                    round(99.0 - index * 0.5, 2),
+                    source_id,
+                    f"discovery-book-{index + 1}",
+                ),
+            ).lastrowid
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+                (cid,),
+            )
+        for status, count in (("saved", 3), ("imported", 2), ("new", 2)):
+            for idx in range(count):
+                cid = con.execute(
+                    "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (
+                        f"{status.title()} Book {idx + 1}",
+                        f"{status.title()} Author {idx + 1}",
+                        75.0 - idx,
+                        status,
+                        source_id,
+                        f"{status}-book-{idx + 1}",
+                    ),
+                ).lastrowid
+                con.execute(
+                    "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+                    (cid,),
+                )
+
+    prev_enabled = settings.exploration_enabled
+    prev_epsilon = settings.exploration_epsilon
+    prev_top_k = settings.exploration_stable_top_k
+    settings.exploration_enabled = True
+    settings.exploration_epsilon = 0.25
+    settings.exploration_stable_top_k = 8
+    try:
+        with TestClient(app, headers=authenticated_headers()) as client:
+            response = client.get("/api/overview?recommendation_limit=24")
+        assert response.status_code == 200
+        overview = response.json()
+        assert overview["recommendations_has_more"] is True
+        returned_statuses = [item["status"] for item in overview["recommendations"]]
+        assert returned_statuses.count("recommended") == 24
+        assert "saved" in returned_statuses
+        assert "imported" in returned_statuses
+        assert "new" in returned_statuses
+
+        run_id = overview["recommendation_run_id"]
+        assert run_id
+        with connect() as con:
+            logged = [
+                dict(item)
+                for item in con.execute(
+                    "SELECT i.rank,i.propensity,c.status "
+                    "FROM recommendation_impressions i "
+                    "JOIN candidates c ON c.id=i.candidate_id "
+                    "WHERE i.run_id=? ORDER BY i.rank",
+                    (run_id,),
+                ).fetchall()
+            ]
+        assert len(logged) == 24
+        assert [item["rank"] for item in logged] == list(range(1, 25))
+        assert all(item["status"] == "recommended" for item in logged)
+        # Full discovery pool has 30 recommended books; stable_top_k=8 leaves tail_size=22.
+        # Appended saved/imported/new items (7 rows) must not inflate tail_size to 29,
+        # and post-slice truncation (24 - 8 = 16) must not shrink tail_size to 16.
+        expected_in_place = (1.0 - 0.25) + (0.25 / 22.0)
+        expected_displaced = 0.25 / 22.0
+        assert all(item["propensity"] == pytest.approx(1.0) for item in logged[:8])
+        assert all(
+            item["propensity"]
+            in (pytest.approx(expected_in_place), pytest.approx(expected_displaced))
+            for item in logged[8:]
+        )
+    finally:
+        settings.exploration_enabled = prev_enabled
+        settings.exploration_epsilon = prev_epsilon
+        settings.exploration_stable_top_k = prev_top_k
+
+
+def test_paginated_discovery_logs_global_ranks_and_has_more_header(database):
+    from afterword_engine.decision_evidence import load_decision_evidence
+
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("DELETE FROM candidates")
+        for index in range(35):
+            cid = con.execute(
+                "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+                "VALUES(?,?,?,'recommended',?,?)",
+                (
+                    f"Paged Book {index + 1}",
+                    f"Paged Author {index + 1}",
+                    round(99.0 - index * 0.5, 2),
+                    source_id,
+                    f"paged-book-{index + 1}",
+                ),
+            ).lastrowid
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+                (cid,),
+            )
+        saved_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Shortlisted Extra','Reader',88.0,'saved',?,?)",
+            (source_id, "shortlisted-extra"),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            (saved_id,),
+        )
+
+    prev_enabled = settings.exploration_enabled
+    prev_epsilon = settings.exploration_epsilon
+    prev_top_k = settings.exploration_stable_top_k
+    settings.exploration_enabled = True
+    settings.exploration_epsilon = 0.20
+    settings.exploration_stable_top_k = 8
+    try:
+        with TestClient(app, headers=authenticated_headers()) as client:
+            page = client.get(
+                "/api/recommendations?status=recommended&limit=8&offset=24"
+            )
+            assert page.status_code == 200
+            assert page.headers.get("X-Bookward-Has-More") == "true"
+            run_id = page.headers.get("X-Bookward-Recommendation-Run")
+            assert run_id
+            items = page.json()
+            assert len(items) == 8
+            assert all(item["recommendation_run_id"] == run_id for item in items)
+
+            tail_page = client.get(
+                "/api/recommendations?status=recommended&limit=8&offset=32"
+            )
+            assert tail_page.status_code == 200
+            assert tail_page.headers.get("X-Bookward-Has-More") == "false"
+            tail_run_id = tail_page.headers.get("X-Bookward-Recommendation-Run")
+            assert tail_run_id
+            assert len(tail_page.json()) == 3
+
+        expected_in_place = (1.0 - 0.20) + (0.20 / (35 - 8))
+        expected_displaced = 0.20 / (35 - 8)
+        with connect() as con:
+            impressions = [
+                dict(item)
+                for item in con.execute(
+                    "SELECT rank,propensity FROM recommendation_impressions "
+                    "WHERE run_id=? ORDER BY rank",
+                    (run_id,),
+                ).fetchall()
+            ]
+            evidence = load_decision_evidence(con, run_id)
+            tail_ranks = [
+                item["rank"]
+                for item in con.execute(
+                    "SELECT rank FROM recommendation_impressions "
+                    "WHERE run_id=? ORDER BY rank",
+                    (tail_run_id,),
+                ).fetchall()
+            ]
+        assert [item["rank"] for item in impressions] == list(range(25, 33))
+        assert all(
+            item["propensity"]
+            in (pytest.approx(expected_in_place), pytest.approx(expected_displaced))
+            for item in impressions
+        )
+        assert [item["rank"] for item in evidence["served_exposures"]] == list(
+            range(25, 33)
+        )
+        assert tail_ranks == [33, 34, 35]
+    finally:
+        settings.exploration_enabled = prev_enabled
+        settings.exploration_epsilon = prev_epsilon
+        settings.exploration_stable_top_k = prev_top_k
+
+
+def test_non_discovery_queries_and_settings_endpoints_insert_zero_runs(database):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        saved_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Saved Item','Author S',85,'saved',?,?)",
+            (source_id, "saved-item-author-s"),
+        ).lastrowid
+        rejected_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Rejected Item','Author R',60,'rejected',?,?)",
+            (source_id, "rejected-item-author-r"),
+        ).lastrowid
+        con.execute(
+            "INSERT INTO feedback(candidate_id,action) VALUES(?,'reject')",
+            (rejected_id,),
+        )
+        later_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Later Item','Author L',70,'maybe_later',?,?)",
+            (source_id, "later-item-author-l"),
+        ).lastrowid
+        for cid in (saved_id, rejected_id, later_id):
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+                (cid,),
+            )
+
+    initial_runs = row("SELECT COUNT(*) count FROM recommendation_runs")["count"]
+    with TestClient(app, headers=authenticated_headers()) as client:
+        for status in ("saved", "decisions", "rejected", "maybe_later"):
+            res = client.get(f"/api/recommendations?status={status}&limit=8&offset=0")
+            assert res.status_code == 200
+            assert res.headers.get("X-Bookward-Has-More") == "false"
+            assert res.headers.get("X-Bookward-Recommendation-Run") is None
+            assert all(item["recommendation_run_id"] == "" for item in res.json())
+
+        settings_res = client.get("/api/settings")
+        assert settings_res.status_code == 200
+        assert "embedding_backend" in settings_res.json()
+
+        sources_res = client.get("/api/sources")
+        assert sources_res.status_code == 200
+        default_source = next(item for item in sources_res.json() if item["is_default"])
+        toggle_res = client.put(f"/api/sources/{default_source['id']}/toggle", json={})
+        assert toggle_res.status_code == 200
+
+        put_settings = client.put(
+            "/api/settings", json={"librarr_media_type": "ebook"}
+        )
+        assert put_settings.status_code == 200
+
+        untracked_overview = client.get(
+            "/api/overview?recommendation_limit=24&track_impressions=false"
+        )
+        assert untracked_overview.status_code == 200
+        assert untracked_overview.json()["recommendation_run_id"] == ""
+
+    final_runs = row("SELECT COUNT(*) count FROM recommendation_runs")["count"]
+    assert final_runs == initial_runs
+
+
+def test_shortlist_read_attribution_credits_discovery_exposure_over_non_discovery_runs(
+    database,
+):
+    recommendations, discovery_run_id = tracked_recommendations(status="recommended")
+    manual_book = recommendations[0]
+    imported_book = recommendations[1]
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        for book in (manual_book, imported_book):
+            save_res = client.post(
+                f"/api/recommendations/{book['id']}/feedback",
+                json={"action": "save", "run_id": discovery_run_id},
+            )
+            assert save_res.status_code == 200
+
+        # Querying shortlist must create zero runs.
+        shortlist_res = client.get("/api/recommendations?status=saved&limit=8&offset=0")
+        assert shortlist_res.status_code == 200
+        assert shortlist_res.headers.get("X-Bookward-Recommendation-Run") is None
+
+        # Simulate a legacy shortlist run with newer presented_at and visible_at timestamps.
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO recommendation_runs(id,policy,policy_version,session_id,candidate_count,metadata,created_at) "
+                "VALUES('legacy-saved-run','legacy','v0','',2,'{\"status\":\"saved\"}','2098-06-01T12:00:00+00:00')"
+            )
+            for idx, book in enumerate((manual_book, imported_book), start=1):
+                con.execute(
+                    "INSERT INTO recommendation_impressions(run_id,candidate_id,rank,score,propensity,presented_at,visible_at) "
+                    "VALUES('legacy-saved-run',?,?,80.0,1.0,'2098-06-01T12:00:00+00:00','2098-06-01T12:05:00+00:00')",
+                    (book["id"], idx),
+                )
+            # Ensure discovery exposures precede the manual read timestamp and legacy run.
+            con.execute(
+                "UPDATE recommendation_impressions SET presented_at='2025-01-01T00:00:00+00:00', "
+                "visible_at='2025-01-01T00:01:00+00:00' WHERE run_id=?",
+                (discovery_run_id,),
+            )
+
+        read_res = client.post(
+            f"/api/recommendations/{manual_book['id']}/read", json={"rating": 5}
+        )
+        assert read_res.status_code == 200
+
+    manual_outcome = row(
+        "SELECT i.run_id,i.rank,o.label,o.label_kind "
+        "FROM recommendation_outcomes o "
+        "JOIN recommendation_impressions i ON i.id=o.impression_id "
+        "JOIN recommendation_events e ON e.id=o.event_id "
+        "WHERE e.candidate_id=? AND e.source='manual_read'",
+        (manual_book["id"],),
+    )
+    assert manual_outcome == {
+        "run_id": discovery_run_id,
+        "rank": 1,
+        "label": 1.0,
+        "label_kind": "rating_positive",
+    }
+
+    csv_payload = (
+        "Title,Author,My Rating,Date Read,Exclusive Shelf\n"
+        f"{imported_book['title']},{imported_book['author']},5,2099/01/02,read\n"
+    ).encode("utf-8")
+    assert import_goodreads_csv(csv_payload) == 1
+    imported_outcome = row(
+        "SELECT i.run_id,i.rank,o.label,o.label_kind "
+        "FROM recommendation_outcomes o "
+        "JOIN recommendation_impressions i ON i.id=o.impression_id "
+        "JOIN recommendation_events e ON e.id=o.event_id "
+        "WHERE e.candidate_id=? AND e.source='read_import'",
+        (imported_book["id"],),
+    )
+    assert imported_outcome == {
+        "run_id": discovery_run_id,
+        "rank": 2,
+        "label": 1.0,
+        "label_kind": "rating_positive",
+    }
+
+
+def test_paginated_discovery_forms_stable_exploration_partition_with_exact_propensities(
+    database, monkeypatch
+):
+    import afterword_engine.main as main_module
+
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("DELETE FROM candidates")
+        for index in range(35):
+            cid = con.execute(
+                "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+                "VALUES(?,?,?,'recommended',?,?)",
+                (
+                    f"Partition Book {index + 1}",
+                    f"Partition Author {index + 1}",
+                    round(99.0 - index * 0.5, 2),
+                    source_id,
+                    f"partition-book-{index + 1}",
+                ),
+            ).lastrowid
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+                (cid,),
+            )
+
+    monkeypatch.setattr(settings, "exploration_enabled", True)
+    monkeypatch.setattr(settings, "exploration_epsilon", 1.0)
+    monkeypatch.setattr(settings, "exploration_stable_top_k", 8)
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        overview_res = client.get("/api/overview?recommendation_limit=24")
+        assert overview_res.status_code == 200
+        overview_body = overview_res.json()
+        run_0 = overview_body["recommendation_run_id"]
+        assert run_0
+        page_0_ids = [
+            item["id"]
+            for item in overview_body["recommendations"]
+            if item["status"] == "recommended"
+        ]
+        assert len(page_0_ids) == 24
+
+        page_1_res = client.get(
+            f"/api/recommendations?status=recommended&limit=8&offset=24&seed_run_id={run_0}"
+        )
+        assert page_1_res.status_code == 200
+        assert page_1_res.headers.get("X-Bookward-Has-More") == "true"
+        run_24 = page_1_res.headers.get("X-Bookward-Recommendation-Run")
+        assert run_24 and run_24 != run_0
+        page_1_ids = [item["id"] for item in page_1_res.json()]
+        assert len(page_1_ids) == 8
+
+        # Chaining seed_run_id from page 2's run resolves back to the root exploration seed.
+        page_2_res = client.get(
+            f"/api/recommendations?status=recommended&limit=8&offset=32&seed_run_id={run_24}"
+        )
+        assert page_2_res.status_code == 200
+        assert page_2_res.headers.get("X-Bookward-Has-More") == "false"
+        page_2_ids = [item["id"] for item in page_2_res.json()]
+        assert len(page_2_ids) == 3
+
+        combined = page_0_ids + page_1_ids + page_2_ids
+        assert len(combined) == 35
+        assert len(set(combined)) == 35
+
+        # Window-based fallback without seed_run_id also reuses the recent discovery seed.
+        window_p1 = client.get(
+            "/api/recommendations?status=recommended&limit=8&offset=24"
+        ).json()
+        window_p2 = client.get(
+            "/api/recommendations?status=recommended&limit=8&offset=32"
+        ).json()
+        assert [item["id"] for item in window_p1] == page_1_ids
+        assert [item["id"] for item in window_p2] == page_2_ids
+
+    # Exact marginal propensities at epsilon=1.0: top 8 = 1.0, all 27 tail slots = 1/27.
+    expected_tail_propensity = 1.0 / (35 - 8)
+    with connect() as con:
+        p0_imps = con.execute(
+            "SELECT rank,propensity FROM recommendation_impressions WHERE run_id=? ORDER BY rank",
+            (run_0,),
+        ).fetchall()
+        p1_imps = con.execute(
+            "SELECT rank,propensity FROM recommendation_impressions WHERE run_id=? ORDER BY rank",
+            (run_24,),
+        ).fetchall()
+    assert [r["rank"] for r in p0_imps] == list(range(1, 25))
+    assert all(r["propensity"] == pytest.approx(1.0) for r in p0_imps[:8])
+    assert all(
+        r["propensity"] == pytest.approx(expected_tail_propensity)
+        for r in p0_imps[8:]
+    )
+    assert [r["rank"] for r in p1_imps] == list(range(25, 33))
+    assert all(
+        r["propensity"] == pytest.approx(expected_tail_propensity)
+        for r in p1_imps
+    )
+
+    # Independent offset=0 runs draw fresh exploration permutations across refreshes.
+    tail_orders = set()
+    for _ in range(6):
+        fresh_items, fresh_run = tracked_recommendations(
+            status="recommended", limit=35, offset=0
+        )
+        assert fresh_run
+        tail_orders.add(tuple(item["id"] for item in fresh_items[8:]))
+    assert len(tail_orders) > 1
+
+    # Personalization failure fallback branch also honors seed_run_id across pages.
+    def broken_personalize(*_args, **_kwargs):
+        raise RuntimeError("simulated ranking failure")
+
+    monkeypatch.setattr(main_module, "personalize_recommendations", broken_personalize)
+    fb_p0, fb_seed_run, _ = main_module.tracked_recommendations_page(
+        status="recommended", limit=24, offset=0
+    )
+    fb_p1, _, _ = main_module.tracked_recommendations_page(
+        status="recommended", limit=8, offset=24, seed_run_id=fb_seed_run
+    )
+    fb_p2, _, _ = main_module.tracked_recommendations_page(
+        status="recommended", limit=8, offset=32, seed_run_id=fb_seed_run
+    )
+    fb_ids = [item["id"] for item in [*fb_p0, *fb_p1, *fb_p2]]
+    assert len(fb_ids) == 35
+    assert len(set(fb_ids)) == 35
+
+
+def test_empty_run_id_feedback_falls_back_to_latest_discovery_impression(database):
+    recommendations, discovery_run_id = tracked_recommendations(status="recommended")
+    target = recommendations[0]
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        save_res = client.post(
+            f"/api/recommendations/{target['id']}/feedback",
+            json={"action": "save", "run_id": discovery_run_id},
+        )
+        assert save_res.status_code == 200
+
+        shortlist_items = client.get(
+            "/api/recommendations?status=saved&limit=8&offset=0"
+        ).json()
+        shortlisted = next(
+            item for item in shortlist_items if item["id"] == target["id"]
+        )
+        assert shortlisted["recommendation_run_id"] == ""
+
+        # Shortlist/history forms submit recommendation_run_id="" (or omit run_id).
+        restore_res = client.post(
+            f"/api/recommendations/{target['id']}/feedback",
+            json={"action": "restore", "run_id": ""},
+        )
+        assert restore_res.status_code == 200
+
+        reject_res = client.post(
+            f"/api/recommendations/{target['id']}/feedback",
+            json={"action": "reject", "run_id": ""},
+        )
+        assert reject_res.status_code == 200
+        reject_decision_id = reject_res.json()["decision_id"]
+
+    event = row(
+        "SELECT id,run_id,event_type FROM recommendation_events WHERE event_key=?",
+        (f"feedback:{reject_decision_id}",),
+    )
+    assert event["run_id"] is None
+    assert event["event_type"] == "reject"
+    outcome = row(
+        "SELECT i.run_id,i.rank,o.label,o.label_kind,o.confidence "
+        "FROM recommendation_outcomes o "
+        "JOIN recommendation_impressions i ON i.id=o.impression_id "
+        "WHERE o.event_id=?",
+        (event["id"],),
+    )
+    assert outcome == {
+        "run_id": discovery_run_id,
+        "rank": 1,
+        "label": 0.0,
+        "label_kind": "explicit_feedback",
+        "confidence": 0.5,
+    }
+
+
+def test_create_recommendation_run_guards_and_non_discovery_caller_skip(database):
+    from afterword_engine.main import tracked_recommendations_page
+
+    candidate_id = row("SELECT id FROM candidates LIMIT 1")["id"]
+
+    for bad_status in (
+        "saved",
+        "decisions",
+        "rejected",
+        "maybe_later",
+        "imported",
+        "new",
+        "read",
+    ):
+        with pytest.raises(
+            ValueError, match="only be created for discovery slates"
+        ):
+            create_recommendation_run(
+                [{"id": candidate_id, "score": 80, "status": "recommended"}],
+                status=bad_status,
+            )
+
+    for bad_item_status in (
+        "saved",
+        "imported",
+        "rejected",
+        "maybe_later",
+        "decisions",
+        "excluded",
+        "read",
+    ):
+        with pytest.raises(
+            ValueError,
+            match="may not log shortlist, imported, or archived items",
+        ):
+            create_recommendation_run(
+                [{"id": candidate_id, "score": 80, "status": bad_item_status}],
+                status="recommended",
+            )
+
+    for bad_offset in (-1, True):
+        with pytest.raises(ValueError, match="non-negative integer"):
+            create_recommendation_run(
+                [{"id": candidate_id, "score": 80, "status": "recommended"}],
+                offset=bad_offset,
+            )
+
+    before_runs = row("SELECT COUNT(*) count FROM recommendation_runs")["count"]
+    for non_discovery in ("saved", "decisions", "rejected", "maybe_later"):
+        _items, skipped_run_id, _more = tracked_recommendations_page(
+            status=non_discovery, limit=8, offset=0
+        )
+        assert skipped_run_id == ""
+    assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == before_runs
+
+
+def test_legacy_saved_runs_are_excluded_without_discovery_run_and_with_explicit_run_id(
+    database,
+):
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        only_saved_id = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+            "VALUES('Legacy Saved Only','Legacy Author',75.0,'saved',?,?)",
+            (source_id, "legacy-saved-only"),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+            (only_saved_id,),
+        )
+        con.execute(
+            "INSERT INTO recommendation_runs(id,policy,policy_version,session_id,candidate_count,metadata,created_at) "
+            "VALUES('legacy-saved-only','legacy','v0','',1,'{\"status\":\"saved\"}','2025-01-01T00:00:00+00:00')"
+        )
+        con.execute(
+            "INSERT INTO recommendation_impressions(run_id,candidate_id,rank,score,propensity,presented_at,visible_at) "
+            "VALUES('legacy-saved-only',?,1,75.0,1.0,'2025-01-01T00:00:00+00:00','2025-01-01T00:01:00+00:00')",
+            (only_saved_id,),
+        )
+
+    with TestClient(app, headers=authenticated_headers()) as client:
+        # Feedback without run_id, with empty run_id, and with explicit legacy run_id
+        # must all refuse to attribute an outcome to a non-discovery "saved" run.
+        r1 = client.post(
+            f"/api/recommendations/{only_saved_id}/feedback",
+            json={"action": "reject", "run_id": ""},
+        )
+        assert r1.status_code == 200
+        r2 = client.post(
+            f"/api/recommendations/{only_saved_id}/feedback",
+            json={"action": "save", "run_id": "legacy-saved-only"},
+        )
+        assert r2.status_code == 200
+        r3 = client.post(
+            f"/api/recommendations/{only_saved_id}/read",
+            json={"rating": 5},
+        )
+        assert r3.status_code == 200
+
+    csv_payload = (
+        "Title,Author,My Rating,Date Read,Exclusive Shelf\n"
+        "Legacy Saved Only,Legacy Author,5,2099/01/02,read\n"
+    ).encode("utf-8")
+    assert import_goodreads_csv(csv_payload) == 1
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_outcomes o "
+            "JOIN recommendation_impressions i ON i.id=o.impression_id "
+            "WHERE i.candidate_id=?",
+            (only_saved_id,),
+        )["count"]
+        == 0
+    )
+
+    # When both a discovery run and a newer legacy saved run exist, even passing
+    # run_id="legacy-saved-both" falls back to the discovery impression rather than
+    # crediting the non-discovery saved run.
+    recommendations, discovery_run_id = tracked_recommendations(status="recommended")
+    both_book = recommendations[0]
+    with transaction() as con:
+        con.execute(
+            "INSERT INTO recommendation_runs(id,policy,policy_version,session_id,candidate_count,metadata,created_at) "
+            "VALUES('legacy-saved-both','legacy','v0','',1,'{\"status\":\"saved\"}','2098-01-01T00:00:00+00:00')"
+        )
+        con.execute(
+            "INSERT INTO recommendation_impressions(run_id,candidate_id,rank,score,propensity,presented_at,visible_at) "
+            "VALUES('legacy-saved-both',?,1,75.0,1.0,'2098-01-01T00:00:00+00:00','2098-01-01T00:01:00+00:00')",
+            (both_book["id"],),
+        )
+    with TestClient(app, headers=authenticated_headers()) as client:
+        res = client.post(
+            f"/api/recommendations/{both_book['id']}/feedback",
+            json={"action": "save", "run_id": "legacy-saved-both"},
+        )
+        assert res.status_code == 200
+        decision_id = res.json()["decision_id"]
+
+    credited = row(
+        "SELECT i.run_id FROM recommendation_outcomes o "
+        "JOIN recommendation_impressions i ON i.id=o.impression_id "
+        "JOIN recommendation_events e ON e.id=o.event_id "
+        "WHERE e.event_key=?",
+        (f"feedback:{decision_id}",),
+    )
+    assert credited == {"run_id": discovery_run_id}
+
+
+def test_internal_settings_and_sources_endpoints_enforce_auth_and_mask_secrets(
+    database, monkeypatch
+):
+    from afterword_engine.secrets import seal
+
+    with transaction() as con:
+        for key, raw in (
+            ("librarr_api_key", "super-secret-librarr"),
+            ("embedding_api_key", "super-secret-embed"),
+            ("nyt_api_key", "super-secret-nyt"),
+            ("association_google_books_api_key", "super-secret-gbooks"),
+            ("llm_rerank_api_key", "super-secret-llm"),
+            ("digest_discord_webhook_url", "https://discord.example/secret-webhook"),
+            ("digest_smtp_password", "super-secret-smtp"),
+        ):
+            con.execute(
+                "INSERT INTO settings(key,value,secret) VALUES(?,?,1) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,secret=1",
+                (key, seal(raw)),
+            )
+
+    # Unauthenticated requests are rejected with 401.
+    with TestClient(app) as unauth_client:
+        for path in ("/api/settings", "/api/sources"):
+            res = unauth_client.get(path)
+            assert res.status_code == 401
+
+    # When service_secret is configured, missing/wrong x-bookward-service is rejected with 401.
+    auth_headers = authenticated_headers()
+    monkeypatch.setattr(settings, "service_secret", "shared-engine-secret")
+    with TestClient(app, headers=auth_headers) as missing_service_client:
+        for path in ("/api/settings", "/api/sources"):
+            res = missing_service_client.get(path)
+            assert res.status_code == 401
+
+    with TestClient(
+        app,
+        headers={**auth_headers, "x-bookward-service": "shared-engine-secret"},
+    ) as client:
+        settings_res = client.get("/api/settings")
+        sources_res = client.get("/api/sources")
+        overview_res = client.get("/api/overview?track_impressions=false")
+
+    assert settings_res.status_code == 200
+    assert sources_res.status_code == 200
+    assert "no-store" in settings_res.headers.get("cache-control", "")
+    assert "private" in settings_res.headers.get("cache-control", "")
+    assert "no-store" in sources_res.headers.get("cache-control", "")
+    assert "private" in sources_res.headers.get("cache-control", "")
+
+    settings_payload = settings_res.json()
+    serialized = json.dumps(settings_payload)
+    assert "super-secret" not in serialized
+    assert "secret-webhook" not in serialized
+    assert "api_tokens" not in settings_payload
+    assert settings_payload["librarr_api_key_set"] is True
+    assert settings_payload["embedding_api_key_set"] is True
+    assert settings_payload["nyt_api_key_set"] is True
+    assert settings_payload["google_books_api_key_set"] is True
+    assert settings_payload["llm_rerank"]["api_key_set"] is True
+    assert settings_payload["digest"]["discord_webhook_set"] is True
+    assert settings_payload["digest"]["smtp_password_set"] is True
+    assert sources_res.json() == overview_res.json()["sources"]
 
 
 def test_read_attribution_matches_subtitles_coauthors_isbns_and_verified_work_ids(database):
@@ -2419,7 +3153,7 @@ def test_storygraph_csv_import_attributes_dated_fractional_rating_outcomes(datab
     with transaction() as con:
         source_id = con.execute("SELECT id FROM sources WHERE is_default=1 LIMIT 1").fetchone()[0]
         con.execute(
-            "INSERT INTO candidates(title,author,source_id,normalized_key) VALUES(?,?,?,?)",
+            "INSERT INTO candidates(title,author,status,source_id,normalized_key) VALUES(?,?,'recommended',?,?)",
             ("StoryGraph Pick", "Primary Writer", source_id, "storygraph pick primary writer"),
         )
         candidate_id = con.execute(
@@ -2444,3 +3178,134 @@ def test_storygraph_csv_import_attributes_dated_fractional_rating_outcomes(datab
     assert event["occurred_at"] == "2099/01/10"
     assert outcome["label"] == 1.0
     assert outcome["label_kind"] == "rating_positive"
+
+
+def test_authenticated_http_discovery_isolates_exploration_seed_per_session(
+    database, monkeypatch
+):
+    monkeypatch.setattr(settings, "exploration_enabled", True)
+    monkeypatch.setattr(settings, "exploration_epsilon", 1.0)
+    monkeypatch.setattr(settings, "exploration_stable_top_k", 3)
+
+    headers_a = authenticated_headers()
+    headers_b = authenticated_headers()
+    assert headers_a["x-bookward-session"] != headers_b["x-bookward-session"]
+
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        con.execute("DELETE FROM candidates")
+        for index in range(40):
+            cid = con.execute(
+                "INSERT INTO candidates(title,author,score,status,source_id,normalized_key) "
+                "VALUES(?,?,?,'recommended',?,?)",
+                (
+                    f"Session Pool {index + 1}",
+                    f"Author {index + 1}",
+                    round(100.0 - index, 2),
+                    source_id,
+                    f"session pool {index + 1}",
+                ),
+            ).lastrowid
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted' WHERE candidate_id=?",
+                (cid,),
+            )
+
+    with TestClient(app) as client:
+        token = client.post(
+            "/api/settings/api-tokens",
+            headers=headers_a,
+            json={"name": "Session Isolation CLI"},
+        ).json()["token"]
+        v1_headers = {"Authorization": f"Bearer {token}"}
+
+        ov_a = client.get(
+            "/api/overview?recommendation_limit=24&decision_limit=24",
+            headers=headers_a,
+        )
+        assert ov_a.status_code == 200
+        run_a0 = ov_a.json()["recommendation_run_id"]
+        ids_a0 = [
+            item["id"]
+            for item in ov_a.json()["recommendations"]
+            if item["status"] == "recommended"
+        ]
+        assert run_a0
+
+        ov_b = client.get(
+            "/api/overview?recommendation_limit=24&decision_limit=24",
+            headers=headers_b,
+        )
+        assert ov_b.status_code == 200
+        run_b0 = ov_b.json()["recommendation_run_id"]
+        ids_b0 = [
+            item["id"]
+            for item in ov_b.json()["recommendations"]
+            if item["status"] == "recommended"
+        ]
+        assert run_b0
+        assert run_b0 != run_a0
+
+        # Session B acted more recently than Session A; an unseeded offset=24
+        # request from Session A must reuse Session A's own seed (run_a0), not
+        # Session B's more recent run_b0, and return a disjoint tail slice.
+        page_a = client.get(
+            "/api/recommendations?status=recommended&limit=8&offset=24",
+            headers=headers_a,
+        )
+        assert page_a.status_code == 200
+        run_a1 = page_a.headers["X-Bookward-Recommendation-Run"]
+        ids_a1 = [item["id"] for item in page_a.json()]
+        assert set(ids_a0).isdisjoint(ids_a1)
+
+        page_b = client.get(
+            "/api/recommendations?status=recommended&limit=8&offset=24",
+            headers=headers_b,
+        )
+        assert page_b.status_code == 200
+        run_b1 = page_b.headers["X-Bookward-Recommendation-Run"]
+        ids_b1 = [item["id"] for item in page_b.json()]
+        assert set(ids_b0).isdisjoint(ids_b1)
+
+        # An API token caller also gets its own api-token:* session_id rather
+        # than inheriting either browser session's recent seed.
+        v1_page = client.get(
+            "/api/v1/recommendations?status=recommended&limit=8&offset=24",
+            headers=v1_headers,
+        )
+        assert v1_page.status_code == 200
+        run_v1 = v1_page.headers["X-Bookward-Recommendation-Run"]
+
+        # When an API token explicitly passes seed_run_id for Session A's run,
+        # it reproduces Session A's exact partition while keeping its api-token session_id.
+        v1_seeded = client.get(
+            f"/api/v1/recommendations?status=recommended&limit=8&offset=24&seed_run_id={run_a0}",
+            headers=v1_headers,
+        )
+        assert v1_seeded.status_code == 200
+        assert [item["id"] for item in v1_seeded.json()] == ids_a1
+        run_v1_seeded = v1_seeded.headers["X-Bookward-Recommendation-Run"]
+
+    runs_by_id = {
+        item["id"]: item
+        for item in rows(
+            "SELECT id, session_id, metadata FROM recommendation_runs WHERE id IN (?, ?, ?, ?, ?, ?)",
+            (run_a0, run_b0, run_a1, run_b1, run_v1, run_v1_seeded),
+        )
+    }
+    assert runs_by_id[run_a0]["session_id"].startswith("sess:")
+    assert runs_by_id[run_b0]["session_id"].startswith("sess:")
+    assert runs_by_id[run_a0]["session_id"] != runs_by_id[run_b0]["session_id"]
+    assert runs_by_id[run_a1]["session_id"] == runs_by_id[run_a0]["session_id"]
+    assert runs_by_id[run_b1]["session_id"] == runs_by_id[run_b0]["session_id"]
+    assert runs_by_id[run_v1]["session_id"].startswith("api-token:")
+    assert runs_by_id[run_v1_seeded]["session_id"] == runs_by_id[run_v1]["session_id"]
+
+    meta_a1 = json.loads(runs_by_id[run_a1]["metadata"])
+    meta_b1 = json.loads(runs_by_id[run_b1]["metadata"])
+    meta_v1 = json.loads(runs_by_id[run_v1]["metadata"])
+    assert meta_a1["exploration_seed"] == run_a0
+    assert meta_b1["exploration_seed"] == run_b0
+    assert meta_v1["exploration_seed"] == run_v1

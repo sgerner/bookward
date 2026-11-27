@@ -1361,15 +1361,18 @@ def archive_served_exposures(
     run_id: str,
     recommendations: Iterable[Mapping[str, Any]],
     presented_at: str,
+    offset: int = 0,
 ) -> int:
     """Copy actual returned slots into the cleanup-independent evidence tables."""
 
+    if isinstance(offset, bool) or int(offset) < 0:
+        raise ValueError("Exposure offset must be a non-negative integer")
     items = list(recommendations)
     if len(items) > MAX_EXPOSURES_PER_RUN:
         LOGGER.warning("Recommendation evidence exposure cap exceeded")
         return 0
     archived = 0
-    for rank, item in enumerate(items, 1):
+    for rank, item in enumerate(items, int(offset) + 1):
         try:
             candidate_id = _candidate_id(item)
             if candidate_id is None:

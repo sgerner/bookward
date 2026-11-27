@@ -1641,23 +1641,49 @@ def test_tracked_recommendations_skips_llm_settings_lookup_when_recommended_empt
         _set_embeddings(con, [saved], {saved["id"]: vector})
 
     with connect() as con:
+        runs_before = con.execute("SELECT COUNT(*) count FROM recommendation_runs").fetchone()[
+            "count"
+        ]
+        prepared = main_module._prepare_tracked_recommendations(
+            status="recommended", limit=10, offset=0, connection=con
+        )
+        empty_evidence = build_decision_evidence(
+            con,
+            base_pool=prepared["base_pool"],
+            personalized_pool=prepared["personalized_pool"],
+            final_pool=[],
+            interaction_events=prepared["interaction_events"],
+            cached_vectors=prepared["cached_vectors"],
+            ranking_metadata=prepared["learning_metadata"],
+            discovery_slate_metadata=prepared["discovery_metadata"],
+            request_context={"status": "recommended", "limit": 10, "offset": 0},
+            visible_day_counts=prepared["visible_day_counts"],
+            impression_fatigue_settings=prepared["fatigue_settings"],
+            llm_rerank_settings=prepared["llm_cfg"],
+        )
         empty_recommended, empty_run = tracked_recommendations(
             status="recommended", limit=10, offset=0, connection=con
         )
         saved_items, saved_run = tracked_recommendations(
             status="saved", limit=10, offset=0, connection=con
         )
-        empty_evidence = load_decision_evidence(con, empty_run)
+        runs_after = con.execute("SELECT COUNT(*) count FROM recommendation_runs").fetchone()[
+            "count"
+        ]
+        persisted_empty_evidence = load_decision_evidence(con, empty_run)
 
     assert empty_recommended == []
-    assert empty_run is not None
+    assert empty_run == ""
+    assert persisted_empty_evidence is None
+    assert prepared["llm_cfg"] == {}
     assert empty_evidence["capture_status"] == "complete"
     assert (
-        empty_evidence["decision"]["stage_inputs"]["llm_rerank"]["settings"]["enabled"]
+        empty_evidence["stage_inputs"]["llm_rerank"]["settings"]["enabled"]
         is False
     )
     assert [item["id"] for item in saved_items] == [saved["id"]]
-    assert saved_run is not None
+    assert saved_run == ""
+    assert runs_after == runs_before
 
 
 def test_llm_rerank_precedes_discovery_slate_diversification_in_replay(

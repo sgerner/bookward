@@ -196,9 +196,10 @@ def test_filtered_recommendations_skip_llm_reranker_and_full_slate_evidence(
 
         filtered = client.get(
             "/api/recommendations",
-            params={"status": "recommended", "limit": 4, "search": "piranesi"},
+            params={"status": "recommended", "limit": 4, "search": "isako"},
         )
         assert filtered.status_code == 200
+        assert len(filtered.json()) == 1
         assert rerank_calls == 1  # External LLM reranker was NOT called for filtered query
 
         latest_filtered = row(
@@ -211,6 +212,16 @@ def test_filtered_recommendations_skip_llm_reranker_and_full_slate_evidence(
         assert latest_filtered["reason"] == "filtered_query"
         assert latest_filtered["vector_count"] == 0
         assert latest_filtered["payload_bytes"] < latest_unfiltered["payload_bytes"]
+
+        runs_before_empty = row("SELECT COUNT(*) count FROM recommendation_runs")["count"]
+        empty_filtered = client.get(
+            "/api/recommendations",
+            params={"status": "recommended", "limit": 4, "search": "piranesi"},
+        )
+        assert empty_filtered.status_code == 200
+        assert empty_filtered.json() == []
+        assert empty_filtered.headers.get("X-Bookward-Recommendation-Run") is None
+        assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == runs_before_empty
 
 
 def test_v1_recommendations_token_and_direct_python_call_compatibility(database):

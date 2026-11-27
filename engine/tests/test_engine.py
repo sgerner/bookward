@@ -2485,6 +2485,67 @@ def test_tracked_recommendations_defers_url_formatting_until_after_pagination(da
     assert len(overview_slice) == 5
     assert urlparse_calls == 5
 
+    # Paginated discovery slice (offset=24, limit=8) formats only the 8 returned items
+    httpx_calls = 0
+    urlparse_calls = 0
+    paged_slice, paged_run_id, paged_has_more = main_module.tracked_recommendations_page(
+        status="recommended", limit=8, offset=24
+    )
+    assert len(paged_slice) == 8
+    assert paged_run_id
+    assert paged_has_more is True
+    assert urlparse_calls == 8
+
+    # Non-discovery +1 lookahead formats only the returned cap, never the extra lookahead row
+    with main_module.transaction() as con:
+        extra_rejected = con.execute(
+            """INSERT INTO candidates(
+                title,author,description,cover_url,source_url,source_id,
+                genres,score,explanation,status,normalized_key,isbn13
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "Second Rejected Book",
+                "Rejected Writer Two",
+                "Description",
+                "",
+                "https://openlibrary.org/people/reader/lists/OL99L",
+                source_id,
+                '["Fiction"]',
+                12.0,
+                '["Rejected"]',
+                "rejected",
+                "second-rejected-book::rejected-writer-two",
+                "",
+            ),
+        )
+        con.execute(
+            """INSERT OR REPLACE INTO candidate_quality(
+                candidate_id,quality_status,quality_score,audit_version,metadata_version,work_id,provider
+            ) VALUES(?,?,?,?,?,?,?)""",
+            (
+                extra_rejected.lastrowid,
+                "accepted",
+                1.0,
+                "builtin-curated-v1",
+                "catalog-metadata-v1",
+                "/works/OL901W",
+                "openlibrary",
+            ),
+        )
+        con.execute(
+            "INSERT INTO feedback(candidate_id,action) VALUES(?,?)",
+            (extra_rejected.lastrowid, "reject"),
+        )
+    httpx_calls = 0
+    urlparse_calls = 0
+    rejected_page, rejected_run_id, rejected_has_more = main_module.tracked_recommendations_page(
+        status="decisions", limit=1, offset=0
+    )
+    assert len(rejected_page) == 1
+    assert rejected_run_id == ""
+    assert rejected_has_more is True
+    assert urlparse_calls == 1
+
     # Personalization failure fallback still formats URLs for the returned slice
     def broken_personalize(*_args, **_kwargs):
         raise RuntimeError("simulated personalization failure")

@@ -215,6 +215,11 @@ async function buildRealComponentHarness(): Promise<HarnessAssets> {
       if (id === virtualNavId) {
         return `
           import { setHarnessPage } from '$app/state';
+          export async function goto(url) {
+            const resolved = new URL(url, window.location.href);
+            window.history.replaceState({}, '', resolved);
+            setHarnessPage({ href: resolved.href });
+          }
           export function pushState(url) {
             const resolved = new URL(url, window.location.href);
             window.history.replaceState({}, '', resolved);

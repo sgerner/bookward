@@ -531,6 +531,60 @@ def ips_ndcg_at_k(
     return sum(per_run) / len(per_run) if per_run else None
 
 
+def ips_rank_concordance(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    score_key: str = "score",
+    positive_threshold: float = 0.5,
+    min_propensity: float = DEFAULT_MIN_PROPENSITY,
+    full_rating_certainty: bool = False,
+) -> float | None:
+    """Compute within-run pairwise rank concordance as a macro-average over runs.
+
+    Logged slate ``rank`` orders candidates within each discovery run (smaller
+    rank means presented earlier), while unlabeled slots remain censored.  This
+    measures concordance of the served slate order even when local diversity
+    swaps reorder close-scoring candidates without mutating raw scores.
+    """
+
+    per_run: list[float] = []
+    for values in _ranked_runs(rows).values():
+        usable: list[tuple[int, float, float]] = []
+        for row, rank in values:
+            item = _weighted_item(
+                row,
+                score_key=score_key,
+                min_propensity=min_propensity,
+                full_rating_certainty=full_rating_certainty,
+            )
+            if item is not None:
+                _score, label, weight = item
+                usable.append((rank, label, weight))
+        positives = [
+            (rank, weight) for rank, label, weight in usable if label > positive_threshold
+        ]
+        negatives = [
+            (rank, weight) for rank, label, weight in usable if label < positive_threshold
+        ]
+        denominator = sum(
+            left_weight * right_weight
+            for _, left_weight in positives
+            for _, right_weight in negatives
+        )
+        if not positives or not negatives or denominator <= 0:
+            continue
+        numerator = 0.0
+        for positive_rank, positive_weight in positives:
+            for negative_rank, negative_weight in negatives:
+                pair_weight = positive_weight * negative_weight
+                if positive_rank < negative_rank:
+                    numerator += pair_weight
+                elif positive_rank == negative_rank:
+                    numerator += pair_weight * 0.5
+        per_run.append(numerator / denominator)
+    return sum(per_run) / len(per_run) if per_run else None
+
+
 def _metric_bundle(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -546,6 +600,11 @@ def _metric_bundle(
     labels = [label for _, _, label, _ in usable]
     return {
         "auc": ips_auc(
+            rows,
+            score_key=score_key,
+            full_rating_certainty=full_rating_certainty,
+        ),
+        "rank_concordance": ips_rank_concordance(
             rows,
             score_key=score_key,
             full_rating_certainty=full_rating_certainty,
@@ -613,6 +672,7 @@ def cluster_bootstrap(
     extra = {"full_rating_certainty": True} if full_rating_certainty else {}
     metric_fn = {
         "auc": lambda sample: ips_auc(sample, score_key=score_key, **extra),
+        "rank_concordance": lambda sample: ips_rank_concordance(sample, score_key=score_key, **extra),
         "grade_concordance": lambda sample: ips_grade_concordance(sample, score_key=score_key, **extra),
         "precision_at_20": lambda sample: ips_precision_at_k(sample, k, score_key=score_key, **extra),
         "ndcg_at_20": lambda sample: ips_ndcg_at_k(sample, k, score_key=score_key, **extra),
@@ -834,18 +894,54 @@ def _read_json_or_sqlite(path: Path) -> dict[str, Any]:
         )}
 
 
+_DISCOVERY_RUN_STATUSES = frozenset({"", "recommended", "all"})
+
+
+def _is_discovery_run(run: Mapping[str, Any]) -> bool:
+    direct_status = run.get("status")
+    if direct_status is not None and (
+        not isinstance(direct_status, str)
+        or direct_status.strip() not in _DISCOVERY_RUN_STATUSES
+    ):
+        return False
+    raw_metadata = run.get("metadata")
+    if raw_metadata is None or raw_metadata == "":
+        return True
+    if isinstance(raw_metadata, str):
+        try:
+            metadata = json.loads(raw_metadata)
+        except (TypeError, ValueError):
+            return False
+    elif isinstance(raw_metadata, Mapping):
+        metadata = raw_metadata
+    else:
+        return False
+    if not isinstance(metadata, Mapping):
+        return False
+    status = metadata.get("status")
+    if status is None:
+        return True
+    return isinstance(status, str) and status.strip() in _DISCOVERY_RUN_STATUSES
+
+
 def load_rows(source: str | Path | Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Load joined recommendation impressions and observed outcomes."""
+    """Load joined discovery recommendation impressions and observed outcomes."""
 
     data = dict(source) if isinstance(source, Mapping) else _read_json_or_sqlite(Path(source))
     runs = {str(row["id"]): row for row in data.get("recommendation_runs", [])}
+    excluded_run_ids = {
+        run_id for run_id, row in runs.items() if not _is_discovery_run(row)
+    }
     impressions = data.get("recommendation_impressions", [])
     outcomes_by_impression: dict[Any, list[Mapping[str, Any]]] = defaultdict(list)
     for outcome in data.get("recommendation_outcomes", []):
         outcomes_by_impression[outcome.get("impression_id")].append(outcome)
     values: list[dict[str, Any]] = []
     for impression in impressions:
-        run = runs.get(str(impression.get("run_id")), {})
+        run_key = str(impression.get("run_id"))
+        if run_key in excluded_run_ids:
+            continue
+        run = runs.get(run_key, {})
         candidates = outcomes_by_impression.get(impression.get("id"), [])
         outcome = _select_primary_outcome(candidates)
         raw_confidence = outcome.get("confidence") if outcome is not None else None
@@ -892,5 +988,6 @@ def build_report(
     for split_name, split_rows in splits.items():
         champion = evaluate_metrics(split_rows, score_key="score", k=k)
         champion["auc_bootstrap"] = cluster_bootstrap(split_rows, score_key="score", metric="auc", k=k, iterations=bootstrap_iterations, seed=bootstrap_seed)
+        champion["rank_concordance_bootstrap"] = cluster_bootstrap(split_rows, score_key="score", metric="rank_concordance", k=k, iterations=bootstrap_iterations, seed=bootstrap_seed)
         report["splits"][split_name] = {"champion": champion}
     return report

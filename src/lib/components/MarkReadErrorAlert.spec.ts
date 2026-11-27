@@ -88,4 +88,36 @@ describe('MarkReadErrorAlert and createMarkReadSubmit', () => {
 		expect(rollback).not.toHaveBeenCalled();
 		expect(errors).toEqual(['']);
 	});
+
+	it('propagates active view and runs view-aware refresh before non-refreshAll update when configured', async () => {
+		const refreshView = vi.fn().mockResolvedValue(undefined);
+		const update = vi.fn().mockResolvedValue(undefined);
+		const action = new URL('http://afterword.test/?/markRead');
+		const formData = new FormData();
+
+		const submit = createMarkReadSubmit({
+			bookId: 9,
+			getView: () => 'saved',
+			refreshView,
+			setError: () => {},
+			setPending: () => {},
+			startOptimistic: () => {},
+			onSuccess: () => {}
+		});
+
+		const callback = submit({
+			action,
+			formData,
+			submitter: null
+		} as never);
+		expect(action.searchParams.get('view')).toBe('saved');
+		expect(formData.get('view')).toBe('saved');
+
+		await (callback as (arg: unknown) => Promise<void>)({
+			update,
+			result: { type: 'success', status: 200, data: { message: 'Marked Read.' } }
+		});
+		expect(refreshView).toHaveBeenCalledTimes(1);
+		expect(update).toHaveBeenCalledWith({ reset: false, refreshAll: false, navigate: false });
+	});
 });

@@ -187,7 +187,11 @@ export function engineStatus(error: unknown, passthroughStatus?: number): number
   return 503;
 }
 
-export async function engine<T>(path: string, init?: RequestInit, timeoutMs = 30_000): Promise<T> {
+export async function engineWithHeaders<T>(
+  path: string,
+  init?: RequestInit,
+  timeoutMs = 30_000,
+): Promise<{ data: T; headers: Headers }> {
   const timeout = AbortSignal.timeout(timeoutMs);
   const headers = new Headers(init?.headers);
   if (!(init?.body instanceof FormData) && !headers.has('content-type')) headers.set('content-type', 'application/json');
@@ -211,11 +215,21 @@ export async function engine<T>(path: string, init?: RequestInit, timeoutMs = 30
       parseRetryAfter(response.headers)
     );
   }
+  let data: T;
   try {
-    return (await response.json()) as T;
+    data = (await response.json()) as T;
   } catch {
     throw new EngineError(ENGINE_UNAVAILABLE_MESSAGE, 503, true);
   }
+  return {
+    data,
+    headers: response.headers,
+  };
+}
+
+export async function engine<T>(path: string, init?: RequestInit, timeoutMs = 30_000): Promise<T> {
+  const { data } = await engineWithHeaders<T>(path, init, timeoutMs);
+  return data;
 }
 
 export async function engineStream(path: string, init?: RequestInit): Promise<Response> {

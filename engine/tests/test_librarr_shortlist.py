@@ -28,10 +28,11 @@ def _configure_librarr():
 @respx.mock
 def test_search_download_marks_unread_candidates_imported_and_logs_one_learning_event(database, initial_status):
     _configure_librarr()
-    with transaction() as con:
-        con.execute("UPDATE candidates SET status=? WHERE id=1", (initial_status,))
     recommendations, run_id = tracked_recommendations(include_imported=True)
     assert 1 in {item["id"] for item in recommendations}
+    if initial_status != "recommended":
+        with transaction() as con:
+            con.execute("UPDATE candidates SET status=? WHERE id=1", (initial_status,))
     route = respx.post("http://librarr:5050/api/download").mock(
         return_value=httpx.Response(200, json={"id": "download-1"})
     )
@@ -118,9 +119,10 @@ def test_search_download_does_not_overwrite_read_status(database):
 @respx.mock
 def test_waitlist_import_records_idempotent_librarr_import_event_with_run_attribution(database):
     _configure_librarr()
+    _, run_id = tracked_recommendations(include_imported=True)
     with transaction() as con:
         con.execute("UPDATE candidates SET status='saved' WHERE id=1")
-    _, run_id = tracked_recommendations(include_imported=True)
+        con.execute("UPDATE candidates SET status='saved' WHERE id=2")
     route = respx.post("http://librarr:5050/api/wishlist").mock(
         return_value=httpx.Response(200, json={"id": "wishlist-1"})
     )
@@ -132,12 +134,15 @@ def test_waitlist_import_records_idempotent_librarr_import_event_with_run_attrib
 
         first = client.post("/api/recommendations/1/import", json={"run_id": run_id})
         second = client.post("/api/recommendations/1/import", json={"run_id": run_id})
+        empty_run = client.post("/api/recommendations/2/import", json={"run_id": ""})
 
     assert first.status_code == 200
     assert first.json() == {"id": 1, "status": "imported", "remote_id": "wishlist-1"}
     assert second.status_code == 200
     assert second.json() == {"id": 1, "status": "imported", "remote_id": "wishlist-1", "duplicate": True}
-    assert route.call_count == 1
+    assert empty_run.status_code == 200
+    assert empty_run.json() == {"id": 2, "status": "imported", "remote_id": "wishlist-1"}
+    assert route.call_count == 2
     assert row("SELECT status FROM candidates WHERE id=1")["status"] == "imported"
     events = rows("SELECT * FROM recommendation_events WHERE candidate_id=1 AND event_type='librarr_import'")
     assert len(events) == 1
@@ -147,12 +152,22 @@ def test_waitlist_import_records_idempotent_librarr_import_event_with_run_attrib
     assert outcome["label"] == 1.0
     assert outcome["label_kind"] == "librarr_import"
     assert outcome["confidence"] == 0.7
+    fallback_event = row(
+        "SELECT id,run_id FROM recommendation_events WHERE candidate_id=2 AND event_type='librarr_import'"
+    )
+    assert fallback_event["run_id"] is None
+    fallback_outcome = row(
+        "SELECT i.run_id,o.confidence FROM recommendation_outcomes o "
+        "JOIN recommendation_impressions i ON i.id=o.impression_id WHERE o.event_id=?",
+        (fallback_event["id"],),
+    )
+    assert fallback_outcome == {"run_id": run_id, "confidence": 0.7}
 
 
 def test_remove_on_imported_shortlist_card_restores_to_discover_and_undo_restores_imported(database):
+    _, run_id = tracked_recommendations(include_imported=True)
     with transaction() as con:
         con.execute("UPDATE candidates SET status='imported' WHERE id=1")
-    _, run_id = tracked_recommendations(include_imported=True)
     reads_before = row("SELECT COUNT(*) count FROM reads")["count"]
 
     with TestClient(app, headers=authenticated_headers()) as client:

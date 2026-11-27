@@ -14,6 +14,7 @@ import {
 	sessionRefreshCookieOptions
 } from '#lib/server/cookies.js';
 import {
+	requestFormData,
 	resolveClientAddress,
 	withRequestContext,
 	withSessionToken
@@ -22,26 +23,11 @@ import {
 const ORIGIN_ERROR_DETAIL = 'Request origin could not be verified';
 const AUTH_REQUIRED_DETAIL = 'Authentication required. Sign in again to continue.';
 const STALE_PROFILE_DETAIL = 'This page belongs to a different profile. Reload before continuing.';
-const formDataByRequest = new WeakMap<Request, Promise<FormData>>();
 
 type SessionLookup =
 	| { status: 'authenticated'; user: NonNullable<App.Locals['user']> }
 	| { status: 'unauthenticated' }
 	| { status: 'unavailable' };
-
-function requestFormData(request: Request): Promise<FormData> {
-	let cached = formDataByRequest.get(request);
-	if (!cached) {
-		const parse = request.formData.bind(request);
-		cached = parse();
-		formDataByRequest.set(request, cached);
-		Object.defineProperty(request, 'formData', {
-			configurable: true,
-			value: () => cached!
-		});
-	}
-	return cached;
-}
 
 function prefersHtmlError(request: Request, path: string): boolean {
 	if (path.startsWith('/api/') || request.headers.get('x-sveltekit-action') === 'true') return false;
@@ -171,13 +157,21 @@ async function sessionUser(token: string): Promise<SessionLookup> {
 }
 
 async function submittedProfile(request: Request): Promise<string> {
+	const contentType = request.headers.get('content-type') || '';
+	const isFormBody =
+		contentType.includes('multipart/form-data') ||
+		contentType.includes('application/x-www-form-urlencoded');
 	const header = request.headers.get('x-bookward-profile');
-	if (header) return header;
+	if (header) {
+		if (isFormBody) {
+			void requestFormData(request).catch(() => undefined);
+		}
+		return header;
+	}
 	const requestUrl = new URL(request.url);
 	if (requestUrl.pathname === '/auth/oidc/start') return requestUrl.searchParams.get('profile_id') || '';
-	const contentType = request.headers.get('content-type') || '';
 	try {
-		if (contentType.includes('multipart/form-data') || contentType.includes('application/x-www-form-urlencoded')) {
+		if (isFormBody) {
 			const form = await requestFormData(request);
 			return String(form.get('__profile_id') || '');
 		}

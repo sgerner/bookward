@@ -13,9 +13,16 @@ export function createMarkReadSubmit(options: {
 	setPending: (key: string, pending: boolean) => void;
 	startOptimistic: (formData: FormData) => OptimisticChange | void;
 	onSuccess: () => void;
+	getView?: () => string;
+	refreshView?: () => Promise<void>;
 }): SubmitFunction {
 	const key = `shortlist-read-${options.bookId}`;
-	return ({ formData, submitter }) => {
+	return ({ action, formData, submitter }) => {
+		const view = options.getView?.();
+		if (view) {
+			action?.searchParams.set('view', view);
+			if (!formData.has('view')) formData.set('view', view);
+		}
 		options.setError('');
 		options.setPending(key, true);
 		let change: OptimisticChange | void;
@@ -40,7 +47,12 @@ export function createMarkReadSubmit(options: {
 					options.setError(actionResultMessage(result));
 					return;
 				}
-				await update({ reset: false, navigate: false });
+				if (options.refreshView && result.type === 'success') {
+					await options.refreshView();
+					await update({ reset: false, refreshAll: false, navigate: false });
+				} else {
+					await update({ reset: false, navigate: false });
+				}
 				options.onSuccess();
 				change?.commit?.();
 			} catch (error) {

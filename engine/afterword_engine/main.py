@@ -5,6 +5,7 @@ import asyncio
 import logging
 import base64
 import hmac
+import random
 import re
 import secrets
 import sqlite3
@@ -121,6 +122,7 @@ from .learning import (
     HISTORICAL_READ_SOURCES,
     create_recommendation_run,
     build_decision_evidence,
+    is_discovery_run_metadata,
     reconcile_read_outcomes_in_connection,
     record_event_in_connection,
     record_events,
@@ -177,7 +179,14 @@ from .identity import (
 )
 from .isbn import isbn_parts
 from . import profiles as identity_store
-from .tenancy import ProfileDeletedError, current_profile_id, profile_database_path, profile_scope
+from .tenancy import (
+    ProfileDeletedError,
+    current_profile_id,
+    current_session_id,
+    profile_database_path,
+    profile_scope,
+    session_scope,
+)
 import jwt
 
 SOURCE_SYNC_MIN_HOURS = 0
@@ -1471,8 +1480,13 @@ async def authenticate_engine_request(request: Request, call_next):
                     status_code=503,
                     headers={"cache-control": "private, no-store"},
                 )
+        derived_session_id = f"api-token:{int(token['id']):06d}"
         try:
-            with profile_scope(token["profile_id"]), bind_request_restore_epoch():
+            with (
+                profile_scope(token["profile_id"]),
+                session_scope(derived_session_id),
+                bind_request_restore_epoch(),
+            ):
                 response = await call_next(request)
         except ProfileDeletedError:
             return JSONResponse(
@@ -1501,8 +1515,9 @@ async def authenticate_engine_request(request: Request, call_next):
         response.headers["cache-control"] = "no-store"
         return response
 
+    raw_session = request.headers.get("x-bookward-session") or ""
     account = await asyncio.to_thread(
-        identity_store.resolve_session, request.headers.get("x-bookward-session")
+        identity_store.resolve_session, raw_session or None
     )
     if not account:
         return JSONResponse({"detail": "Authentication required"}, status_code=401)
@@ -1535,8 +1550,17 @@ async def authenticate_engine_request(request: Request, call_next):
                     status_code=503,
                     headers={"cache-control": "private, no-store"},
                 )
+    derived_session_id = (
+        f"sess:{hashlib.sha256(raw_session.encode('utf-8')).hexdigest()[:24]}"
+        if raw_session
+        else ""
+    )
     try:
-        with profile_scope(account["profile_id"]), bind_request_restore_epoch():
+        with (
+            profile_scope(account["profile_id"]),
+            session_scope(derived_session_id),
+            bind_request_restore_epoch(),
+        ):
             response = await call_next(request)
     except ProfileDeletedError:
         return JSONResponse(
@@ -2261,9 +2285,20 @@ class SourcePreviewIn(UrlIn):
     filters: SourceFilters = Field(default_factory=SourceFilters)
 
 
+def _normalize_optional_run_id(value: Any) -> Any:
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
 class FeedbackIn(BaseModel):
     action: Literal["save", "reject", "maybe_later", "restore"]
     run_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+    @field_validator("run_id", mode="before")
+    @classmethod
+    def normalize_run_id(cls, value: Any) -> Any:
+        return _normalize_optional_run_id(value)
 
 
 class UndoFeedbackIn(BaseModel):
@@ -2342,6 +2377,11 @@ class TelemetryEventIn(BaseModel):
     source: str = Field(default="ui", min_length=1, max_length=32)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("run_id", mode="before")
+    @classmethod
+    def normalize_run_id(cls, value: Any) -> Any:
+        return _normalize_optional_run_id(value)
+
     @field_validator("event_type")
     @classmethod
     def valid_event_type(cls, value: str) -> str:
@@ -2367,6 +2407,11 @@ class BulkFeedbackIn(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=100)
     action: Literal["save", "reject", "restore"]
     run_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+    @field_validator("run_id", mode="before")
+    @classmethod
+    def normalize_run_id(cls, value: Any) -> Any:
+        return _normalize_optional_run_id(value)
 
 
 class BulkUndoItemIn(BaseModel):
@@ -2519,6 +2564,133 @@ def _format_recommendation_item(
     return formatted
 
 
+def _slice_discovery_pool(
+    *,
+    recommended: list[dict[str, Any]],
+    non_recommended: list[dict[str, Any]],
+    status: str | None,
+    limit: int | None,
+    offset: int,
+    recommended_limit: int | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool, int, int | None]:
+    ranked = recommended if status == "recommended" else recommended + non_recommended
+    if recommended_limit is not None and status is None and offset == 0:
+        cap = max(0, int(recommended_limit))
+        discovery_slice = recommended[:cap]
+        remaining = [
+            item
+            for item in non_recommended
+            if item.get("status") in {"saved", "imported", "new"}
+        ]
+        recommendations = discovery_slice + remaining
+        has_more = len(recommended) > len(discovery_slice)
+        return recommendations, discovery_slice, has_more, 0, cap
+    start = max(0, int(offset))
+    end = None if limit is None else start + max(0, int(limit))
+    recommendations = ranked[start:end]
+    discovery_slice = [
+        item for item in recommendations if item.get("status") == "recommended"
+    ]
+    has_more = end is not None and len(ranked) > end
+    return recommendations, discovery_slice, has_more, start, limit
+
+
+EXPLORATION_SEED_WINDOW_SECONDS = 1800
+
+
+def _extract_run_exploration_seed(raw_metadata: Any) -> str | None:
+    if not raw_metadata or not isinstance(raw_metadata, str):
+        return None
+    try:
+        parsed = json.loads(raw_metadata)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    seed = parsed.get("exploration_seed")
+    if isinstance(seed, str) and seed:
+        try:
+            return _validate_identifier(seed, "exploration seed")
+        except ValueError:
+            return None
+    return None
+
+
+def _resolve_exploration_seed(
+    connection,
+    *,
+    planned_run_id: str,
+    offset: int,
+    ranking_at: datetime,
+    session_id: str = "",
+    seed_run_id: str | None = None,
+    track_impressions: bool = True,
+) -> tuple[str, str]:
+    if seed_run_id:
+        validated_seed = _validate_identifier(
+            seed_run_id, "seed recommendation run"
+        )
+        run_row = (
+            connection.execute(
+                "SELECT session_id, metadata FROM recommendation_runs WHERE id=?",
+                (validated_seed,),
+            ).fetchone()
+            if connection is not None
+            else row(
+                "SELECT session_id, metadata FROM recommendation_runs WHERE id=?",
+                (validated_seed,),
+            )
+        )
+        if run_row is not None and is_discovery_run_metadata(run_row["metadata"]):
+            resolved_session = str(run_row["session_id"] or "") or session_id
+            return (
+                _extract_run_exploration_seed(run_row["metadata"]) or validated_seed,
+                resolved_session,
+            )
+        return validated_seed, session_id
+    if int(offset) <= 0:
+        return planned_run_id, session_id
+    recent_runs = (
+        connection.execute(
+            "SELECT id,session_id,metadata,created_at FROM recommendation_runs "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 20"
+        ).fetchall()
+        if connection is not None
+        else rows(
+            "SELECT id,session_id,metadata,created_at FROM recommendation_runs "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 20"
+        )
+    )
+    for candidate_run in recent_runs:
+        if not is_discovery_run_metadata(candidate_run["metadata"]):
+            continue
+        if session_id and candidate_run["session_id"] != session_id:
+            continue
+        created_time, _ = _read_time(candidate_run["created_at"])
+        if (
+            created_time is not None
+            and abs((ranking_at - created_time).total_seconds())
+            <= EXPLORATION_SEED_WINDOW_SECONDS
+        ):
+            resolved_session = session_id or str(candidate_run["session_id"] or "")
+            return (
+                _extract_run_exploration_seed(candidate_run["metadata"])
+                or str(candidate_run["id"]),
+                resolved_session,
+            )
+    if track_impressions:
+        return planned_run_id, session_id
+    bucket = int(ranking_at.timestamp()) // EXPLORATION_SEED_WINDOW_SECONDS
+    return f"window:{bucket:010d}", session_id
+
+
+def _exploration_rng(scope: str, exploration_seed: str) -> random.Random:
+    digest = hashlib.sha256(
+        f"bookward-tail-explore:v1:{scope}:{exploration_seed}".encode("utf-8")
+    ).digest()
+    return random.Random(int.from_bytes(digest, "big"))
+
+
 def _load_llm_rerank_inputs(connection, interaction_events: list[dict[str, Any]]):
     fetch = (
         (lambda sql, values=(): [dict(item) for item in connection.execute(sql, values).fetchall()])
@@ -2580,7 +2752,7 @@ def _load_llm_rerank_inputs(connection, interaction_events: list[dict[str, Any]]
 def _prepare_tracked_recommendations(
     *,
     status: str | None = None,
-    limit: int = 100,
+    limit: int | None = 100,
     offset: int = 0,
     search: str | None = None,
     genre: str | None = None,
@@ -2590,12 +2762,27 @@ def _prepare_tracked_recommendations(
     include_imported: bool = False,
     private: dict | None = None,
     pool_summary: dict[str, Any] | None = None,
+    track_impressions: bool = True,
+    session_id: str = "",
+    seed_run_id: str | None = None,
 ) -> dict[str, Any]:
+    if isinstance(status, str):
+        status = status.strip()
+    effective_session_id = session_id or (current_session_id() or "")
+    if effective_session_id:
+        _validate_identifier(effective_session_id, "session identifier")
+    profile_id = current_profile_id() or "legacy"
     ranking_at = datetime.now(timezone.utc)
     is_filtered = bool((search and search.strip()) or (genre and genre.strip()))
     base_pool = personalized_pool = None
     ranked = None
     recommendations = None
+    fallback_pool = None
+    has_more = False
+    planned_run_id = ""
+    exploration_seed = ""
+    run_session_id = ""
+    exploration_scope = ""
     interaction_events: list[dict[str, Any]] = []
     cached_vectors: dict[int, Any] = {}
     visible_day_counts: dict[int, int] = {}
@@ -2625,6 +2812,18 @@ def _prepare_tracked_recommendations(
     can_personalize = status in (None, "", "all", "recommended")
     fallback_triggered = False
     if can_personalize:
+        planned_run_id = str(uuid.uuid4())
+        exploration_seed, seed_session_id = _resolve_exploration_seed(
+            connection,
+            planned_run_id=planned_run_id,
+            offset=offset,
+            ranking_at=ranking_at,
+            session_id=effective_session_id,
+            seed_run_id=seed_run_id,
+            track_impressions=track_impressions,
+        )
+        run_session_id = effective_session_id or seed_session_id
+        exploration_scope = f"{profile_id}:{seed_session_id}"
         try:
             # Score the full eligible recommendation pool before pagination so
             # a learned preference can promote a strong match from below the
@@ -2700,6 +2899,8 @@ def _prepare_tracked_recommendations(
                     )
                     llm_active = False
         except Exception:
+            # Personalization must never take the recommendation service down.
+            # On malformed legacy evidence, return the existing champion order.
             LOGGER.exception(
                 "Interaction personalization failed; serving the base ranking"
             )
@@ -2709,52 +2910,36 @@ def _prepare_tracked_recommendations(
             visible_day_counts = {}
             llm_cfg = {}
             llm_active = False
-            if pool_summary is not None:
-                fallback_recommended = _recommendation_rows(
-                    connection,
-                    statuses=("recommended",),
-                    limit=None,
-                    identity_context=identity_context,
-                )
-                pool_summary["recommended_total"] = len(fallback_recommended)
-                pool_summary["recommendation_genres"] = _distinct_genres(fallback_recommended)
-            recommendations = recommendation_list(
+            fallback_pool = recommendation_list(
                 connection,
                 status=status,
-                limit=limit,
-                offset=offset,
-                search=search,
-                genre=genre,
-                recommended_limit=recommended_limit,
+                limit=None,
+                offset=0,
                 identity_context=identity_context,
                 include_imported=include_imported,
-            )
-            learning_metadata = {
-                "mode": "base_ranker_fallback",
-                "scope": "installation",
-                "applied": False,
-                "observed_books": 0,
-                "qualified_features": 0,
-                "semantic_evidence_books": 0,
-                "semantic_adjusted_candidates": 0,
-                "adjusted_candidates": 0,
-                "max_score_adjustment": 0.0,
-            }
-            discovery_metadata = empty_discovery_slate_diagnostics(
-                "base_ranker_fallback"
+                format_urls=False,
             )
     else:
-        recommendations = recommendation_list(
+        fetch_limit = None if limit is None else max(0, int(limit)) + 1
+        batch = recommendation_list(
             connection,
             status=status,
-            limit=limit,
+            limit=fetch_limit,
             offset=offset,
             search=search,
             genre=genre,
             recommended_limit=recommended_limit,
             identity_context=identity_context,
             include_imported=include_imported,
+            format_urls=False,
         )
+        if limit is None:
+            recommendations = _format_recommendation_urls(batch)
+            has_more = False
+        else:
+            cap = max(0, int(limit))
+            recommendations = _format_recommendation_urls(batch[:cap])
+            has_more = len(batch) > cap
 
     return {
         "status": status,
@@ -2767,9 +2952,16 @@ def _prepare_tracked_recommendations(
         "recommended_limit": recommended_limit,
         "identity_context": identity_context,
         "include_imported": include_imported,
+        "track_impressions": track_impressions,
+        "planned_run_id": planned_run_id,
+        "exploration_seed": exploration_seed,
+        "run_session_id": run_session_id,
+        "exploration_scope": exploration_scope,
         "ranking_at": ranking_at,
         "can_personalize": can_personalize,
         "fallback_triggered": fallback_triggered,
+        "fallback_pool": fallback_pool,
+        "has_more": has_more,
         "base_pool": base_pool,
         "personalized_pool": personalized_pool,
         "ranked": ranked,
@@ -2784,7 +2976,7 @@ def _prepare_tracked_recommendations(
         "llm_cfg": llm_cfg,
         "read_rows": read_rows,
         "llm_events": llm_events,
-        "profile_id": current_profile_id() or "legacy",
+        "profile_id": profile_id,
     }
 
 
@@ -2792,7 +2984,13 @@ def _complete_tracked_recommendations(
     prepared: dict[str, Any],
     *,
     connection=None,
+    _return_has_more: bool = False,
 ):
+    def _result(items: list[dict[str, Any]], active_run_id: str, more: bool):
+        if _return_has_more:
+            return items, active_run_id, more
+        return items, active_run_id
+
     status = prepared["status"]
     limit = prepared["limit"]
     offset = prepared["offset"]
@@ -2801,6 +2999,11 @@ def _complete_tracked_recommendations(
     is_filtered = prepared["is_filtered"]
     pool_summary = prepared["pool_summary"]
     recommended_limit = prepared["recommended_limit"]
+    track_impressions = prepared["track_impressions"]
+    planned_run_id = prepared["planned_run_id"]
+    exploration_seed = prepared["exploration_seed"]
+    run_session_id = prepared["run_session_id"]
+    exploration_scope = prepared["exploration_scope"]
     ranking_at = prepared["ranking_at"]
     can_personalize = prepared["can_personalize"]
     base_pool = prepared["base_pool"]
@@ -2817,10 +3020,85 @@ def _complete_tracked_recommendations(
     llm_rerank_output: dict[str, Any] | None = None
     final_pool = None
 
-    if can_personalize and not prepared["fallback_triggered"] and ranked is not None:
+    if not can_personalize:
+        # Non-ranking requests (shortlist, history, decisions) never create a
+        # recommendation run or explore the tail.
+        return _result(recommendations, "", prepared["has_more"])
+
+    def _assemble_fallback_slate(raw_pool: list[dict[str, Any]]):
+        fallback_recommended = [
+            item for item in raw_pool if item.get("status") == "recommended"
+        ]
+        fallback_other = [
+            item for item in raw_pool if item.get("status") != "recommended"
+        ]
+        if settings.exploration_enabled and fallback_recommended:
+            fallback_recommended = epsilon_tail_explore(
+                fallback_recommended,
+                epsilon=settings.exploration_epsilon,
+                stable_top_k=settings.exploration_stable_top_k,
+                rng=_exploration_rng(exploration_scope, exploration_seed),
+            )
+        if pool_summary is not None:
+            pool_summary["recommended_total"] = len(fallback_recommended)
+            pool_summary["recommendation_genres"] = _distinct_genres(fallback_recommended)
+        if is_filtered:
+            fallback_recommended = [
+                item
+                for item in fallback_recommended
+                if _matches_recommendation_filter(item, search=search, genre=genre)
+            ]
+            fallback_other = [
+                item
+                for item in fallback_other
+                if _matches_recommendation_filter(item, search=search, genre=genre)
+            ]
+        (
+            fb_recommendations,
+            fb_discovery_slice,
+            fb_has_more,
+            fb_exposure_offset,
+            fb_run_limit,
+        ) = _slice_discovery_pool(
+            recommended=fallback_recommended,
+            non_recommended=fallback_other,
+            status=status,
+            limit=limit,
+            offset=offset,
+            recommended_limit=recommended_limit,
+        )
+        _format_recommendation_urls(fb_recommendations)
+        fb_learning_metadata = {
+            "mode": "base_ranker_fallback",
+            "scope": "installation",
+            "applied": False,
+            "observed_books": 0,
+            "qualified_features": 0,
+            "semantic_evidence_books": 0,
+            "semantic_adjusted_candidates": 0,
+            "adjusted_candidates": 0,
+            "max_score_adjustment": 0.0,
+        }
+        fb_discovery_metadata = empty_discovery_slate_diagnostics(
+            "base_ranker_fallback"
+        )
+        return (
+            fb_recommendations,
+            fb_discovery_slice,
+            fb_has_more,
+            fb_exposure_offset,
+            fb_run_limit,
+            fb_learning_metadata,
+            fb_discovery_metadata,
+        )
+
+    if not prepared["fallback_triggered"] and ranked is not None:
         try:
             recommended = [
                 item for item in ranked if item.get("status") == "recommended"
+            ]
+            non_recommended = [
+                item for item in ranked if item.get("status") != "recommended"
             ]
             if recommended:
                 if not is_filtered and prepared["llm_active"]:
@@ -2858,43 +3136,56 @@ def _complete_tracked_recommendations(
                 diversified, discovery_metadata = diversify_discovery_slate(
                     recommended, cached_vectors
                 )
-                ranked = diversified + [
-                    item for item in ranked if item.get("status") != "recommended"
-                ]
+                # Sample the full discovery pool before pagination so shortlist/imported
+                # candidates never inflate tail_size and paginated discovery slices
+                # retain true full-pool marginal propensities.
+                if settings.exploration_enabled:
+                    diversified = epsilon_tail_explore(
+                        diversified,
+                        epsilon=settings.exploration_epsilon,
+                        stable_top_k=settings.exploration_stable_top_k,
+                        rng=_exploration_rng(exploration_scope, exploration_seed),
+                    )
+                recommended = diversified
             else:
                 discovery_metadata = empty_discovery_slate_diagnostics(
                     "no_recommended_candidates"
                 )
             if pool_summary is not None:
-                all_recommended = [
-                    item for item in ranked if item.get("status") == "recommended"
-                ]
-                pool_summary["recommended_total"] = len(all_recommended)
-                pool_summary["recommendation_genres"] = _distinct_genres(all_recommended)
+                pool_summary["recommended_total"] = len(recommended)
+                pool_summary["recommendation_genres"] = _distinct_genres(recommended)
             if not is_filtered:
-                final_pool = [dict(item) for item in ranked]
+                ranked_pool = (
+                    recommended
+                    if status == "recommended"
+                    else recommended + non_recommended
+                )
+                final_pool = [dict(item) for item in ranked_pool]
             else:
-                ranked = [
+                recommended = [
                     item
-                    for item in ranked
+                    for item in recommended
                     if _matches_recommendation_filter(item, search=search, genre=genre)
                 ]
-            if recommended_limit is not None and status is None and offset == 0:
-                recommended_out = [
-                    item for item in ranked if item.get("status") == "recommended"
-                ]
-                remaining = [
+                non_recommended = [
                     item
-                    for item in ranked
-                    if item.get("status") in {"saved", "imported", "new"}
+                    for item in non_recommended
+                    if _matches_recommendation_filter(item, search=search, genre=genre)
                 ]
-                recommendations = (
-                    recommended_out[: max(0, int(recommended_limit))] + remaining
-                )
-            else:
-                start = max(0, int(offset))
-                end = None if limit is None else start + max(0, int(limit))
-                recommendations = ranked[start:end]
+            (
+                recommendations,
+                discovery_slice,
+                has_more,
+                exposure_offset,
+                run_limit,
+            ) = _slice_discovery_pool(
+                recommended=recommended,
+                non_recommended=non_recommended,
+                status=status,
+                limit=limit,
+                offset=offset,
+                recommended_limit=recommended_limit,
+            )
             _format_recommendation_urls(recommendations)
         except Exception:
             LOGGER.exception(
@@ -2902,54 +3193,38 @@ def _complete_tracked_recommendations(
             )
             base_pool = personalized_pool = final_pool = None
             llm_rerank_output = None
-            if pool_summary is not None:
-                fallback_recommended = _recommendation_rows(
-                    connection,
-                    statuses=("recommended",),
-                    limit=None,
-                    identity_context=prepared["identity_context"],
-                )
-                pool_summary["recommended_total"] = len(fallback_recommended)
-                pool_summary["recommendation_genres"] = _distinct_genres(fallback_recommended)
-            recommendations = recommendation_list(
+            post_fallback_pool = recommendation_list(
                 connection,
                 status=status,
-                limit=limit,
-                offset=offset,
-                search=search,
-                genre=genre,
-                recommended_limit=recommended_limit,
+                limit=None,
+                offset=0,
                 identity_context=prepared["identity_context"],
                 include_imported=prepared["include_imported"],
+                format_urls=False,
             )
-            learning_metadata = {
-                "mode": "base_ranker_fallback",
-                "scope": "installation",
-                "applied": False,
-                "observed_books": 0,
-                "qualified_features": 0,
-                "semantic_evidence_books": 0,
-                "semantic_adjusted_candidates": 0,
-                "adjusted_candidates": 0,
-                "max_score_adjustment": 0.0,
-            }
-            discovery_metadata = empty_discovery_slate_diagnostics(
-                "base_ranker_fallback"
-            )
-
-    if not can_personalize:
-        # Non-ranking requests (shortlist, history, decisions) never create a
-        # recommendation run or explore the tail.
-        return recommendations, ""
-    # Keep exploration outside the scorer and behind an environment flag.  A
-    # disabled deployment receives the same deterministic order and scores as
-    # before, while enabled traffic records exact tail propensities.
-    if settings.exploration_enabled:
-        recommendations = epsilon_tail_explore(
+            (
+                recommendations,
+                discovery_slice,
+                has_more,
+                exposure_offset,
+                run_limit,
+                learning_metadata,
+                discovery_metadata,
+            ) = _assemble_fallback_slate(post_fallback_pool)
+    else:
+        (
             recommendations,
-            epsilon=settings.exploration_epsilon,
-            stable_top_k=settings.exploration_stable_top_k,
-        )
+            discovery_slice,
+            has_more,
+            exposure_offset,
+            run_limit,
+            learning_metadata,
+            discovery_metadata,
+        ) = _assemble_fallback_slate(prepared["fallback_pool"] or [])
+
+    if not discovery_slice or not track_impressions:
+        return _result(recommendations, "", has_more)
+
     if is_filtered:
         decision_evidence = {
             "schema_version": EVIDENCE_SCHEMA_VERSION,
@@ -2976,6 +3251,7 @@ def _complete_tracked_recommendations(
                 "exploration_enabled": settings.exploration_enabled,
                 "exploration_epsilon": settings.exploration_epsilon,
                 "exploration_stable_top_k": settings.exploration_stable_top_k,
+                "exploration_seed": exploration_seed,
             },
             visible_day_counts=visible_day_counts,
             impression_fatigue_settings=fatigue_settings,
@@ -2990,14 +3266,18 @@ def _complete_tracked_recommendations(
             "captured_at": ranking_at.isoformat(),
         }
     run_id = create_recommendation_run(
-        recommendations,
+        discovery_slice,
+        run_id=planned_run_id,
+        session_id=run_session_id,
+        exploration_seed=exploration_seed,
         decision_evidence=decision_evidence,
         status=status,
-        limit=limit,
+        limit=run_limit,
+        offset=exposure_offset,
         ranking_metadata=learning_metadata,
         discovery_slate_metadata=discovery_metadata,
     )
-    return recommendations, run_id
+    return _result(recommendations, run_id, has_more)
 
 
 READS_RECENT_ORDER_SQL = (
@@ -3030,10 +3310,10 @@ def _normalize_read_at_input(raw_value: str | None) -> str | None:
     return parsed_day.isoformat()
 
 
-def tracked_recommendations(
+def tracked_recommendations_page(
     *,
     status: str | None = None,
-    limit: int = 100,
+    limit: int | None = 100,
     offset: int = 0,
     search: str | None = None,
     genre: str | None = None,
@@ -3043,6 +3323,47 @@ def tracked_recommendations(
     include_imported: bool = False,
     private: dict | None = None,
     pool_summary: dict[str, Any] | None = None,
+    track_impressions: bool = True,
+    session_id: str = "",
+    seed_run_id: str | None = None,
+) -> tuple[list[dict[str, Any]], str, bool]:
+    recommendations, run_id, has_more = tracked_recommendations(
+        status=status,
+        limit=limit,
+        offset=offset,
+        search=search,
+        genre=genre,
+        connection=connection,
+        recommended_limit=recommended_limit,
+        identity_context=identity_context,
+        include_imported=include_imported,
+        private=private,
+        pool_summary=pool_summary,
+        track_impressions=track_impressions,
+        session_id=session_id,
+        seed_run_id=seed_run_id,
+        _return_has_more=True,
+    )
+    return recommendations, run_id, has_more
+
+
+def tracked_recommendations(
+    *,
+    status: str | None = None,
+    limit: int | None = 100,
+    offset: int = 0,
+    search: str | None = None,
+    genre: str | None = None,
+    connection=None,
+    recommended_limit: int | None = None,
+    identity_context=None,
+    include_imported: bool = False,
+    private: dict | None = None,
+    pool_summary: dict[str, Any] | None = None,
+    track_impressions: bool = True,
+    session_id: str = "",
+    seed_run_id: str | None = None,
+    _return_has_more: bool = False,
 ):
     if connection is not None:
         prepared = _prepare_tracked_recommendations(
@@ -3057,8 +3378,13 @@ def tracked_recommendations(
             include_imported=include_imported,
             private=private,
             pool_summary=pool_summary,
+            track_impressions=track_impressions,
+            session_id=session_id,
+            seed_run_id=seed_run_id,
         )
-        return _complete_tracked_recommendations(prepared, connection=connection)
+        return _complete_tracked_recommendations(
+            prepared, connection=connection, _return_has_more=_return_has_more
+        )
 
     with connect() as read_con:
         prepared = _prepare_tracked_recommendations(
@@ -3073,11 +3399,18 @@ def tracked_recommendations(
             include_imported=include_imported,
             private=private,
             pool_summary=pool_summary,
+            track_impressions=track_impressions,
+            session_id=session_id,
+            seed_run_id=seed_run_id,
         )
         if not prepared["llm_active"]:
-            return _complete_tracked_recommendations(prepared, connection=read_con)
+            return _complete_tracked_recommendations(
+                prepared, connection=read_con, _return_has_more=_return_has_more
+            )
     # Release _LockedConnection before executing outbound LLM network I/O.
-    return _complete_tracked_recommendations(prepared, connection=None)
+    return _complete_tracked_recommendations(
+        prepared, connection=None, _return_has_more=_return_has_more
+    )
 
 
 def overview_payload(
@@ -3085,10 +3418,12 @@ def overview_payload(
     include_api_tokens: bool = True,
     recommendation_limit: int | None = None,
     decision_limit: int = 24,
+    track_impressions: bool = True,
 ):
     deferred_prepared = None
     recommendations = None
     run_id = None
+    recommendations_has_more = False
     pool_summary: dict[str, Any] = {}
     with connect() as connection:
         counts = {
@@ -3105,12 +3440,15 @@ def overview_payload(
             include_imported=True,
             private=private,
             pool_summary=pool_summary,
+            track_impressions=track_impressions,
         )
         if prepared["llm_active"]:
             deferred_prepared = prepared
         else:
-            recommendations, run_id = _complete_tracked_recommendations(
-                prepared, connection=connection
+            recommendations, run_id, recommendations_has_more = (
+                _complete_tracked_recommendations(
+                    prepared, connection=connection, _return_has_more=True
+                )
             )
         all_decision_rows = _recommendation_rows(
             connection,
@@ -3143,16 +3481,9 @@ def overview_payload(
         )
 
     if deferred_prepared is not None:
-        recommendations, run_id = _complete_tracked_recommendations(
-            deferred_prepared, connection=None
+        recommendations, run_id, recommendations_has_more = _complete_tracked_recommendations(
+            deferred_prepared, connection=None, _return_has_more=True
         )
-    served_recommended = sum(
-        1 for item in recommendations if item.get("status") == "recommended"
-    )
-    recommendations_has_more = (
-        int(pool_summary.get("recommended_total", served_recommended))
-        > served_recommended
-    )
     recommendation_genres = list(pool_summary.get("recommendation_genres") or [])
     return {
         "counts": counts,
@@ -3178,10 +3509,12 @@ async def health():
 def overview(
     recommendation_limit: int | None = Query(default=None, ge=1, le=100),
     decision_limit: int = Query(default=24, ge=1, le=24),
+    track_impressions: bool = Query(default=True),
 ):
     return overview_payload(
         recommendation_limit=recommendation_limit,
         decision_limit=decision_limit,
+        track_impressions=track_impressions,
     )
 
 
@@ -3763,17 +4096,29 @@ def recommendations(
     offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
     search: Annotated[str | None, Query(max_length=200)] = None,
     genre: Annotated[str | None, Query(max_length=100)] = None,
+    seed_run_id: Annotated[
+        str | None,
+        Query(
+            min_length=8,
+            max_length=128,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+        ),
+    ] = None,
 ):
-    values, run_id = tracked_recommendations(
+    values, run_id, has_more = tracked_recommendations_page(
         status=status,
         limit=limit,
         offset=offset,
         search=search,
         genre=genre,
         include_imported=status in {"saved", "imported", "all"},
+        seed_run_id=seed_run_id,
     )
     for item in values:
-        item["recommendation_run_id"] = run_id
+        item["recommendation_run_id"] = (
+            run_id if run_id and item.get("status") == "recommended" else ""
+        )
+    response.headers["X-Bookward-Has-More"] = "true" if has_more else "false"
     if run_id:
         response.headers["X-Bookward-Recommendation-Run"] = run_id
     return values
@@ -3897,15 +4242,20 @@ def _mark_candidate_read_in_connection(
     impression = None
     if not historical and read_time is not None:
         prior_impressions = con.execute(
-            "SELECT id,run_id,rank,score,propensity,presented_at,visible_at "
-            "FROM recommendation_impressions WHERE candidate_id=? "
-            "ORDER BY COALESCE(visible_at,presented_at) DESC,id DESC",
+            "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at,"
+            "r.metadata AS run_metadata "
+            "FROM recommendation_impressions i "
+            "JOIN recommendation_runs r ON r.id=i.run_id "
+            "WHERE i.candidate_id=? "
+            "ORDER BY COALESCE(i.visible_at,i.presented_at) DESC,i.id DESC",
             (candidate["id"],),
         ).fetchall()
         impression = next(
             (
-                item for item in prior_impressions
-                if _impression_precedes(item, read_time, day_precision)
+                item
+                for item in prior_impressions
+                if is_discovery_run_metadata(item["run_metadata"])
+                and _impression_precedes(item, read_time, day_precision)
             ),
             None,
         )
@@ -4346,6 +4696,11 @@ def post_telemetry_events(payload: TelemetryBatchIn):
 class LibrarrImportIn(BaseModel):
     run_id: str | None = Field(default=None, min_length=8, max_length=128)
 
+    @field_validator("run_id", mode="before")
+    @classmethod
+    def normalize_run_id(cls, value: Any) -> Any:
+        return _normalize_optional_run_id(value)
+
 
 def _record_librarr_import_in_connection(con, candidate_id: int, *, run_id: str | None = None):
     next_seq = int(
@@ -4508,6 +4863,11 @@ class LibrarrDownloadIn(BaseModel):
     result: dict[str, Any]
     candidate_id: int | None = Field(default=None, gt=0)
     run_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+    @field_validator("run_id", mode="before")
+    @classmethod
+    def normalize_run_id(cls, value: Any) -> Any:
+        return _normalize_optional_run_id(value)
 
 
 @app.post("/api/librarr/download")
@@ -5827,6 +6187,11 @@ def delete_api_token(token_id: int):
 def revoke_api_token(token_id: int):
     return _revoke_api_token(token_id)
 
+@app.get("/api/settings")
+def get_settings():
+    return safe_settings(include_api_tokens=False)
+
+
 @app.put("/api/settings")
 @fenced_async
 async def update_settings(payload: EngineSettings):
@@ -6016,8 +6381,24 @@ def api_recommendations(
     offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
     search: Annotated[str | None, Query(max_length=200)] = None,
     genre: Annotated[str | None, Query(max_length=100)] = None,
+    seed_run_id: Annotated[
+        str | None,
+        Query(
+            min_length=8,
+            max_length=128,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+        ),
+    ] = None,
 ):
-    return recommendations(response, status, limit, offset, search=search, genre=genre)
+    return recommendations(
+        response,
+        status,
+        limit,
+        offset,
+        search=search,
+        genre=genre,
+        seed_run_id=seed_run_id,
+    )
 
 
 @api_v1.post("/recommendations/bulk-feedback")

@@ -8,6 +8,7 @@ import {
   isPayloadTooLarge,
 } from "#lib/server/engine.js";
 import { toPageBook } from "#lib/server/recommendations.js";
+import { hasCachedFormData, requestFormData } from "#lib/server/request-context.js";
 import { z } from "zod";
 
 type SourceFilters = {
@@ -72,6 +73,7 @@ type CatalogQuality = {
 type Overview = {
   counts?: { reads?: number };
   recommendation_run_id?: string;
+  recommendations_has_more?: boolean;
   recommendations: Array<{
     id: number;
     title: string;
@@ -91,7 +93,6 @@ type Overview = {
     source_enabled?: boolean;
     quality_status?: string | null;
   }>;
-  recommendations_has_more?: boolean;
   recommendation_genres?: string[];
   decisions?: Overview["recommendations"];
   decisions_has_more?: boolean;
@@ -183,6 +184,51 @@ type DigestSettings = {
   } | null;
 };
 
+const NON_DISCOVER_VIEWS = new Set(["saved", "decisions", "sources", "settings"]);
+
+async function shouldTrackDiscoverImpressions(
+  url: URL,
+  request: Request | undefined,
+): Promise<boolean> {
+  let explicitView = url.searchParams.get("view")?.trim() || null;
+  if (!explicitView && request?.method === "POST") {
+    const contentType = request.headers?.get("content-type") || "";
+    const isFormBody =
+      contentType.includes("multipart/form-data") ||
+      contentType.includes("application/x-www-form-urlencoded");
+    if (isFormBody && (!request.bodyUsed || hasCachedFormData(request))) {
+      try {
+        const form = await requestFormData(request);
+        const submittedView = form.get("view");
+        if (typeof submittedView === "string" && submittedView.trim()) {
+          explicitView = submittedView.trim();
+        }
+      } catch {
+        explicitView = null;
+      }
+    }
+  }
+  const isInvalidatedDataRequest = (() => {
+    if (url.searchParams.has("x-sveltekit-invalidated")) return true;
+    if (request?.headers?.get("x-sveltekit-invalidated")?.trim()) return true;
+    if (!request?.url) return false;
+    try {
+      return new URL(request.url).searchParams.has("x-sveltekit-invalidated");
+    } catch {
+      return false;
+    }
+  })();
+  const isMutationOrRevalidation =
+    Boolean(request?.method && !["GET", "HEAD"].includes(request.method)) ||
+    isInvalidatedDataRequest;
+  if (explicitView) {
+    if (explicitView === "discover") return true;
+    if (NON_DISCOVER_VIEWS.has(explicitView)) return false;
+    return !isMutationOrRevalidation;
+  }
+  return !isMutationOrRevalidation;
+}
+
 const distinctGenres = (items: Array<{ genres: string[] }>) => {
   const seen = new Map<string, string>();
   for (const item of items) {
@@ -196,7 +242,7 @@ const distinctGenres = (items: Array<{ genres: string[] }>) => {
   return [...seen.values()].sort((left, right) => left.localeCompare(right));
 };
 
-export const load: PageServerLoad = async ({ url, locals }) => {
+export const load: PageServerLoad = async ({ url, request, locals }) => {
   if (locals?.engineUnavailable) {
     throw httpError(503, "Bookward's recommendation engine is unavailable.");
   }
@@ -225,9 +271,11 @@ export const load: PageServerLoad = async ({ url, locals }) => {
     evidence_complete_runs: 0,
     evidence_incomplete_runs: 0,
   };
-  const overviewRequest = engine<Overview>(
-    "/api/overview?recommendation_limit=24&decision_limit=24",
-  );
+  const isDiscoverView = await shouldTrackDiscoverImpressions(url, request);
+  const overviewPath = isDiscoverView
+    ? "/api/overview?recommendation_limit=24&decision_limit=24"
+    : "/api/overview?recommendation_limit=24&decision_limit=24&track_impressions=false";
+  const overviewRequest = engine<Overview>(overviewPath);
   const backupStatusRequest = engine<BackupStatus>("/api/backups")
     .then((status) => ({ ...fallbackBackupStatus, ...status }))
     .catch(() => fallbackBackupStatus);
@@ -260,7 +308,7 @@ export const load: PageServerLoad = async ({ url, locals }) => {
   const books = overview.recommendations.map((book) =>
     toPageBook({
       ...book,
-      recommendation_run_id: runId,
+      recommendation_run_id: book.status === "recommended" ? runId : "",
     }),
   );
   const overviewBooksById = new Map(books.map((book) => [book.id, book]));
@@ -896,7 +944,7 @@ export const actions: Actions = {
     try {
       if (!targetUrl) {
         const overview = await engine<Overview>(
-          "/api/overview?recommendation_limit=1&decision_limit=1",
+          "/api/overview?recommendation_limit=1&decision_limit=1&track_impressions=false",
         );
         const existing = overview.sources.find((item) => item.id === id.data);
         if (!existing) return fail(404, { message: "Source not found." });

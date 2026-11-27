@@ -65,4 +65,49 @@ describe("recommendation telemetry client", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     client.destroy();
   });
+
+  it("emits visible events only when discovery tracking is enabled", async () => {
+    const { observeRecommendationVisibility } = await import("./telemetry");
+    const observed: HTMLElement[] = [];
+    let callback: IntersectionObserverCallback | undefined;
+    const disconnectMock = vi.fn();
+    class FakeObserver {
+      constructor(cb: IntersectionObserverCallback) {
+        callback = cb;
+      }
+      observe(target: Element) {
+        observed.push(target as HTMLElement);
+      }
+      disconnect() {
+        disconnectMock();
+      }
+    }
+    vi.stubGlobal("IntersectionObserver", FakeObserver);
+    try {
+      const visibleIds: number[] = [];
+      const shortlistNode = {} as HTMLElement;
+      const shortlistAction = observeRecommendationVisibility(shortlistNode, {
+        candidateId: 42,
+        enabled: false,
+        onVisible: (id) => visibleIds.push(id),
+      });
+      expect(observed).toHaveLength(0);
+      expect(visibleIds).toEqual([]);
+
+      // Switching the same card to discover enables observation and fires once on intersect.
+      shortlistAction.update({
+        candidateId: 42,
+        enabled: true,
+        onVisible: (id) => visibleIds.push(id),
+      });
+      expect(observed).toEqual([shortlistNode]);
+      callback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      callback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+      expect(visibleIds).toEqual([42]);
+      expect(disconnectMock).toHaveBeenCalledTimes(1);
+      shortlistAction.destroy();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

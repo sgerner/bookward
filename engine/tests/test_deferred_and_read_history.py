@@ -772,3 +772,86 @@ def test_reconciling_read_in_multi_book_slate_preserves_other_slate_events_outco
     assert [item["version"] for item in rows("SELECT version FROM schema_migrations ORDER BY version")] == [
         item[0] for item in MIGRATIONS
     ]
+
+
+def test_reconcile_read_outcomes_ignores_legacy_non_discovery_runs_on_date_and_rating_edits(database):
+    headers = authenticated_headers()
+    with transaction() as con:
+        cid = _insert_accepted_candidate(con, title="Legacy Shortlist Exposure", author="Merge Author")
+        non_discovery_run_id = str(uuid.uuid4())
+        con.execute(
+            "INSERT INTO recommendation_runs"
+            "(id,policy,policy_version,session_id,candidate_count,metadata,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                non_discovery_run_id,
+                "deterministic",
+                "v1",
+                "",
+                1,
+                json.dumps({"status": "saved", "limit": 24}),
+                "2025-04-01T10:00:00Z",
+            ),
+        )
+        con.execute(
+            "INSERT INTO recommendation_impressions"
+            "(run_id,candidate_id,rank,score,propensity,presented_at,visible_at) "
+            "VALUES(?,?,1,81.0,1.0,?,?)",
+            (
+                non_discovery_run_id,
+                cid,
+                "2025-04-01T10:00:00Z",
+                "2025-04-01T10:00:00Z",
+            ),
+        )
+
+    client = TestClient(app, headers=headers)
+    marked = client.post(
+        f"/api/recommendations/{cid}/read",
+        json={"rating": 5, "read_at": "2025-04-05"},
+    )
+    assert marked.status_code == 200
+    read_id = marked.json()["read_id"]
+    assert (
+        row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (read_id,))["count"]
+        == 0
+    )
+
+    # Rating-only edit (sync_read_rating_in_connection) and date edit (reconcile_read_outcomes_in_connection)
+    # must both continue ignoring the legacy non-discovery shortlist run.
+    assert client.put(f"/api/reading-history/{read_id}", json={"rating": 3}).status_code == 200
+    assert client.put(f"/api/reading-history/{read_id}", json={"read_at": "2025-04-10"}).status_code == 200
+    assert (
+        row("SELECT COUNT(*) count FROM recommendation_outcomes WHERE read_id=?", (read_id,))["count"]
+        == 0
+    )
+    assert (
+        row(
+            "SELECT COUNT(*) count FROM recommendation_evidence_events WHERE run_id=?",
+            (non_discovery_run_id,),
+        )["count"]
+        == 0
+    )
+
+    # Once a genuine discovery impression precedes read_at, reconciliation attributes cleanly.
+    with transaction() as con:
+        discovery_run_id = _insert_run_and_impression(
+            con, cid, visible_at="2025-04-08T09:00:00Z", score=86.0
+        )
+    updated = client.put(
+        f"/api/reading-history/{read_id}",
+        json={"read_at": "2025-04-12", "rating": 5},
+    )
+    assert updated.status_code == 200
+    attributed = row(
+        "SELECT ro.label,ro.label_kind,ri.run_id "
+        "FROM recommendation_outcomes ro "
+        "JOIN recommendation_impressions ri ON ri.id=ro.impression_id "
+        "WHERE ro.read_id=?",
+        (read_id,),
+    )
+    assert attributed is not None
+    assert attributed["run_id"] == discovery_run_id
+    assert attributed["label"] == 1.0
+    assert attributed["label_kind"] == "rating_positive"
+

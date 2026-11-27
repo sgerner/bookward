@@ -324,6 +324,145 @@ def test_load_rows_preserves_earlier_intent_alongside_rated_outcome():
     assert diagnostics["rating_negative"]["labeled_impressions"] == 1
 
 
+def test_load_rows_filters_non_discovery_runs_and_keeps_unlabeled_impressions_censored():
+    dataset = {
+        "recommendation_runs": [
+            {
+                "id": "run-discover",
+                "created_at": "2026-02-01T00:00:00Z",
+                "metadata": json.dumps({"status": "recommended", "offset": 0}),
+            },
+            {
+                "id": "run-legacy-all",
+                "created_at": "2026-02-02T00:00:00Z",
+                "metadata": json.dumps({"status": "all"}),
+            },
+            {
+                "id": "run-saved",
+                "created_at": "2026-02-03T00:00:00Z",
+                "metadata": json.dumps({"status": "saved"}),
+            },
+            {
+                "id": "run-decisions",
+                "created_at": "2026-02-04T00:00:00Z",
+                "metadata": json.dumps({"status": "decisions"}),
+            },
+            {
+                "id": "run-rejected",
+                "created_at": "2026-02-05T00:00:00Z",
+                "metadata": json.dumps({"status": "rejected"}),
+            },
+            {
+                "id": "run-maybe-later",
+                "created_at": "2026-02-06T00:00:00Z",
+                "metadata": json.dumps({"status": "maybe_later"}),
+            },
+        ],
+        "recommendation_impressions": [
+            {"id": 1, "run_id": "run-discover", "candidate_id": 10, "rank": 1, "score": 95},
+            {"id": 2, "run_id": "run-discover", "candidate_id": 11, "rank": 2, "score": 90},
+            {"id": 3, "run_id": "run-legacy-all", "candidate_id": 12, "rank": 1, "score": 88},
+            {"id": 4, "run_id": "run-saved", "candidate_id": 10, "rank": 1, "score": 95},
+            {"id": 5, "run_id": "run-decisions", "candidate_id": 13, "rank": 1, "score": 60},
+            {"id": 6, "run_id": "run-rejected", "candidate_id": 14, "rank": 1, "score": 55},
+            {"id": 7, "run_id": "run-maybe-later", "candidate_id": 15, "rank": 1, "score": 65},
+        ],
+        "recommendation_outcomes": [
+            {"impression_id": 1, "label": 1.0, "label_kind": "rating_positive", "confidence": 1.0},
+            {"impression_id": 4, "label": 0.0, "label_kind": "rating_negative", "confidence": 1.0},
+        ],
+    }
+
+    rows = load_rows(dataset)
+    assert [item["impression_id"] for item in rows] == [1, 2, 3]
+    assert {item["run_id"] for item in rows} == {"run-discover", "run-legacy-all"}
+    # Unlabeled discovery impressions must remain censored (label=None), never converted to 0.
+    assert rows[1]["label"] is None
+    assert rows[2]["label"] is None
+
+
+def test_ips_rank_concordance_aligns_with_ndcg_after_diversify_discovery_slate_swap():
+    import numpy as np
+    from afterword_engine.discovery_slate import diversify_discovery_slate
+
+    candidates = [
+        {"id": 1, "title": "Anchor Book", "author": "Author A", "score": 95.0, "status": "recommended"},
+        {"id": 2, "title": "Near Duplicate", "author": "Author B", "score": 93.0, "status": "recommended"},
+        {"id": 3, "title": "Distinct Choice", "author": "Author C", "score": 90.0, "status": "recommended"},
+    ]
+    vectors = {
+        1: np.asarray([1.0, 0.0], dtype=np.float32),
+        # Cosine similarity 0.80 >= NEAR_DUPLICATE_COSINE (0.75) with Anchor Book:
+        2: np.asarray([0.8, 0.6], dtype=np.float32),
+        3: np.asarray([0.0, 1.0], dtype=np.float32),
+    }
+
+    diversified, diagnostics = diversify_discovery_slate(candidates, vectors)
+    assert diagnostics["similarity_swaps"] == 1
+    assert [item["id"] for item in diversified] == [1, 3, 2]
+    # Raw ranker scores remain untouched on cards (90.0 precedes 93.0 at rank 2 vs rank 3).
+    assert [item["score"] for item in diversified] == [95.0, 90.0, 93.0]
+
+    logged_rows = [
+        {
+            "run_id": "run-slate-swap",
+            "created_at": "2026-03-01T00:00:00Z",
+            "impression_id": rank,
+            "candidate_id": item["id"],
+            "rank": rank,
+            "score": item["score"],
+            "propensity": 1.0,
+            # Anchor at rank 1 stays unlabeled (censored); swapped Distinct Choice at
+            # rank 2 earns positive label while displaced Near Duplicate at rank 3 is negative.
+            "label": 1.0 if item["id"] == 3 else 0.0 if item["id"] == 2 else None,
+            "confidence": 1.0 if item["id"] in {2, 3} else None,
+            "label_kind": (
+                "rating_positive"
+                if item["id"] == 3
+                else "rating_negative"
+                if item["id"] == 2
+                else None
+            ),
+        }
+        for rank, item in enumerate(diversified, 1)
+    ]
+
+    pre_swap_rows = [
+        {
+            "run_id": "run-before-swap",
+            "created_at": "2026-03-01T00:00:00Z",
+            "impression_id": rank,
+            "candidate_id": item["id"],
+            "rank": rank,
+            "score": item["score"],
+            "propensity": 1.0,
+            "label": 1.0 if item["id"] == 3 else 0.0 if item["id"] == 2 else None,
+            "confidence": 1.0 if item["id"] in {2, 3} else None,
+            "label_kind": (
+                "rating_positive"
+                if item["id"] == 3
+                else "rating_negative"
+                if item["id"] == 2
+                else None
+            ),
+        }
+        for rank, item in enumerate(candidates, 1)
+    ]
+
+    assert ips_auc(logged_rows) == pytest.approx(0.0)
+    assert evaluation.ips_rank_concordance(pre_swap_rows) == pytest.approx(0.0)
+    assert evaluation.ips_rank_concordance(logged_rows) == pytest.approx(1.0)
+    assert ips_ndcg_at_k(pre_swap_rows, 8) == pytest.approx(1.0 / math.log2(4))
+    assert ips_ndcg_at_k(logged_rows, 8) == pytest.approx(1.0 / math.log2(3))
+    assert ips_ndcg_at_k(logged_rows, 8) > ips_ndcg_at_k(pre_swap_rows, 8)
+
+    report = build_report(logged_rows, bootstrap_iterations=10)
+    assert report["sample"]["rank_concordance"] == pytest.approx(1.0)
+    assert report["sample"]["labeled_impressions"] == 2
+    assert report["splits"]["train"]["champion"]["rank_concordance"] == pytest.approx(1.0)
+    assert "rank_concordance_bootstrap" in report["splits"]["train"]["champion"]
+
+
 def test_load_rows_prioritizes_neutral_ratings_and_completions_over_explicit_feedback():
     corpus = {
         "recommendation_runs": [{"id": "run-1", "created_at": "2026-01-01T00:00:00Z"}],

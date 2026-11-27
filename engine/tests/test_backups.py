@@ -1852,6 +1852,23 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                     "saved",
                 ),
             ).lastrowid
+            alice_discovery_id = con.execute(
+                "INSERT INTO candidates(source_id,title,author,normalized_key,status,score) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    alice_source_id,
+                    "Discovery slate pick",
+                    "Ursula K. Le Guin",
+                    "discovery slate pick::ursula k. le guin",
+                    "recommended",
+                    88.0,
+                ),
+            ).lastrowid
+            con.execute(
+                "UPDATE candidate_quality SET quality_status='accepted',quality_score=0.9,"
+                "metadata_confidence=0.85 WHERE candidate_id=?",
+                (alice_discovery_id,),
+            )
 
     with profile_scope(bob["profile_id"]):
         initialize(seed_demo=False)
@@ -2015,8 +2032,9 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                 assert await asyncio.to_thread(staging_entered.wait, 3)
                 assert database_lock(alice_path).is_locked()
 
-                # Start a live write, pure reads, and overview (which records a
-                # recommendation_runs row via transaction()) on Alice during staging.
+                # Start a live write, pure reads (including untracked overview),
+                # and tracked discovery overview (which records a recommendation_runs
+                # row via transaction()) on Alice during staging.
                 staged_alice_write = asyncio.create_task(
                     client.post(
                         f"/api/recommendations/{alice_candidate_id}/read",
@@ -2029,6 +2047,11 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                 )
                 contended_history = asyncio.create_task(
                     client.get("/api/reading-history", headers=alice_headers)
+                )
+                contended_untracked_overview = asyncio.create_task(
+                    client.get(
+                        "/api/overview?track_impressions=false", headers=alice_headers
+                    )
                 )
                 contended_overview = asyncio.create_task(
                     client.get("/api/overview", headers=alice_headers)
@@ -2052,6 +2075,7 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                 assert not staged_alice_write.done()
                 assert not contended_scores.done()
                 assert not contended_history.done()
+                assert not contended_untracked_overview.done()
                 assert not contended_overview.done()
 
                 pause_staging = False
@@ -2064,6 +2088,7 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                 assert not staged_alice_write.done()
                 assert not contended_scores.done()
                 assert not contended_history.done()
+                assert not contended_untracked_overview.done()
                 assert not contended_overview.done()
 
                 loop = asyncio.get_running_loop()
@@ -2091,17 +2116,23 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
 
                 pause_cutover = False
                 release_cutover.set()
-                restored_res, write_res, scores_res, history_res, overview_res = (
-                    await asyncio.wait_for(
-                        asyncio.gather(
-                            restore_task,
-                            staged_alice_write,
-                            contended_scores,
-                            contended_history,
-                            contended_overview,
-                        ),
-                        timeout=5,
-                    )
+                (
+                    restored_res,
+                    write_res,
+                    scores_res,
+                    history_res,
+                    untracked_overview_res,
+                    overview_res,
+                ) = await asyncio.wait_for(
+                    asyncio.gather(
+                        restore_task,
+                        staged_alice_write,
+                        contended_scores,
+                        contended_history,
+                        contended_untracked_overview,
+                        contended_overview,
+                    ),
+                    timeout=5,
                 )
                 assert restored_res.status_code == 200
                 assert write_res.status_code == 409
@@ -2111,6 +2142,11 @@ def test_backups_and_restores_never_delay_health_or_other_profiles_while_same_pr
                 assert {item["title"] for item in history_res.json()} == {
                     "Alice snapshot book"
                 }
+                assert untracked_overview_res.status_code == 200
+                assert untracked_overview_res.json()["recommendation_run_id"] == ""
+                assert {
+                    item["title"] for item in untracked_overview_res.json()["history"]
+                } == {"Alice snapshot book"}
                 assert overview_res.status_code == 409
                 assert "restored" in overview_res.json()["detail"].lower()
 
