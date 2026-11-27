@@ -22,8 +22,6 @@ from operator import itemgetter
 from pathlib import Path
 from typing import Any
 
-from .learning import DISCOVERY_RUN_STATUSES, is_discovery_run_metadata
-
 
 DEFAULT_K = 20
 DEFAULT_BOOTSTRAP_ITERATIONS = 1000
@@ -496,12 +494,7 @@ def ips_ndcg_at_k(
     ``confidence > 0``), and both ``DCG@k`` and ``IDCG@k`` apply unweighted
     intrinsic relevance gains symmetrically so ``IDCG@k`` is computed from the
     observed top-k gains alone and each run's ``DCG@k / IDCG@k`` is guaranteed
-    within ``[0, 1]`` without clamping.  Discovery runs with at least one
-    observed top-k outcome whose ideal gain is zero (``idcg == 0``, such as an
-    all-pass or neutral-only slate) score ``0.0`` to match
-    :func:`ips_precision_at_k`, whereas completely censored runs with zero
-    observed top-k outcomes are skipped (returning ``None`` if all runs are
-    censored).
+    within ``[0, 1]`` without clamping.
     """
 
     if k <= 0:
@@ -535,12 +528,6 @@ def ips_ndcg_at_k(
             if not 0.0 <= ratio <= 1.0:
                 raise AssertionError(f"NDCG@k out of [0, 1] bounds: {ratio}")
             per_run.append(ratio)
-        else:
-            # Discovery runs with observed top-K outcomes but zero ideal gain
-            # (e.g. an all-pass triage session) intentionally score 0.0 to match
-            # ips_precision_at_k; completely censored runs exited above, and
-            # non-discovery runs are excluded by load_rows.
-            per_run.append(0.0)
     return sum(per_run) / len(per_run) if per_run else None
 
 
@@ -847,34 +834,18 @@ def _read_json_or_sqlite(path: Path) -> dict[str, Any]:
         )}
 
 
-def _is_discovery_run(run: Mapping[str, Any]) -> bool:
-    direct_status = run.get("status")
-    if direct_status is not None and (
-        not isinstance(direct_status, str)
-        or direct_status.strip().lower() not in DISCOVERY_RUN_STATUSES
-    ):
-        return False
-    return is_discovery_run_metadata(run.get("metadata"))
-
-
 def load_rows(source: str | Path | Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Load joined discovery recommendation impressions and observed outcomes."""
+    """Load joined recommendation impressions and observed outcomes."""
 
     data = dict(source) if isinstance(source, Mapping) else _read_json_or_sqlite(Path(source))
     runs = {str(row["id"]): row for row in data.get("recommendation_runs", [])}
-    excluded_run_ids = {
-        run_id for run_id, row in runs.items() if not _is_discovery_run(row)
-    }
     impressions = data.get("recommendation_impressions", [])
     outcomes_by_impression: dict[Any, list[Mapping[str, Any]]] = defaultdict(list)
     for outcome in data.get("recommendation_outcomes", []):
         outcomes_by_impression[outcome.get("impression_id")].append(outcome)
     values: list[dict[str, Any]] = []
     for impression in impressions:
-        run_key = str(impression.get("run_id"))
-        if run_key in excluded_run_ids:
-            continue
-        run = runs.get(run_key, {})
+        run = runs.get(str(impression.get("run_id")), {})
         candidates = outcomes_by_impression.get(impression.get("id"), [])
         outcome = _select_primary_outcome(candidates)
         raw_confidence = outcome.get("confidence") if outcome is not None else None

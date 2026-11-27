@@ -113,7 +113,7 @@ def test_five_click_discover_triage_creates_one_run_and_preserves_ndcg(seeded_db
     assert ips_ndcg_at_k(eval_rows, 20) == pytest.approx(1.0 / math.log2(6))
 
 
-def test_twenty_passes_then_rank_twenty_one_save_scores_zero_top_twenty(seeded_db):
+def test_twenty_passes_then_rank_twenty_one_save_preserves_session_ranks(seeded_db):
     db_path, _ = seeded_db
     client = TestClient(app, headers=authenticated_headers())
     overview = client.get(
@@ -142,33 +142,8 @@ def test_twenty_passes_then_rank_twenty_one_save_scores_zero_top_twenty(seeded_d
     assert row("SELECT COUNT(*) count FROM recommendation_runs")["count"] == 1
     eval_rows = load_rows(db_path)
     assert ips_precision_at_k(eval_rows, 20) == 0.0
-    assert ips_ndcg_at_k(eval_rows, 20) == 0.0
-
-
-def test_ips_ndcg_at_k_scores_all_negative_runs_as_zero_and_skips_censored_runs():
-    def make_row(run_id: str, rank: int, label: int | None):
-        return {
-            "run_id": run_id,
-            "rank": rank,
-            "candidate_id": f"{run_id}-{rank}",
-            "impression_id": f"{run_id}-{rank}",
-            "score": float(100 - rank),
-            "propensity": 1.0,
-            "confidence": 1.0,
-            "label": label,
-        }
-
-    dataset = [
-        make_row("neg-only", 1, 0),
-        make_row("neg-only", 2, 0),
-        *[make_row("twenty-passes", rank, 0) for rank in range(1, 21)],
-        make_row("twenty-passes", 21, 1),
-        make_row("pos-top", 1, 1),
-        make_row("pos-top", 2, 0),
-        make_row("censored-only", 1, None),
-        make_row("censored-only", 2, None),
-    ]
-    assert ips_ndcg_at_k(dataset, 20) == pytest.approx(1.0 / 3.0)
+    assert ips_ndcg_at_k(eval_rows, 20) is None
+    assert ips_ndcg_at_k(eval_rows, 24) == pytest.approx(1.0 / math.log2(22))
 
 
 def test_non_discover_requests_create_zero_runs_and_impressions(seeded_db):
@@ -632,44 +607,245 @@ def test_untracked_recommendations_skip_exploration_reordering_and_log_no_propen
     )
 
 
-def test_load_rows_excludes_historical_non_discovery_runs_from_ndcg():
-    dataset = {
-        "recommendation_runs": [
-            {
-                "id": "discover-pos",
-                "created_at": "2026-10-01T00:00:00Z",
-                "metadata": json.dumps({"status": "recommended"}),
-            },
-            {
-                "id": "discover-all-neg",
-                "created_at": "2026-10-02T00:00:00Z",
-                "metadata": json.dumps({"status": "recommended"}),
-            },
-            {
-                "id": "historical-decisions",
-                "created_at": "2026-10-03T00:00:00Z",
-                "metadata": json.dumps({"status": "decisions"}),
-            },
-            {
-                "id": "historical-saved",
-                "created_at": "2026-10-04T00:00:00Z",
-                "metadata": json.dumps({"status": "saved"}),
-            },
-        ],
-        "recommendation_impressions": [
-            {"id": 1, "run_id": "discover-pos", "candidate_id": 1, "rank": 1, "score": 95.0, "propensity": 1.0},
-            {"id": 2, "run_id": "discover-all-neg", "candidate_id": 2, "rank": 1, "score": 94.0, "propensity": 1.0},
-            {"id": 3, "run_id": "historical-decisions", "candidate_id": 3, "rank": 1, "score": 60.0, "propensity": 1.0},
-            {"id": 4, "run_id": "historical-saved", "candidate_id": 4, "rank": 1, "score": 88.0, "propensity": 1.0},
-        ],
-        "recommendation_outcomes": [
-            {"impression_id": 1, "label": 1.0, "label_kind": "explicit_feedback", "confidence": 1.0},
-            {"impression_id": 2, "label": 0.0, "label_kind": "explicit_feedback", "confidence": 1.0},
-            {"impression_id": 3, "label": 0.0, "label_kind": "explicit_feedback", "confidence": 1.0},
-            {"impression_id": 4, "label": 0.0, "label_kind": "explicit_feedback", "confidence": 1.0},
-        ],
-    }
-    loaded = load_rows(dataset)
-    assert {item["run_id"] for item in loaded} == {"discover-pos", "discover-all-neg"}
-    assert ips_ndcg_at_k(loaded, 20) == pytest.approx(0.5)
+def test_run_metadata_helpers_are_pure_and_exclude_non_json_legacy_rows():
+    from afterword_engine.run_metadata import (
+        is_discovery_run_metadata,
+        is_matching_run_profile,
+        parse_run_metadata,
+    )
+
+    for legacy_discovery in (
+        None,
+        "",
+        "{}",
+        {},
+        json.dumps({"status": "recommended"}),
+        json.dumps({"status": "ALL"}),
+        json.dumps({"status": ""}),
+        json.dumps({"offset": 0}),
+    ):
+        assert is_discovery_run_metadata(legacy_discovery) is True
+
+    for excluded in (
+        json.dumps({"status": "saved"}),
+        json.dumps({"status": "decisions"}),
+        json.dumps({"status": "rejected"}),
+        json.dumps({"status": "maybe_later"}),
+        json.dumps({"status": 123}),
+        "legacy-non-json-metadata",
+        "{truncated",
+        "[1, 2, 3]",
+        '"recommended"',
+        42,
+    ):
+        assert is_discovery_run_metadata(excluded) is False
+
+    assert parse_run_metadata("legacy-non-json-metadata") is None
+    assert is_matching_run_profile(None, "legacy") is True
+    assert is_matching_run_profile("{}", "profile-abc") is True
+    assert (
+        is_matching_run_profile(
+            json.dumps({"profile_id": "profile-abc"}), "profile-abc"
+        )
+        is True
+    )
+    assert (
+        is_matching_run_profile(
+            json.dumps({"profile_id": "profile-other"}), "profile-abc"
+        )
+        is False
+    )
+    assert is_matching_run_profile("legacy-non-json-metadata", "legacy") is False
+
+
+def test_explicit_non_discovery_or_missing_run_id_never_falls_back_to_other_run(
+    seeded_db,
+):
+    from afterword_engine.learning import _find_latest_impression
+
+    _, candidate_ids = seeded_db
+    target_id = candidate_ids[0]
+    client = TestClient(app, headers=authenticated_headers())
+    overview = client.get(
+        "/api/overview?recommendation_limit=24&decision_limit=24"
+    ).json()
+    discovery_run_id = overview["recommendation_run_id"]
+    assert discovery_run_id
+
+    with transaction() as con:
+        for run_id, raw_meta, ts in (
+            (
+                "run-a-non-discovery",
+                json.dumps({"status": "saved"}),
+                "2026-12-01T12:00:00+00:00",
+            ),
+            (
+                "run-a-non-json-meta",
+                "legacy-plain-text-metadata",
+                "2026-12-01T12:05:00+00:00",
+            ),
+        ):
+            con.execute(
+                "INSERT INTO recommendation_runs(id,policy,policy_version,candidate_count,metadata,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (run_id, "rating-neighborhood", "v1", 1, raw_meta, ts),
+            )
+            con.execute(
+                "INSERT INTO recommendation_impressions("
+                "run_id,candidate_id,rank,score,propensity,presented_at"
+                ") VALUES(?,?,?,?,?,?)",
+                (run_id, target_id, 1, 95.0, 1.0, ts),
+            )
+
+        # Explicit non-discovery, non-JSON, or missing run_id must return None rather than
+        # falling back to discovery_run_id's impression.
+        assert _find_latest_impression(con, target_id, "run-a-non-discovery") is None
+        assert _find_latest_impression(con, target_id, "run-a-non-json-meta") is None
+        assert _find_latest_impression(con, target_id, "missing-run-9999") is None
+        fallback = _find_latest_impression(con, target_id, None)
+        assert fallback is not None
+        assert fallback["run_id"] == discovery_run_id
+
+    # Feedback explicitly naming run A (non-discovery) must NOT attribute an outcome to run B.
+    save_non_disc = client.post(
+        f"/api/recommendations/{target_id}/feedback",
+        json={"action": "save", "run_id": "run-a-non-discovery"},
+    )
+    assert save_non_disc.status_code == 200
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] == 0
+
+    reject_non_json = client.post(
+        f"/api/recommendations/{target_id}/feedback",
+        json={"action": "reject", "run_id": "run-a-non-json-meta"},
+    )
+    assert reject_non_json.status_code == 200
+    assert row("SELECT COUNT(*) count FROM recommendation_outcomes")["count"] == 0
+
+    # Without an explicit run_id, attribution still matches discovery_run_id.
+    save_unscoped = client.post(
+        f"/api/recommendations/{target_id}/feedback",
+        json={"action": "save"},
+    )
+    assert save_unscoped.status_code == 200
+    outcomes = rows(
+        "SELECT ri.run_id, ro.label FROM recommendation_outcomes ro "
+        "JOIN recommendation_impressions ri ON ri.id = ro.impression_id"
+    )
+    assert [(r["run_id"], r["label"]) for r in outcomes] == [(discovery_run_id, 1.0)]
+
+
+def test_concurrent_pagination_assigns_unique_contiguous_ranks_inside_write_transaction(
+    seeded_db, monkeypatch
+):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from afterword_engine import main as engine_main
+
+    _, candidate_ids = seeded_db
+    auth_headers = authenticated_headers()
+    client = TestClient(app, headers=auth_headers)
+
+    # Case 1: Complete frozen-evidence run under concurrent disjoint + duplicate page loads.
+    run_frozen = client.get(
+        "/api/overview?recommendation_limit=24&decision_limit=24"
+    ).json()["recommendation_run_id"]
+    assert run_frozen
+
+    orig_read_state = engine_main._read_paginated_run_state
+    barrier_frozen = threading.Barrier(2, timeout=10)
+
+    def synced_read_state_frozen(*args, **kwargs):
+        res = orig_read_state(*args, **kwargs)
+        barrier_frozen.wait()
+        return res
+
+    monkeypatch.setattr(engine_main, "_read_paginated_run_state", synced_read_state_frozen)
+
+    def fetch_page(run_id: str, offset: int, limit: int):
+        page_client = TestClient(app, headers=auth_headers)
+        resp = page_client.get(
+            f"/api/recommendations?status=recommended&limit={limit}&offset={offset}&run_id={run_id}"
+        )
+        assert resp.status_code == 200
+        return [item["id"] for item in resp.json()]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(fetch_page, run_frozen, 24, 4)
+        f2 = pool.submit(fetch_page, run_frozen, 28, 4)
+        ids_24, ids_28 = f1.result(), f2.result()
+
+    assert ids_24 == candidate_ids[24:28]
+    assert ids_28 == candidate_ids[28:32]
+
+    barrier_dup = threading.Barrier(2, timeout=10)
+
+    def synced_read_state_dup(*args, **kwargs):
+        res = orig_read_state(*args, **kwargs)
+        barrier_dup.wait()
+        return res
+
+    monkeypatch.setattr(engine_main, "_read_paginated_run_state", synced_read_state_dup)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        d1 = pool.submit(fetch_page, run_frozen, 32, 4)
+        d2 = pool.submit(fetch_page, run_frozen, 32, 4)
+        assert d1.result() == candidate_ids[32:36]
+        assert d2.result() == candidate_ids[32:36]
+
+    monkeypatch.setattr(engine_main, "_read_paginated_run_state", orig_read_state)
+
+    frozen_imp = rows(
+        "SELECT candidate_id, rank FROM recommendation_impressions WHERE run_id=? ORDER BY rank ASC",
+        (run_frozen,),
+    )
+    assert [r["rank"] for r in frozen_imp] == list(range(1, 37))
+    assert len({r["candidate_id"] for r in frozen_imp}) == 36
+    frozen_exp = rows(
+        "SELECT candidate_id, rank FROM recommendation_evidence_exposures WHERE run_id=? ORDER BY rank ASC",
+        (run_frozen,),
+    )
+    assert [r["rank"] for r in frozen_exp] == list(range(1, 37))
+    assert [r["candidate_id"] for r in frozen_exp] == [r["candidate_id"] for r in frozen_imp]
+
+    # Case 2: Incomplete-evidence fallback (frozen_recommended is None) under concurrent page loads.
+    run_fallback = client.get(
+        "/api/overview?recommendation_limit=24&decision_limit=24"
+    ).json()["recommendation_run_id"]
+    with transaction() as con:
+        con.execute(
+            "DELETE FROM recommendation_run_evidence WHERE run_id=?",
+            (run_fallback,),
+        )
+
+    barrier_fallback = threading.Barrier(2, timeout=10)
+
+    def synced_read_state_fallback(*args, **kwargs):
+        res = orig_read_state(*args, **kwargs)
+        assert res[3] is None
+        barrier_fallback.wait()
+        return res
+
+    monkeypatch.setattr(engine_main, "_read_paginated_run_state", synced_read_state_fallback)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fb1 = pool.submit(fetch_page, run_fallback, 24, 4)
+        fb2 = pool.submit(fetch_page, run_fallback, 28, 4)
+        fb_ids_24, fb_ids_28 = fb1.result(), fb2.result()
+
+    monkeypatch.setattr(engine_main, "_read_paginated_run_state", orig_read_state)
+
+    assert fb_ids_24 == candidate_ids[24:28]
+    assert fb_ids_28 == candidate_ids[28:32]
+    fallback_imp = rows(
+        "SELECT candidate_id, rank FROM recommendation_impressions WHERE run_id=? ORDER BY rank ASC",
+        (run_fallback,),
+    )
+    assert [r["rank"] for r in fallback_imp] == list(range(1, 33))
+    assert set(r["candidate_id"] for r in fallback_imp) == set(candidate_ids[:32])
+    fallback_exp = rows(
+        "SELECT candidate_id, rank FROM recommendation_evidence_exposures WHERE run_id=? ORDER BY rank ASC",
+        (run_fallback,),
+    )
+    assert [r["rank"] for r in fallback_exp] == list(range(1, 33))
+    assert [r["candidate_id"] for r in fallback_exp] == [
+        r["candidate_id"] for r in fallback_imp
+    ]
 

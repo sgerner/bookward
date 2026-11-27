@@ -36,6 +36,13 @@ from .identity import (
     book_row_exact_and_prefix_match_keys,
     book_row_identity_match_keys,
 )
+from .run_metadata import (
+    DISCOVERY_RUN_STATUSES,
+    NON_DISCOVERY_ITEM_STATUSES,
+    is_discovery_run_metadata,
+    is_matching_run_profile as _is_matching_run_profile_meta,
+    parse_run_metadata as _parse_run_metadata,
+)
 from .tenancy import current_profile_id
 
 
@@ -119,46 +126,11 @@ def _validate_value(value: float | None) -> float | None:
     return number
 
 
-DISCOVERY_RUN_STATUSES = frozenset({"", "recommended", "all"})
-NON_DISCOVERY_ITEM_STATUSES = frozenset(
-    {"saved", "imported", "rejected", "maybe_later", "decisions", "excluded", "read"}
-)
-
-
 def active_profile_key() -> str:
     """Return the canonical profile identifier for run ownership metadata."""
 
     selected = (current_profile_id() or "").strip()
     return selected or "legacy"
-
-
-def _parse_run_metadata(raw_metadata: Any) -> Mapping[str, Any] | None:
-    if raw_metadata is None or raw_metadata == "":
-        return {}
-    if isinstance(raw_metadata, str):
-        try:
-            parsed = json.loads(raw_metadata)
-        except (TypeError, ValueError):
-            return None
-    elif isinstance(raw_metadata, Mapping):
-        parsed = raw_metadata
-    else:
-        return None
-    return parsed if isinstance(parsed, Mapping) else None
-
-
-def is_discovery_run_metadata(raw_metadata: Any) -> bool:
-    """Return True when run metadata belongs to a discovery recommendation run."""
-
-    if raw_metadata is None or raw_metadata == "":
-        return True
-    parsed = _parse_run_metadata(raw_metadata)
-    if parsed is None:
-        return False
-    status = parsed.get("status")
-    if status is None:
-        return True
-    return isinstance(status, str) and status.strip().lower() in DISCOVERY_RUN_STATUSES
 
 
 def is_matching_run_profile(
@@ -167,16 +139,8 @@ def is_matching_run_profile(
 ) -> bool:
     """Return True when run metadata belongs to the active profile (or legacy unlabeled row)."""
 
-    parsed = _parse_run_metadata(raw_metadata)
-    if parsed is None:
-        return False
-    recorded_profile = parsed.get("profile_id")
-    if recorded_profile is None or recorded_profile == "":
-        return True
-    if not isinstance(recorded_profile, str):
-        return False
     target = (expected_profile_id or active_profile_key()).strip() or "legacy"
-    return recorded_profile.strip() == target
+    return _is_matching_run_profile_meta(raw_metadata, target)
 
 
 def create_recommendation_run(
@@ -306,10 +270,13 @@ def append_recommendation_run_impressions(
     run_id: str,
     recommendations: Iterable[dict[str, Any]],
     *,
-    ranks: Sequence[int] | None = None,
     expected_profile_id: str | None = None,
 ) -> bool:
-    """Append newly served discovery pagination candidates to an existing discovery run."""
+    """Append newly served discovery pagination candidates to an existing discovery run.
+
+    Ranks are assigned atomically inside ``transaction()`` (``BEGIN IMMEDIATE``)
+    so concurrent page loads never collide on duplicate rank numbers.
+    """
 
     _validate_identifier(run_id, "recommendation run")
     items = list(recommendations)
@@ -322,8 +289,6 @@ def append_recommendation_run_impressions(
             raise ValueError(
                 "Recommendation exposure runs may not log shortlist, imported, or archived items"
             )
-    if ranks is not None and len(ranks) != len(items):
-        raise ValueError("Recommendation ranks must match recommendation count")
     target_profile = (expected_profile_id or active_profile_key()).strip() or "legacy"
     now = utc_now()
     with transaction() as con:
@@ -339,23 +304,30 @@ def append_recommendation_run_impressions(
             raise ValueError("Invalid recommendation run")
         if not items:
             return True
+        parsed_meta = _parse_run_metadata(run_row["metadata"]) or {}
+        raw_offset = parsed_meta.get("offset", 0)
+        try:
+            base_offset = max(0, int(raw_offset)) if not isinstance(raw_offset, bool) else 0
+        except (TypeError, ValueError):
+            base_offset = 0
         existing = con.execute(
             "SELECT candidate_id,rank FROM recommendation_impressions WHERE run_id=?",
             (run_id,),
         ).fetchall()
         existing_ids = {int(row["candidate_id"]) for row in existing}
-        next_rank = max((int(row["rank"]) for row in existing), default=0) + 1
+        existing_ranks = {int(row["rank"]) for row in existing}
+        next_rank = base_offset + 1
         new_items: list[dict[str, Any]] = []
         new_ranks: list[int] = []
-        for idx, item in enumerate(items):
+        for item in items:
             candidate_id = int(item["id"])
             if candidate_id in existing_ids:
                 continue
-            rank = int(ranks[idx]) if ranks is not None else next_rank
-            if rank <= 0:
-                raise ValueError("Recommendation ranks must be positive")
-            if ranks is None:
+            while next_rank in existing_ranks:
                 next_rank += 1
+            rank = next_rank
+            existing_ranks.add(rank)
+            next_rank += 1
             try:
                 propensity = float(item.get("propensity", 1.0))
             except (TypeError, ValueError) as exc:
@@ -459,6 +431,7 @@ def _find_latest_impression(con, candidate_id: int, run_id: str | None = None):
         matched = _run_impression(con, run_id, candidate_id)
         if matched is not None and is_discovery_run_metadata(matched["run_metadata"]):
             return matched
+        return None
     rows = con.execute(
         "SELECT i.id,i.run_id,i.rank,i.score,i.propensity,i.presented_at,i.visible_at,"
         "r.metadata AS run_metadata "
@@ -1221,10 +1194,18 @@ def sync_read_rating_in_connection(con, read: dict[str, Any]) -> dict[str, int]:
                     "UPDATE recommendation_events SET value=?,occurred_at=? WHERE id=?",
                     (rating_value, timestamp, event_id),
                 )
+                fallback_run_id = None
+                if impression is None and run_id is not None:
+                    run_row = con.execute(
+                        "SELECT metadata FROM recommendation_runs WHERE id=?",
+                        (run_id,),
+                    ).fetchone()
+                    if run_row is not None and is_discovery_run_metadata(run_row["metadata"]):
+                        fallback_run_id = run_id
                 archive_run_id = (
                     str(impression["run_id"])
                     if impression is not None and impression["run_id"] is not None
-                    else run_id
+                    else fallback_run_id
                 )
                 if archive_run_id:
                     archived_revision = archive_recommendation_event(

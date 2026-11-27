@@ -116,17 +116,19 @@ from .digest import (
     validate_digest_config,
 )
 from .decision_evidence import retract_recommendation_outcome_evidence
-from .learning import (
+from .run_metadata import (
     DISCOVERY_RUN_STATUSES,
+    NON_DISCOVERY_ITEM_STATUSES,
+    is_discovery_run_metadata,
+)
+from .learning import (
     EVENT_TYPES,
     HISTORICAL_READ_SOURCES,
-    NON_DISCOVERY_ITEM_STATUSES,
     RUN_ID_RE,
     active_profile_key,
     append_recommendation_run_impressions,
     create_recommendation_run,
     build_decision_evidence,
-    is_discovery_run_metadata,
     is_matching_run_profile,
     reconcile_read_outcomes_in_connection,
     record_event_in_connection,
@@ -3278,7 +3280,9 @@ def _load_frozen_run_recommended_pool(connection, run_id: str) -> list[dict[str,
         return None
 
 
-def _read_paginated_run_state(connection, *, run_id: str, current_profile: str, target_status: str):
+def _read_paginated_run_state(
+    connection, *, run_id: str, current_profile: str, target_status: str, start: int
+):
     run_row = connection.execute(
         "SELECT id, metadata FROM recommendation_runs WHERE id=?",
         (run_id,),
@@ -3303,9 +3307,9 @@ def _read_paginated_run_state(connection, *, run_id: str, current_profile: str, 
         (run_id,),
     ).fetchall()
     impressed_ids = {int(r["candidate_id"]) for r in existing_rows}
-    max_rank = max((int(r["rank"]) for r in existing_rows), default=0)
+    prior_impressed_count = sum(1 for r in existing_rows if int(r["rank"]) <= start)
     frozen_recommended = _load_frozen_run_recommended_pool(connection, run_id)
-    return by_id, impressed_ids, max_rank, frozen_recommended
+    return by_id, impressed_ids, prior_impressed_count, frozen_recommended
 
 
 def paginated_run_recommendations(
@@ -3327,26 +3331,32 @@ def paginated_run_recommendations(
         raise HTTPException(400, "Invalid recommendation run")
     current_profile = active_profile_key()
     target_status = "recommended"
+    start = max(0, int(offset))
     if connection is not None:
-        by_id, impressed_ids, max_rank, frozen_recommended = _read_paginated_run_state(
-            connection,
-            run_id=run_id,
-            current_profile=current_profile,
-            target_status=target_status,
-        )
-    else:
-        with connect() as read_con:
-            by_id, impressed_ids, max_rank, frozen_recommended = _read_paginated_run_state(
-                read_con,
+        by_id, impressed_ids, prior_impressed_count, frozen_recommended = (
+            _read_paginated_run_state(
+                connection,
                 run_id=run_id,
                 current_profile=current_profile,
                 target_status=target_status,
+                start=start,
+            )
+        )
+    else:
+        with connect() as read_con:
+            by_id, impressed_ids, prior_impressed_count, frozen_recommended = (
+                _read_paginated_run_state(
+                    read_con,
+                    run_id=run_id,
+                    current_profile=current_profile,
+                    target_status=target_status,
+                    start=start,
+                )
             )
 
-    start = max(0, int(offset))
-    ranked_candidates: list[tuple[int, dict[str, Any]]] = []
     if frozen_recommended is not None:
-        for frozen_rank, snap in enumerate(frozen_recommended[start:], start + 1):
+        candidates: list[dict[str, Any]] = []
+        for snap in frozen_recommended[start:]:
             try:
                 cid = int(snap["id"])
             except (KeyError, TypeError, ValueError):
@@ -3358,7 +3368,9 @@ def paginated_run_recommendations(
                 item["score"] = float(snap["score"])
             if not _matches_recommendation_filter(item, search=search, genre=genre):
                 continue
-            ranked_candidates.append((frozen_rank, item))
+            candidates.append(item)
+        page_items = candidates[: max(0, int(limit))]
+        _format_recommendation_urls(page_items)
     else:
         unlogged, _ = tracked_recommendations(
             connection=connection,
@@ -3369,19 +3381,14 @@ def paginated_run_recommendations(
             genre=genre,
             track_run=False,
         )
-        next_rank = max(max_rank, start) + 1
-        for item in unlogged:
-            cid = int(item["id"])
-            if cid in impressed_ids:
-                continue
-            ranked_candidates.append((next_rank, dict(item)))
-            next_rank += 1
+        unimpressed = [
+            dict(item) for item in unlogged if int(item["id"]) not in impressed_ids
+        ]
+        unimpressed_offset = max(0, start - prior_impressed_count)
+        page_items = unimpressed[
+            unimpressed_offset : unimpressed_offset + max(0, int(limit))
+        ]
 
-    sliced = ranked_candidates[: max(0, int(limit))]
-    page_items = [item for _, item in sliced]
-    if frozen_recommended is not None:
-        _format_recommendation_urls(page_items)
-    page_ranks = [rank for rank, _ in sliced]
     imp_count = (
         len(page_items)
         if impression_limit is None
@@ -3392,7 +3399,6 @@ def paginated_run_recommendations(
             appended = append_recommendation_run_impressions(
                 run_id,
                 page_items[:imp_count],
-                ranks=page_ranks[:imp_count],
                 expected_profile_id=current_profile,
             )
         except ValueError as exc:

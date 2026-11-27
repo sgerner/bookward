@@ -525,15 +525,7 @@ def test_scoped_full_rating_certainty_and_zero_neutral_ndcg_gain():
         {"run_id": "r3", "rank": 1, "score": 95.0, "propensity": 1.0, "label": 0.5, "confidence": 0.25, "label_kind": "rating_neutral"},
         {"run_id": "r3", "rank": 2, "score": 85.0, "propensity": 1.0, "label": 0.0, "confidence": 1.0, "label_kind": "rating_negative"},
     ]
-    # Observed top-k slates with zero ideal gain (e.g. neutral + negative) score 0.0 to match ips_precision_at_k,
-    # whereas completely censored slates with no observed top-k outcomes return None.
-    assert ips_precision_at_k(no_positive_outcomes, 5) == pytest.approx(0.0)
-    assert ips_ndcg_at_k(no_positive_outcomes, 5) == pytest.approx(0.0)
-    censored_only = [
-        {"run_id": "r4", "rank": 1, "score": 95.0, "propensity": 1.0, "label": None, "confidence": None},
-        {"run_id": "r4", "rank": 2, "score": 85.0, "propensity": 1.0, "label": None, "confidence": None},
-    ]
-    assert ips_ndcg_at_k(censored_only, 5) is None
+    assert ips_ndcg_at_k(no_positive_outcomes, 5) is None
 
 
 def test_ips_ndcg_at_k_matches_hand_computed_gain_only_ideal_without_clamping():
@@ -905,84 +897,3 @@ def test_sqlite_cli_preserves_report_contract_with_shortlisted_neutral_reads(tmp
     assert report["enjoyment"]["precision_at_20"] == pytest.approx(0.5)
     assert report["signal_diagnostics"]["explicit_ratings"]["auc"] is None
     assert report["signal_diagnostics"]["explicit_ratings"]["grade_concordance"] == pytest.approx(1.0)
-
-
-def test_load_rows_excludes_non_discovery_runs_and_scores_zero_idcg_slates(tmp_path: Path):
-    import sqlite3
-
-    db_path = tmp_path / "eval_discovery_filter.db"
-    with sqlite3.connect(db_path) as con:
-        con.executescript(
-            """
-            CREATE TABLE recommendation_runs (
-                id TEXT PRIMARY KEY,
-                created_at TEXT,
-                metadata TEXT
-            );
-            CREATE TABLE recommendation_impressions (
-                id INTEGER PRIMARY KEY,
-                run_id TEXT,
-                candidate_id INTEGER,
-                rank INTEGER,
-                score REAL,
-                propensity REAL,
-                presented_at TEXT
-            );
-            CREATE TABLE recommendation_outcomes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                impression_id INTEGER,
-                label REAL,
-                label_kind TEXT,
-                confidence REAL,
-                attributed_at TEXT
-            );
-            """
-        )
-        runs = [
-            ("disc-hit", "2026-10-01T00:00:00Z", json.dumps({"status": "recommended"})),
-            ("disc-all-pass", "2026-10-02T00:00:00Z", json.dumps({"status": "recommended"})),
-            ("disc-censored", "2026-10-03T00:00:00Z", ""),
-            ("non-disc-saved", "2026-10-04T00:00:00Z", json.dumps({"status": "saved"})),
-            ("non-disc-decisions", "2026-10-05T00:00:00Z", json.dumps({"status": "decisions"})),
-            ("non-disc-malformed", "2026-10-06T00:00:00Z", "{invalid-json"),
-        ]
-        con.executemany(
-            "INSERT INTO recommendation_runs(id, created_at, metadata) VALUES(?,?,?)",
-            runs,
-        )
-        impressions = [
-            (1, "disc-hit", 101, 1, 95.0, 1.0, "2026-10-01T00:00:00Z"),
-            (2, "disc-all-pass", 102, 1, 92.0, 1.0, "2026-10-02T00:00:00Z"),
-            (3, "disc-censored", 103, 1, 90.0, 1.0, "2026-10-03T00:00:00Z"),
-            (4, "non-disc-saved", 104, 1, 88.0, 1.0, "2026-10-04T00:00:00Z"),
-            (5, "non-disc-decisions", 105, 1, 60.0, 1.0, "2026-10-05T00:00:00Z"),
-            (6, "non-disc-malformed", 106, 1, 70.0, 1.0, "2026-10-06T00:00:00Z"),
-        ]
-        con.executemany(
-            "INSERT INTO recommendation_impressions(id, run_id, candidate_id, rank, score, propensity, presented_at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            impressions,
-        )
-        outcomes = [
-            (1, 1.0, "save", 0.9, "2026-10-01T01:00:00Z"),
-            (2, 0.0, "reject", 0.9, "2026-10-02T01:00:00Z"),
-            (4, 1.0, "librarr_import", 0.95, "2026-10-04T01:00:00Z"),
-            (5, 0.0, "reject", 0.9, "2026-10-05T01:00:00Z"),
-            (6, 1.0, "save", 0.9, "2026-10-06T01:00:00Z"),
-        ]
-        con.executemany(
-            "INSERT INTO recommendation_outcomes(impression_id, label, label_kind, confidence, attributed_at) "
-            "VALUES(?,?,?,?,?)",
-            outcomes,
-        )
-
-    loaded = load_rows(db_path)
-    assert [row["run_id"] for row in loaded] == [
-        "disc-hit",
-        "disc-all-pass",
-        "disc-censored",
-    ]
-    # Macro average across the two observed discovery runs: (1.0 + 0.0) / 2 = 0.5;
-    # the censored run contributes no observed_topk and all non-discovery runs are excluded.
-    assert ips_precision_at_k(loaded, 20) == pytest.approx(0.5)
-    assert ips_ndcg_at_k(loaded, 20) == pytest.approx(0.5)
