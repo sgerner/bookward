@@ -1730,13 +1730,13 @@ def test_migration_33_decouples_work_ids_verifies_source_isbns_and_requeues_only
     from afterword_engine.identity import ReadIdentityIndex
     from afterword_engine.main import recommendation_list
 
-    settings.db = str(tmp_path / "legacy-v31.db")
+    settings.db = str(tmp_path / "legacy-v32.db")
     con = sqlite3.connect(settings.db)
     con.execute(
         "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
     for version, script in MIGRATIONS:
-        if version >= 32:
+        if version >= 33:
             break
         _execute_migration_script(con, script)
         con.execute("INSERT INTO schema_migrations(version) VALUES(?)", (version,))
@@ -1940,8 +1940,8 @@ def test_migration_33_decouples_work_ids_verifies_source_isbns_and_requeues_only
 
     initialize(seed_demo=False)
 
-    assert row("SELECT version FROM schema_migrations WHERE version=31") == {"version": 31}
     assert row("SELECT version FROM schema_migrations WHERE version=32") == {"version": 32}
+    assert row("SELECT version FROM schema_migrations WHERE version=33") == {"version": 33}
     quality_columns = {
         col["name"]: col for col in rows("PRAGMA table_info(candidate_quality)")
     }
@@ -2205,7 +2205,7 @@ def test_upgrade_from_main_migration_28_applies_through_migration_33_columns_ind
         item["version"]
         for item in rows("SELECT version FROM schema_migrations WHERE version >= 28")
     }
-    assert {28, 29, 30, 31, 32}.issubset(applied_versions)
+    assert {28, 29, 30, 31, 32, 33}.issubset(applied_versions)
     quality_columns = {
         col["name"]: col for col in rows("PRAGMA table_info(candidate_quality)")
     }
@@ -2532,3 +2532,78 @@ def test_load_llm_rerank_inputs_projects_decoupled_quality_identity_fields(datab
     assert llm_events[0]["quality_isbn_verified"] == 0
     assert llm_events[0]["quality_status"] == "accepted"
     assert llm_events[0]["quality_audit_version"] == QUALITY_VERSION
+
+
+def test_reconcile_read_outcomes_projects_decoupled_work_id_and_ignores_unverified_v6_isbn(database):
+    from afterword_engine.learning import (
+        create_recommendation_run,
+        reconcile_read_outcomes_in_connection,
+    )
+
+    with transaction() as con:
+        source_id = con.execute(
+            "SELECT id FROM sources WHERE is_default=1 LIMIT 1"
+        ).fetchone()[0]
+        unverified_boxset_cid = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,isbn13,normalized_key) "
+            "VALUES('Sequel Volume Two','Different Writer',84,'recommended',?,'','sequel-volume-two')",
+            (source_id,),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='openlibrary',"
+            "provider_id='/works/OL7002W',work_id='/works/OL7002W',openlibrary_work_id='/works/OL7002W',"
+            "isbn13='9780345538376',isbn_verified=0,audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, unverified_boxset_cid),
+        )
+        gb_work_cid = con.execute(
+            "INSERT INTO candidates(title,author,score,status,source_id,isbn13,normalized_key) "
+            "VALUES('Translated Edition Title','Author A',91,'recommended',?,'','translated-edition-title')",
+            (source_id,),
+        ).lastrowid
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',provider='google_books',"
+            "provider_id='gb-vol-7001',work_id='gb-vol-7001',openlibrary_work_id='/works/OL7001W',"
+            "isbn13='',isbn_verified=0,audit_version=? WHERE candidate_id=?",
+            (QUALITY_VERSION, gb_work_cid),
+        )
+
+    run_id = create_recommendation_run(
+        [
+            {"id": unverified_boxset_cid, "score": 84.0},
+            {"id": gb_work_cid, "score": 91.0},
+        ]
+    )
+    assert run_id
+
+    with transaction() as con:
+        con.execute(
+            "UPDATE recommendation_impressions SET presented_at='2026-10-01T10:00:00+00:00' WHERE run_id=?",
+            (run_id,),
+        )
+        boxset_read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
+            "VALUES('Original Book One','Another Writer',5,'2026-10-05','9780345538376','goodreads_csv')"
+        ).lastrowid
+        boxset_read = dict(
+            con.execute("SELECT * FROM reads WHERE id=?", (boxset_read_id,)).fetchone()
+        )
+        boxset_res = reconcile_read_outcomes_in_connection(
+            con, boxset_read, read_at_updated=True
+        )
+        assert boxset_res["outcome"] == "none"
+
+        work_read_id = con.execute(
+            "INSERT INTO reads(title,author,rating,read_at,isbn,source,openlibrary_work_id) "
+            "VALUES('Original Work Title','Author A',5,'2026-10-05','','goodreads_csv','/works/OL7001W')"
+        ).lastrowid
+        work_read = dict(
+            con.execute("SELECT * FROM reads WHERE id=?", (work_read_id,)).fetchone()
+        )
+        work_res = reconcile_read_outcomes_in_connection(
+            con, work_read, read_at_updated=True
+        )
+        assert work_res["outcome"] == "created"
+    assert row(
+        "SELECT candidate_id FROM recommendation_events WHERE event_key=?",
+        (f"read:{work_read_id:08d}",),
+    ) == {"candidate_id": gb_work_cid}

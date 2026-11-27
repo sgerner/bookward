@@ -575,6 +575,27 @@ def queue_digest_if_due():
     return None
 
 
+def _poll_source_schedule_for_profile(
+    profile_id: str, check_enrichment_retries: bool
+) -> None:
+    with profile_scope(profile_id):
+        lock = database_lock()
+        with lock.scheduler_guard() as can_schedule, bind_request_restore_epoch():
+            if not can_schedule or has_restore_journal():
+                return
+            with lock.try_shared() as acquired:
+                if not acquired:
+                    return
+                if (
+                    source_sync_is_due()
+                    and not active_job("sync")
+                    and not active_job("sync_due")
+                ):
+                    enqueue_job("sync_due", dedupe=True)
+                if check_enrichment_retries:
+                    _queue_due_enrichment_retries()
+
+
 async def source_scheduler_loop(stop):
     """Queue a single sync when permanent sources become due.
 
@@ -593,19 +614,20 @@ async def source_scheduler_loop(stop):
         check_enrichment_retries = current_monotonic >= next_enrichment_retry_check
         if check_enrichment_retries:
             next_enrichment_retry_check = current_monotonic + ENRICHMENT_RETRY_POLL_SECONDS
-        for profile_id in identity_store.profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(identity_store.profile_ids)
+        except Exception:
+            LOGGER.exception("Source scheduler could not enumerate profiles")
+            active_profiles = []
+        for profile_id in active_profiles:
+            if stop.is_set():
+                break
             try:
-                with profile_scope(profile_id), database_lock().scheduler_guard() as can_schedule, bind_request_restore_epoch():
-                    if not can_schedule:
-                        continue
-                    if (
-                        source_sync_is_due()
-                        and not active_job("sync")
-                        and not active_job("sync_due")
-                    ):
-                        enqueue_job("sync_due", dedupe=True)
-                    if check_enrichment_retries:
-                        _queue_due_enrichment_retries()
+                await asyncio.to_thread(
+                    _poll_source_schedule_for_profile,
+                    profile_id,
+                    check_enrichment_retries,
+                )
             except (ProfileDeletedError, RestoreEpochError):
                 continue
             except Exception:
@@ -618,6 +640,19 @@ async def source_scheduler_loop(stop):
             pass
 
 
+def _poll_digest_schedule_for_profile(profile_id: str) -> None:
+    with profile_scope(profile_id):
+        lock = database_lock()
+        with lock.scheduler_guard() as can_schedule, bind_request_restore_epoch():
+            if not can_schedule or has_restore_journal():
+                return
+            with lock.try_shared() as acquired:
+                if not acquired:
+                    return
+                if digest_is_due(private_settings()) and not active_job("digest"):
+                    enqueue_job("digest", dedupe=True)
+
+
 async def digest_scheduler_loop(stop):
     """Queue the configured weekly digest without relying on host cron."""
 
@@ -626,13 +661,16 @@ async def digest_scheduler_loop(stop):
     except TimeoutError:
         pass
     while not stop.is_set():
-        for profile_id in identity_store.profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(identity_store.profile_ids)
+        except Exception:
+            LOGGER.exception("Digest scheduler could not enumerate profiles")
+            active_profiles = []
+        for profile_id in active_profiles:
+            if stop.is_set():
+                break
             try:
-                with profile_scope(profile_id), database_lock().scheduler_guard() as can_schedule, bind_request_restore_epoch():
-                    if not can_schedule:
-                        continue
-                    if digest_is_due(private_settings()) and not active_job("digest"):
-                        enqueue_job("digest", dedupe=True)
+                await asyncio.to_thread(_poll_digest_schedule_for_profile, profile_id)
             except (ProfileDeletedError, RestoreEpochError):
                 continue
             except Exception:
@@ -694,6 +732,18 @@ def queue_goodreads_rss_if_due(current_time=None):
         return job_id
 
 
+def _poll_goodreads_rss_schedule_for_profile(profile_id: str) -> None:
+    with profile_scope(profile_id):
+        lock = database_lock()
+        with lock.scheduler_guard() as can_schedule, bind_request_restore_epoch():
+            if not can_schedule or has_restore_journal():
+                return
+            with lock.try_shared() as acquired:
+                if not acquired:
+                    return
+                queue_goodreads_rss_if_due()
+
+
 async def goodreads_rss_scheduler_loop(stop):
     """Queue the configured Goodreads feed each night without host cron."""
 
@@ -702,10 +752,18 @@ async def goodreads_rss_scheduler_loop(stop):
     except TimeoutError:
         pass
     while not stop.is_set():
-        for profile_id in identity_store.profile_ids():
+        try:
+            active_profiles = await asyncio.to_thread(identity_store.profile_ids)
+        except Exception:
+            LOGGER.exception("Goodreads RSS scheduler could not enumerate profiles")
+            active_profiles = []
+        for profile_id in active_profiles:
+            if stop.is_set():
+                break
             try:
-                with profile_scope(profile_id):
-                    queue_goodreads_rss_if_due()
+                await asyncio.to_thread(
+                    _poll_goodreads_rss_schedule_for_profile, profile_id
+                )
             except (ProfileDeletedError, RestoreEpochError):
                 continue
             except Exception:
@@ -715,32 +773,215 @@ async def goodreads_rss_scheduler_loop(stop):
         except TimeoutError:
             pass
 
+
+def _finish_read_work_identities_job(result: dict[str, Any]) -> None:
+    if result["remaining"]:
+        enqueue_followup_job("read_work_identities")
+    if result["matched"]:
+        enqueue_job("read_metadata", dedupe=True)
+
+
+def _rated_publication_years() -> dict[int, tuple[Any, Any]]:
+    from .publication_year_metadata import attach_publication_years
+
+    rated = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
+    with connect() as con:
+        attach_publication_years(con, rated, [])
+    return {
+        item["id"]: (
+            item.get("first_publication_year"),
+            item.get("publication_work_id"),
+        )
+        for item in rated
+    }
+
+
+def _finish_read_metadata_job(
+    before_years: dict[int, tuple[Any, Any]],
+    has_remaining: bool,
+) -> str | None:
+    if has_remaining:
+        enqueue_followup_job("read_metadata")
+    if _rated_publication_years() != before_years:
+        return enqueue_job("score", dedupe=True)
+    return None
+
+
+def _load_association_job_inputs() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return safe_association_settings(), rows("SELECT * FROM reads ORDER BY id")
+
+
+def _enqueue_post_audit_jobs(*, check_followup: bool = True) -> None:
+    if check_followup:
+        _enqueue_candidate_quality_followup()
+    enqueue_job("read_work_identities", dedupe=True)
+
+
+def _prune_stale_embeddings(backend: str, model: str) -> None:
+    with transaction() as con:
+        con.execute(
+            "DELETE FROM embeddings WHERE backend != ? OR model != ?",
+            (backend, model),
+        )
+
+
+def _finish_candidate_metadata_job(has_metadata: bool) -> tuple[int, str | None]:
+    remaining = candidate_metadata_refresh_remaining()
+    score_job_id = enqueue_job("score", dedupe=True) if has_metadata else None
+    if remaining:
+        enqueue_followup_job("metadata")
+    return remaining, score_job_id
+
+
+def _enqueue_metadata_if_remaining() -> None:
+    if candidate_metadata_refresh_remaining():
+        enqueue_job("metadata", dedupe=True)
+
+
+def _finish_candidate_quality_batch_job(
+    quality: dict[str, Any],
+    *,
+    mode: str,
+    started_at: str,
+) -> dict[str, Any]:
+    stopped = bool(quality.get("stopped"))
+    remaining = finish_candidate_quality_batch(
+        mode=mode,
+        started_at=started_at,
+        stopped=stopped,
+    )
+    changed = bool(
+        quality.get("status_changed")
+        or quality.get("deduped")
+        or quality.get("enriched")
+    )
+    is_final_batch = remaining == 0 and not stopped
+    score_job_id = (
+        enqueue_followup_job("score")
+        if (changed or is_final_batch)
+        else None
+    )
+    followup_job_id = (
+        enqueue_followup_job("candidate_quality")
+        if remaining > 0
+        else None
+    )
+    if quality.get("audited") or is_final_batch:
+        enqueue_job("read_work_identities", dedupe=True)
+    return {
+        **quality,
+        "mode": mode,
+        "remaining": remaining,
+        "followup_job_id": followup_job_id,
+        "score_job_id": score_job_id,
+    }
+
+
+def _prepare_candidate_quality_recovery_job() -> tuple[str, float, str]:
+    profile_key = current_profile_id()
+    now_ts = _recovery_clock()
+    started = _get_quality_recovery_setting_float(
+        QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY
+    )
+    max_chain_age = (
+        QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS + ENRICHMENT_RETRY_POLL_SECONDS
+    )
+    if started is None or started > now_ts or (now_ts - started) > max_chain_age:
+        started = now_ts
+        _set_quality_recovery_settings(
+            **{
+                QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: f"{started:.6f}",
+                QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+            }
+        )
+    retry_cutoff = private_setting(QUALITY_RETRY_QUARANTINED_BEFORE_KEY, "").strip()
+    return profile_key, started, retry_cutoff
+
+
+def _finish_candidate_quality_recovery_job(
+    profile_key: str,
+    started: float,
+    quality: dict[str, Any],
+) -> tuple[bool, str | None]:
+    after_ts = _recovery_clock()
+    followup_deferred = False
+    followup_job_id = None
+    if _has_due_quality_recovery():
+        if (after_ts - started) < QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS:
+            followup_job_id = _enqueue_candidate_quality_followup()
+        else:
+            _set_quality_recovery_settings(
+                **{
+                    QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
+                    QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: f"{after_ts + ENRICHMENT_RETRY_POLL_SECONDS:.6f}",
+                }
+            )
+            followup_deferred = True
+            LOGGER.info(
+                "Deferring remaining candidate quality recovery for profile %s after %.1fs continuous window",
+                profile_key,
+                QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS,
+            )
+    else:
+        _set_quality_recovery_settings(
+            **{
+                QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
+                QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+                QUALITY_RETRY_QUARANTINED_BEFORE_KEY: "",
+            }
+        )
+    if quality.get("audited", 0) > 0:
+        enqueue_job("read_work_identities", dedupe=True)
+    pool_changed = bool(
+        quality.get("rejected", 0) > 0
+        or quality.get("deduped", 0) > 0
+        or quality.get("enriched", 0) > 0
+    )
+    if not (followup_job_id is None and quality.get("audited", 0) > 0) and pool_changed:
+        enqueue_job("score", dedupe=True)
+    return followup_deferred, followup_job_id
+
+
+def _load_source_job_context(
+    source_id: int, kind: str
+) -> tuple[dict[str, Any] | None, int, set[str]]:
+    source = row("SELECT * FROM sources WHERE id=?", (source_id,))
+    if not source:
+        return None, 0, set()
+    started_generation = _source_scan_generation(source_id)
+    queued_before = {
+        item["id"]
+        for item in rows(
+            "SELECT id FROM jobs WHERE kind=? AND status='queued'",
+            (kind,),
+        )
+    }
+    return source, started_generation, queued_before
+
+
+def _record_source_scan_error(source_id: int, message: str) -> None:
+    with transaction() as con:
+        con.execute(
+            "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
+            (f"error:{message}", source_id),
+        )
+
+
 @fenced_async
 async def handle_job(kind: str):
-    config = private_settings()
+    config = await asyncio.to_thread(private_settings)
     if kind == "read_work_identities":
         result = await refresh_read_work_identities()
-        if result["remaining"]:
-            enqueue_followup_job("read_work_identities")
-        if result["matched"]:
-            enqueue_job("read_metadata", dedupe=True)
+        if result["remaining"] or result["matched"]:
+            await asyncio.to_thread(_finish_read_work_identities_job, result)
         return result
     if kind == "read_metadata":
-        from .publication_year_metadata import attach_publication_years
-
-        def rated_publication_years():
-            rated = rows("SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id")
-            with connect() as con:
-                attach_publication_years(con, rated, [])
-            return {item["id"]: (item.get("first_publication_year"), item.get("publication_work_id")) for item in rated}
-
-        before_years = rated_publication_years()
+        before_years = await asyncio.to_thread(_rated_publication_years)
         result = await refresh_read_metadata()
-        if result["remaining"]:
-            enqueue_followup_job("read_metadata")
-        score_job_id = (
-            enqueue_job("score", dedupe=True)
-            if rated_publication_years() != before_years else None
+        score_job_id = await asyncio.to_thread(
+            _finish_read_metadata_job,
+            before_years,
+            bool(result["remaining"]),
         )
         return {**result, "score_job_id": score_job_id}
     if kind == "digest":
@@ -750,7 +991,9 @@ async def handle_job(kind: str):
         if not url:
             return {"skipped": "not_configured"}
         result = await _sync_goodreads_rss(url)
-        result["job_id"] = enqueue_job("score", dedupe=True)
+        result["job_id"] = await asyncio.to_thread(
+            lambda: enqueue_job("score", dedupe=True)
+        )
         return result
     if kind in {"digest:manual", "digest:force"}:
         # Manual runs bypass the time window through the job kind; the same
@@ -764,8 +1007,7 @@ async def handle_job(kind: str):
         return await retry_delivery(delivery_id, config)
     if kind.startswith("association:"):
         provider_name = kind.partition(":")[2]
-        provider_settings = safe_association_settings()
-        reads = rows("SELECT * FROM reads ORDER BY id")
+        provider_settings, reads = await asyncio.to_thread(_load_association_job_inputs)
         if provider_name == "openlibrary":
             if not provider_settings["openlibrary_enabled"]:
                 return {"skipped": "disabled", "provider": provider_name}
@@ -789,8 +1031,7 @@ async def handle_job(kind: str):
         else:
             raise ValueError("Unknown association provider")
         quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
-        _enqueue_candidate_quality_followup()
-        enqueue_job("read_work_identities", dedupe=True)
+        await asyncio.to_thread(_enqueue_post_audit_jobs)
         return {
             "run_id": result.id,
             "provider": result.provider,
@@ -805,74 +1046,38 @@ async def handle_job(kind: str):
         # set first, then remove incompatible vectors only after success so an
         # unavailable remote provider cannot erase the previous cache.
         result = await rebuild_all_embeddings(config.get("embedding_backend"), config.get("embedding_model"), config.get("embedding_url"), config.get("embedding_api_key"))
-        with transaction() as con:
-            con.execute(
-                "DELETE FROM embeddings WHERE backend != ? OR model != ?",
-                (result["backend"], result["model"]),
-            )
+        await asyncio.to_thread(
+            _prune_stale_embeddings, result["backend"], result["model"]
+        )
         return {"embeddings": result["embeddings"], "scored": result["scored"]}
     if kind == "score":
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
-        return {"scored": scored, "digest_job_id": queue_digest_if_due()}
+        digest_job_id = await asyncio.to_thread(queue_digest_if_due)
+        return {"scored": scored, "digest_job_id": digest_job_id}
     if kind == "metadata":
         metadata = await refresh_missing_candidate_metadata()
-        remaining = candidate_metadata_refresh_remaining()
-        score_job_id = enqueue_job("score", dedupe=True) if metadata else None
-        if remaining:
-            enqueue_followup_job("metadata")
+        remaining, score_job_id = await asyncio.to_thread(
+            _finish_candidate_metadata_job, bool(metadata)
+        )
         return {"metadata": metadata, "remaining": remaining, "score_job_id": score_job_id}
     if kind == "candidate_quality":
-        mode, started_at = prepare_candidate_quality_batch()
+        mode, started_at = await asyncio.to_thread(prepare_candidate_quality_batch)
         quality = await audit_candidates(
             only_pending=(mode != "full"),
             limit=QUALITY_AUDIT_BATCH_SIZE,
             audited_before=started_at,
         )
-        stopped = bool(quality.get("stopped"))
-        remaining = finish_candidate_quality_batch(
-            mode=mode,
-            started_at=started_at,
-            stopped=stopped,
-        )
-        changed = bool(
-            quality.get("status_changed")
-            or quality.get("deduped")
-            or quality.get("enriched")
-        )
-        is_final_batch = remaining == 0 and not stopped
-        score_job_id = (
-            enqueue_followup_job("score")
-            if (changed or is_final_batch)
-            else None
-        )
-        followup_job_id = (
-            enqueue_followup_job("candidate_quality")
-            if remaining > 0
-            else None
-        )
-        if quality.get("audited") or is_final_batch:
-            enqueue_job("read_work_identities", dedupe=True)
-        return {
-            **quality,
-            "mode": mode,
-            "remaining": remaining,
-            "followup_job_id": followup_job_id,
-            "score_job_id": score_job_id,
-        }
-    if kind == "candidate_quality_recovery":
-        profile_key = current_profile_id()
-        now_ts = _recovery_clock()
-        started = _get_quality_recovery_setting_float(QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY)
-        max_chain_age = QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS + ENRICHMENT_RETRY_POLL_SECONDS
-        if started is None or started > now_ts or (now_ts - started) > max_chain_age:
-            started = now_ts
-            _set_quality_recovery_settings(
-                **{
-                    QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: f"{started:.6f}",
-                    QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
-                }
+        return await asyncio.to_thread(
+            lambda: _finish_candidate_quality_batch_job(
+                quality,
+                mode=mode,
+                started_at=started_at,
             )
-        retry_cutoff = private_setting(QUALITY_RETRY_QUARANTINED_BEFORE_KEY, "").strip()
+        )
+    if kind == "candidate_quality_recovery":
+        profile_key, started, retry_cutoff = await asyncio.to_thread(
+            _prepare_candidate_quality_recovery_job
+        )
         if retry_cutoff:
             quality = await audit_candidates(
                 only_pending=True,
@@ -882,39 +1087,11 @@ async def handle_job(kind: str):
             )
         else:
             quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
-        after_ts = _recovery_clock()
-        followup_deferred = False
-        followup_job_id = None
-        if _has_due_quality_recovery():
-            if (after_ts - started) < QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS:
-                followup_job_id = _enqueue_candidate_quality_followup()
-            else:
-                _set_quality_recovery_settings(
-                    **{
-                        QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
-                        QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: f"{after_ts + ENRICHMENT_RETRY_POLL_SECONDS:.6f}",
-                    }
-                )
-                followup_deferred = True
-                LOGGER.info(
-                    "Deferring remaining candidate quality recovery for profile %s after %.1fs continuous window",
-                    profile_key,
-                    QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS,
-                )
-        else:
-            _set_quality_recovery_settings(
-                **{
-                    QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY: "",
-                    QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
-                    QUALITY_RETRY_QUARANTINED_BEFORE_KEY: "",
-                }
-            )
-        if quality.get("audited", 0) > 0:
-            enqueue_job("read_work_identities", dedupe=True)
-        pool_changed = bool(
-            quality.get("rejected", 0) > 0
-            or quality.get("deduped", 0) > 0
-            or quality.get("enriched", 0) > 0
+        followup_deferred, followup_job_id = await asyncio.to_thread(
+            _finish_candidate_quality_recovery_job,
+            profile_key,
+            started,
+            quality,
         )
         if followup_job_id is None and quality.get("audited", 0) > 0:
             scored = await score_all(
@@ -925,15 +1102,15 @@ async def handle_job(kind: str):
             )
         else:
             scored = 0
-            if pool_changed:
-                enqueue_job("score", dedupe=True)
         return {**quality, "scored": scored, "followup_deferred": followup_deferred}
     if kind.startswith("source:"):
         try:
             source_id = int(kind.partition(":")[2])
         except ValueError as exc:
             raise ValueError("Invalid source job") from exc
-        source = row("SELECT * FROM sources WHERE id=?", (source_id,))
+        source, started_generation, queued_before = await asyncio.to_thread(
+            _load_source_job_context, source_id, kind
+        )
         if not source or source["kind"] == "builtin":
             raise ValueError("Source not found")
         if source["kind"] == "association":
@@ -947,14 +1124,6 @@ async def handle_job(kind: str):
         started_filters = normalize_source_filters(source.get("filters"))
         started_last_scanned_at = source["last_scanned_at"]
         started_last_attempted_at = source.get("last_attempted_at")
-        started_generation = _source_scan_generation(source_id)
-        queued_before = {
-            item["id"]
-            for item in rows(
-                "SELECT id FROM jobs WHERE kind=? AND status='queued'",
-                (kind,),
-            )
-        }
 
         def _concurrent_source_state():
             current = row("SELECT * FROM sources WHERE id=?", (source_id,))
@@ -993,18 +1162,13 @@ async def handle_job(kind: str):
                 or reset_during_run,
             )
 
-        try:
-            collected = await scan_source(source)
-        except RestoreEpochError:
-            raise
-        except Exception as exc:
-            message = safe_error_message(exc)
+        def _reconcile_failed_source_scan(error_message: str) -> None:
             current, url_changed, needs_rescan = _concurrent_source_state()
             with transaction() as con:
                 if not url_changed:
                     con.execute(
                         "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (f"error:{message}", source_id),
+                        (f"error:{error_message}", source_id),
                     )
                     if needs_rescan and current and current["lifecycle"] == "one_time":
                         con.execute(
@@ -1023,46 +1187,56 @@ async def handle_job(kind: str):
                 and current["kind"] not in {"builtin", "association"}
             ):
                 enqueue_followup_job(kind)
+
+        def _reconcile_completed_source_scan() -> None:
+            current, url_changed, needs_rescan = _concurrent_source_state()
+            if needs_rescan and current:
+                with transaction() as con:
+                    if url_changed:
+                        con.execute(
+                            "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL, last_status=NULL WHERE id=?",
+                            (source_id,),
+                        )
+                    elif current["lifecycle"] == "one_time":
+                        con.execute(
+                            "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL WHERE id=?",
+                            (source_id,),
+                        )
+                if current["enabled"] and current["kind"] not in {"builtin", "association"}:
+                    enqueue_followup_job(kind)
+
+        try:
+            collected = await scan_source(source)
+        except RestoreEpochError:
             raise
-        current, url_changed, needs_rescan = _concurrent_source_state()
-        if needs_rescan and current:
-            with transaction() as con:
-                if url_changed:
-                    con.execute(
-                        "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL, last_status=NULL WHERE id=?",
-                        (source_id,),
-                    )
-                elif current["lifecycle"] == "one_time":
-                    con.execute(
-                        "UPDATE sources SET last_scanned_at=NULL, last_attempted_at=NULL WHERE id=?",
-                        (source_id,),
-                    )
-            if current["enabled"] and current["kind"] not in {"builtin", "association"}:
-                enqueue_followup_job(kind)
+        except Exception as exc:
+            message = safe_error_message(exc)
+            await asyncio.to_thread(_reconcile_failed_source_scan, message)
+            raise
+        await asyncio.to_thread(_reconcile_completed_source_scan)
         metadata = await refresh_missing_candidate_metadata()
-        if candidate_metadata_refresh_remaining():
-            enqueue_job("metadata", dedupe=True)
+        await asyncio.to_thread(_enqueue_metadata_if_remaining)
         quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
-        _enqueue_candidate_quality_followup()
-        enqueue_job("read_work_identities", dedupe=True)
+        await asyncio.to_thread(_enqueue_post_audit_jobs)
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
-        digest_job_id = queue_digest_if_due()
+        digest_job_id = await asyncio.to_thread(queue_digest_if_due)
         return {"collected":collected,"metadata":metadata,"quality":quality,"scored":scored,"source_id":source_id,"digest_job_id":digest_job_id}
     if kind in {"sync", "sync_due"}:
         total = 0
         errors = []
         if kind == "sync_due":
-            sources = source_sync_due_sources()
+            sources = await asyncio.to_thread(source_sync_due_sources)
             if not sources:
                 return {"skipped": "not_due", "collected": 0, "errors": []}
         else:
-            sources = rows(
+            sources = await asyncio.to_thread(
+                rows,
                 "SELECT * FROM sources WHERE enabled=1 "
                 "AND kind NOT IN ('builtin','association') "
                 "AND (lifecycle='permanent' OR ("
                 "lifecycle='one_time' AND last_scanned_at IS NULL "
                 "AND NOT (last_attempted_at IS NOT NULL AND COALESCE(last_status,'') IN ('empty:0','filtered:0'))"
-                "))"
+                "))",
             )
         for source in sources:
             try:
@@ -1071,22 +1245,18 @@ async def handle_job(kind: str):
                 raise
             except Exception as exc:
                 message = safe_error_message(exc)
-                with transaction() as con:
-                    con.execute(
-                        "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (f"error:{message}", source["id"]),
-                    )
+                await asyncio.to_thread(
+                    _record_source_scan_error, source["id"], message
+                )
                 errors.append({"id": source["id"], "name": source["name"], "error": message})
         if kind == "sync_due" and len(errors) == len(sources):
             return {"collected": total, "errors": errors, "skipped": "all_sources_failed"}
         metadata = await refresh_missing_candidate_metadata()
-        if candidate_metadata_refresh_remaining():
-            enqueue_job("metadata", dedupe=True)
+        await asyncio.to_thread(_enqueue_metadata_if_remaining)
         quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
-        _enqueue_candidate_quality_followup()
-        enqueue_job("read_work_identities", dedupe=True)
+        await asyncio.to_thread(_enqueue_post_audit_jobs)
         scored = await score_all(config.get("embedding_backend"),config.get("embedding_model"),config.get("embedding_url"),config.get("embedding_api_key"))
-        digest_job_id = queue_digest_if_due()
+        digest_job_id = await asyncio.to_thread(queue_digest_if_due)
         return {"collected":total,"metadata":metadata,"quality":quality,"scored":scored,"errors":errors,"digest_job_id":digest_job_id}
     raise ValueError(f"Unsupported job kind: {kind}")
 
@@ -3207,7 +3377,9 @@ async def _cached_rated_read_vectors(
         arr.setflags(write=False)
         frozen.append(arr)
     stored = tuple(frozen)
-    post_digest = _read_embedding_cache_digest(None, embedder.name, embedder.model)
+    post_digest = await asyncio.to_thread(
+        _read_embedding_cache_digest, None, embedder.name, embedder.model
+    )
     store_key = (tenant_key, (*embedder_base_key, post_digest), reads_state_key)
     _RATED_READ_VECTOR_CACHE[store_key] = stored
     _RATED_READ_VECTOR_CACHE.move_to_end(store_key)
@@ -3216,16 +3388,38 @@ async def _cached_rated_read_vectors(
     return stored
 
 
-@app.get("/api/reading-history/scores")
-async def reading_history_scores(
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(
-        default=READING_HISTORY_SCORE_MAX_LIMIT,
-        ge=1,
-        le=READING_HISTORY_SCORE_MAX_LIMIT,
-    ),
-):
-    """Rank a bounded slice of read books against the current reading profile."""
+def _load_reading_history_rater_inputs(
+    connection: sqlite3.Connection | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    if connection is None:
+        with connect() as owned:
+            return _load_reading_history_rater_inputs(owned)
+    config = private_settings(connection)
+    rated_reads = [
+        dict(item)
+        for item in connection.execute(
+            "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
+        ).fetchall()
+    ]
+    read_embedding_rows = [
+        dict(item)
+        for item in connection.execute(
+            "SELECT backend,model,entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
+            "FROM embeddings WHERE entity_type='read' ORDER BY backend,model,entity_id"
+        ).fetchall()
+    ]
+    return config, rated_reads, read_embedding_rows
+
+
+def _load_reading_history_score_inputs(
+    offset: int, limit: int
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     with connect() as connection:
         items = [dict(item) for item in connection.execute(
             "SELECT id,title,author,rating,read_at,source,created_at FROM reads "
@@ -3233,7 +3427,7 @@ async def reading_history_scores(
             (limit, offset),
         ).fetchall()]
         if not items:
-            return []
+            return [], [], {}, [], []
         candidate_keys = list(dict.fromkeys(
             normalize_key(item["title"], item["author"]) for item in items
         ))
@@ -3251,20 +3445,31 @@ async def reading_history_scores(
             ).fetchall()]
             if candidate_keys else []
         )
-        config = private_settings(connection)
-        rated_reads = [
-            dict(item)
-            for item in connection.execute(
-                "SELECT * FROM reads WHERE rating BETWEEN 1 AND 5 ORDER BY id"
-            ).fetchall()
-        ]
-        read_embedding_rows = [
-            dict(item)
-            for item in connection.execute(
-                "SELECT backend,model,entity_id,dimensions,content_hash,LENGTH(vector) AS byte_length "
-                "FROM embeddings WHERE entity_type='read' ORDER BY backend,model,entity_id"
-            ).fetchall()
-        ]
+        config, rated_reads, read_embedding_rows = _load_reading_history_rater_inputs(
+            connection
+        )
+    return items, existing_candidates, config, rated_reads, read_embedding_rows
+
+
+@app.get("/api/reading-history/scores")
+async def reading_history_scores(
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(
+        default=READING_HISTORY_SCORE_MAX_LIMIT,
+        ge=1,
+        le=READING_HISTORY_SCORE_MAX_LIMIT,
+    ),
+):
+    """Rank a bounded slice of read books against the current reading profile."""
+    (
+        items,
+        existing_candidates,
+        config,
+        rated_reads,
+        read_embedding_rows,
+    ) = await asyncio.to_thread(_load_reading_history_score_inputs, offset, limit)
+    if not items:
+        return []
     candidates_by_identity = {}
     for candidate in existing_candidates:
         key = (str(candidate["title"]).strip().casefold(), str(candidate["author"]).strip().casefold())
@@ -3315,7 +3520,8 @@ async def reading_history_scores(
             persist=False,
             expected_dimensions=_vector_dimensions(read_vectors),
         )
-        ranked = rank_candidates(
+        ranked = await asyncio.to_thread(
+            rank_candidates,
             rated_reads,
             read_vectors,
             virtual_candidates,
@@ -3469,7 +3675,7 @@ def _recommendation_rows(
     )
     projection = _candidate_quality_identity_projection(connection)
     query = (
-        "SELECT c.*,s.name source_name,COALESCE(s.enabled, 0) source_enabled,"
+        f"SELECT c.*,s.name source_name,COALESCE(s.enabled, 0) source_enabled,"
         f"q.metadata_confidence,{projection}{decision_select} "
         "FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
@@ -5243,7 +5449,7 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
             candidate_rows = {
                 int(item["id"]): dict(item)
                 for item in connection.execute(
-                    "SELECT c.*,s.name source_name,COALESCE(s.enabled,1) source_enabled,"
+                    f"SELECT c.*,s.name source_name,COALESCE(s.enabled,1) source_enabled,"
                     f"q.metadata_confidence,{projection} "
                     "FROM candidates c "
                     "JOIN sources s ON s.id=c.source_id "
@@ -5304,12 +5510,12 @@ def retry_digest_delivery(delivery_id: str):
     return {"job_id": enqueue_job(f"notification_retry:{delivery_id}", dedupe=True)}
 
 @app.post("/api/sync")
-async def sync():
-    return {"job_id":enqueue_job("sync", dedupe=True)}
+def sync():
+    return {"job_id": enqueue_job("sync", dedupe=True)}
 
 @app.post("/api/score")
-async def score():
-    return {"job_id":enqueue_job("score", dedupe=True)}
+def score():
+    return {"job_id": enqueue_job("score", dedupe=True)}
 
 def _has_resumable_manual_sweep() -> bool:
     if private_setting(QUALITY_SWEEP_ACTIVE_KEY, "") == "1":
@@ -5317,6 +5523,32 @@ def _has_resumable_manual_sweep() -> bool:
     if active_job("candidate_quality"):
         return True
     return bool(get_candidate_quality_sweep_status().get("can_retry"))
+
+
+def _queue_candidate_audit(
+    *,
+    effective_mode: Literal["incremental", "full"] | None,
+    effective_retry: bool,
+    effective_retry_quarantined: bool,
+) -> dict[str, Any]:
+    if effective_retry_quarantined or (
+        effective_retry and effective_mode is None and not _has_resumable_manual_sweep()
+    ):
+        cutoff = _utc_audit_timestamp()
+        settings_updates = {
+            QUALITY_RETRY_QUARANTINED_BEFORE_KEY: cutoff,
+            QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
+        }
+        if not active_job("candidate_quality_recovery"):
+            settings_updates[QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY] = ""
+        _set_quality_recovery_settings(**settings_updates)
+        return {
+            "job_id": enqueue_job("candidate_quality_recovery", dedupe=True),
+            "mode": "incremental",
+            "retry_quarantined": True,
+            "quarantine_retry_days": CATALOG_QUARANTINE_RETRY_DAYS,
+        }
+    return configure_candidate_quality_sweep(mode=effective_mode, retry=effective_retry)
 
 
 @app.post("/api/candidates/audit")
@@ -5362,32 +5594,21 @@ async def candidate_audit(
             count_only=effective_count_only,
             retry_quarantined=bool(effective_retry or effective_retry_quarantined),
         )
-    if effective_retry_quarantined or (
-        effective_retry and effective_mode is None and not _has_resumable_manual_sweep()
-    ):
-        cutoff = _utc_audit_timestamp()
-        settings_updates = {
-            QUALITY_RETRY_QUARANTINED_BEFORE_KEY: cutoff,
-            QUALITY_RECOVERY_CHAIN_DEFERRED_UNTIL_KEY: "",
-        }
-        if not active_job("candidate_quality_recovery"):
-            settings_updates[QUALITY_RECOVERY_CHAIN_STARTED_AT_KEY] = ""
-        _set_quality_recovery_settings(**settings_updates)
-        return {
-            "job_id": enqueue_job("candidate_quality_recovery", dedupe=True),
-            "mode": "incremental",
-            "retry_quarantined": True,
-            "quarantine_retry_days": CATALOG_QUARANTINE_RETRY_DAYS,
-        }
-    return configure_candidate_quality_sweep(mode=effective_mode, retry=effective_retry)
+    return await asyncio.to_thread(
+        lambda: _queue_candidate_audit(
+            effective_mode=effective_mode,
+            effective_retry=effective_retry,
+            effective_retry_quarantined=effective_retry_quarantined,
+        )
+    )
 
 @app.get("/api/candidates/quality")
 def candidate_quality():
     return quality_summary()
 
 @app.post("/api/embeddings/rebuild")
-async def rebuild_embeddings():
-    return {"job_id":enqueue_job("rebuild_embeddings", dedupe=True)}
+def rebuild_embeddings():
+    return {"job_id": enqueue_job("rebuild_embeddings", dedupe=True)}
 
 @app.get("/api/jobs/{job_id}")
 def job(job_id:str):
@@ -5927,13 +6148,13 @@ async def api_goodreads_rss(payload: UrlIn):
 
 
 @api_v1.post("/sync")
-async def api_sync():
-    return await sync()
+def api_sync():
+    return sync()
 
 
 @api_v1.post("/score")
-async def api_score():
-    return await score()
+def api_score():
+    return score()
 
 
 @api_v1.get("/associations/settings")
