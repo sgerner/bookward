@@ -287,6 +287,45 @@ def _requeue_aborted_job(
         return bool(updated)
 
 
+def _expire_aborted_job(
+    profile_id: str, job_id: str, lease_token: str, epoch: int
+) -> bool:
+    """Release an expired in-flight job without discounting its consumed attempt."""
+
+    from .tenancy import profile_scope
+
+    with profile_scope(profile_id), database_lock().try_shared() as acquired:
+        if not acquired:
+            return False
+        with bind_restore_epoch(epoch), transaction() as con:
+            current_row = con.execute(
+                "SELECT attempts FROM jobs WHERE id=? AND status='running' AND lease_token=?",
+                (job_id, lease_token),
+            ).fetchone()
+            if current_row is None:
+                return False
+            if int(current_row["attempts"] or 0) >= JOB_MAX_ATTEMPTS:
+                updated = con.execute(
+                    "UPDATE jobs SET status='failed',error=?,finished_at=?,"
+                    "heartbeat_at=NULL,lease_token=NULL "
+                    "WHERE id=? AND status='running' AND lease_token=?",
+                    (
+                        "Job lease expired after maximum attempts",
+                        now(),
+                        job_id,
+                        lease_token,
+                    ),
+                ).rowcount
+            else:
+                updated = con.execute(
+                    "UPDATE jobs SET status='queued',started_at=NULL,"
+                    "heartbeat_at=NULL,lease_token=NULL "
+                    "WHERE id=? AND status='running' AND lease_token=?",
+                    (job_id, lease_token),
+                ).rowcount
+        return bool(updated)
+
+
 async def worker_loop(handler, stop):
     from .backups import has_restore_journal
     from .profiles import profile_ids
@@ -361,6 +400,7 @@ async def worker_loop(handler, stop):
                 with profile_scope(profile_id), bind_restore_epoch(epoch):
                     heartbeat_stop = Event()
                     job_aborted = Event()
+                    lease_expired = Event()
                     job_token = _ACTIVE_JOB_CONTEXT.set((job["id"], lease_token, stop))
                     handler_task = asyncio.create_task(handler(job["kind"]))
 
@@ -373,6 +413,10 @@ async def worker_loop(handler, stop):
                             loop.call_soon_threadsafe(handler_task.cancel)
                         except RuntimeError:
                             pass
+
+                    def expire_handler() -> None:
+                        lease_expired.set()
+                        cancel_handler()
 
                     try:
                         with lock.track_worker_job(cancel_handler, loop_thread_id):
@@ -388,6 +432,7 @@ async def worker_loop(handler, stop):
                                 ),
                                 kwargs={
                                     "lease_started_monotonic": lease_started_monotonic,
+                                    "on_lease_expired": expire_handler,
                                 },
                                 name=f"job-heartbeat-{job['id'][:8]}",
                                 daemon=True,
@@ -416,9 +461,14 @@ async def worker_loop(handler, stop):
                                         handler_task, return_exceptions=True
                                     )
                                 reset_profile_ready(profile_id)
+                                release_fn = (
+                                    _expire_aborted_job
+                                    if lease_expired.is_set()
+                                    else _requeue_aborted_job
+                                )
                                 try:
                                     await asyncio.to_thread(
-                                        _requeue_aborted_job,
+                                        release_fn,
                                         profile_id,
                                         job["id"],
                                         lease_token,
@@ -433,7 +483,7 @@ async def worker_loop(handler, stop):
                                         raise
                                 except Exception:
                                     LOGGER.debug(
-                                        "Could not immediately requeue cancelled job %s",
+                                        "Could not immediately release cancelled job %s",
                                         job["id"],
                                         exc_info=True,
                                     )
@@ -505,6 +555,7 @@ def _heartbeat(
     expected_epoch: int | None = None,
     *,
     lease_started_monotonic: float | None = None,
+    on_lease_expired=None,
 ) -> None:
     """Keep a live job leased so another worker cannot mistake it for a crash.
 
@@ -537,8 +588,13 @@ def _heartbeat(
                             "Lease expired for job %s while profile database lock was held; cancelling active handler",
                             job_id,
                         )
-                        if on_lost_lease is not None:
-                            on_lost_lease()
+                        callback = (
+                            on_lease_expired
+                            if on_lease_expired is not None
+                            else on_lost_lease
+                        )
+                        if callback is not None:
+                            callback()
                         return
                     if (
                         last_deferred_log_monotonic is None
@@ -577,8 +633,13 @@ def _heartbeat(
                     "Lease expired for job %s after renewal errors; cancelling active handler",
                     job_id,
                 )
-                if on_lost_lease is not None:
-                    on_lost_lease()
+                callback = (
+                    on_lease_expired
+                    if on_lease_expired is not None
+                    else on_lost_lease
+                )
+                if callback is not None:
+                    callback()
                 return
             LOGGER.exception("Could not renew lease for job %s", job_id)
             wait_seconds = min(

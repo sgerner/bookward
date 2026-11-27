@@ -304,21 +304,30 @@ def list_backups() -> list[dict]:
         if not created_at or not path.is_file():
             continue
         try:
+            stat = path.stat()
             details = {
                 "id": backup_id,
                 "created_at": created_at.isoformat(),
-                "size_bytes": path.stat().st_size,
+                "size_bytes": stat.st_size,
             }
             found.append(
                 (
                     created_at.isoformat(),
-                    path.stat().st_mtime_ns,
+                    stat.st_mtime_ns,
+                    backup_id,
                     details,
                 )
             )
         except OSError:
             continue
-    return [item[2] for item in sorted(found, reverse=True)]
+    return [
+        item[3]
+        for item in sorted(
+            found,
+            key=lambda item: (item[0], item[1], item[2]),
+            reverse=True,
+        )
+    ]
 
 
 def _set_last_error(message: str) -> None:
