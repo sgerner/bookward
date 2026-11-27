@@ -519,6 +519,50 @@ def test_admin_delete_requires_reauth_and_guards_sole_admin_self_delete_and_audi
         )
         assert del_carol.status_code == 200
 
+        # SSO-only accounts confirm with display_name (or DELETE when blank) without leaking oidc: hashes.
+        sso_named = profiles.create_oidc_account(
+            "https://idp.example.test",
+            "sso-admin-del-named",
+            "named@example.test",
+            "SSO Admin Target",
+        )
+        wrong_sso = client.request(
+            "DELETE",
+            f"/admin/accounts/{sso_named['id']}",
+            headers={"x-bookward-session": owner_session},
+            json=_admin_delete_payload("wrong-name", owner_cred),
+        )
+        assert wrong_sso.status_code == 400
+        assert "oidc:" not in wrong_sso.json()["detail"]
+        assert wrong_sso.json()["detail"] == "Type SSO Admin Target to confirm deleting this account"
+
+        del_sso_named = client.request(
+            "DELETE",
+            f"/admin/accounts/{sso_named['id']}",
+            headers={"x-bookward-session": owner_session},
+            json=_admin_delete_payload("SSO Admin Target", owner_cred),
+        )
+        assert del_sso_named.status_code == 200
+        assert del_sso_named.json()["has_local_username"] is False
+        assert del_sso_named.json()["display_name"] == "SSO Admin Target"
+
+        sso_unnamed = profiles.create_oidc_account(
+            "https://idp.example.test",
+            "sso-admin-del-unnamed",
+            "",
+            "",
+        )
+        with profiles.auth_connect() as con:
+            con.execute("UPDATE accounts SET display_name='' WHERE id=?", (sso_unnamed["id"],))
+        del_sso_unnamed = client.request(
+            "DELETE",
+            f"/admin/accounts/{sso_unnamed['id']}",
+            headers={"x-bookward-session": owner_session},
+            json=_admin_delete_payload("DELETE", owner_cred),
+        )
+        assert del_sso_unnamed.status_code == 200
+        assert del_sso_unnamed.json()["has_local_username"] is False
+
         # Promote a second admin: /admin still blocks self-deletion and directs to /account.
         co_admin = profiles.create_account(
             "coadmin", _fake_cred("coadmin-1"), "Co-admin", role="admin"

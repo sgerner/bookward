@@ -881,6 +881,8 @@ def import_csv(content: bytes) -> dict[str, int | str]:
             for name in reader.fieldnames
         ]
     source = _detect_csv_source(reader.fieldnames)
+    shelf_header = "Read Status" if source == "storygraph_csv" else "Exclusive Shelf"
+    has_shelf_column = shelf_header in (reader.fieldnames or [])
     count = 0
     batches: list[tuple[str, list[tuple]]] = []
     try:
@@ -941,16 +943,30 @@ def import_csv(content: bytes) -> dict[str, int | str]:
     except csv.Error as exc:
         raise ValueError("CSV is malformed") from exc
     from .learning import attribute_read_outcomes
+    has_shelf_rows = any(kind == "shelf" for kind, _ in batches)
     with transaction() as con:
         if count > 0:
             purge_demo_reads(con)
+        previous_shelf_rows: list[dict] = []
+        if has_shelf_rows or (has_shelf_column and count == 0):
+            previous_shelf_rows = [
+                dict(row)
+                for row in con.execute(
+                    "SELECT shelf, title, author, additional_authors, isbn, openlibrary_work_id "
+                    "FROM goodreads_shelf_items WHERE source IN ('goodreads_csv', 'legacy')"
+                ).fetchall()
+            ]
+            con.execute(
+                "DELETE FROM goodreads_shelf_items WHERE source IN ('goodreads_csv', 'legacy')"
+            )
         for kind, values in batches:
             if kind == "shelf":
                 con.executemany(
                     "INSERT INTO goodreads_shelf_items("
-                    "shelf, title, author, additional_authors, isbn, added_at"
-                    ") VALUES(?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(shelf, title, author) DO UPDATE SET "
+                    "shelf, source, title, author, additional_authors, isbn, added_at"
+                    ") VALUES(?, 'goodreads_csv', ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(source, title, author) DO UPDATE SET "
+                    "shelf=excluded.shelf, "
                     "additional_authors=COALESCE(NULLIF(excluded.additional_authors, ''), "
                     "goodreads_shelf_items.additional_authors), "
                     "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
@@ -982,6 +998,8 @@ def import_csv(content: bytes) -> dict[str, int | str]:
                 "isbn=COALESCE(excluded.isbn,reads.isbn)",
                 values,
             )
+        if previous_shelf_rows:
+            purge_deleted_shelf_evidence(con, previous_shelf_rows)
         # Importing a history is also the point at which naturally supplied
         # ratings can become outcomes for recommendations shown earlier. Import
         # lazily to keep the ingestion module independent of the telemetry
@@ -1120,17 +1138,9 @@ def _openlibrary_work_from_edition(payload, requested_isbn13: str) -> str:
     return next(iter(work_ids)) if len(work_ids) == 1 else ""
 
 
-async def refresh_read_work_identities(
-    limit: int = READ_WORK_IDENTITY_BATCH_SIZE,
-) -> dict[str, int]:
-    """Cache verified Open Library work IDs for reads that could collide.
-
-    ISBN lookups are limited to reads by an author with an active, accepted
-    Open Library candidate whose title/edition identity does not already match.
-    This keeps requests focused and lets the exact work key, rather than fuzzy
-    title translation, decide whether two rows describe one work.
-    """
-
+def _select_read_work_identity_batch(
+    limit: int,
+) -> tuple[list[tuple[float, dict]], int]:
     reads = rows("SELECT * FROM reads ORDER BY id")
     candidates = rows(
         "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
@@ -1207,6 +1217,32 @@ async def refresh_read_work_identities(
         targets.values(),
         key=lambda item: (-item[0], int(item[1]["id"])),
     )[:batch_size]
+    return batch, len(targets)
+
+
+def _persist_read_work_identity_updates(updates: list[tuple[str, str, int]]) -> None:
+    with transaction() as con:
+        con.executemany(
+            "UPDATE reads SET openlibrary_work_id=?,"
+            "openlibrary_lookup_attempted_at=? WHERE id=?",
+            updates,
+        )
+
+
+async def refresh_read_work_identities(
+    limit: int = READ_WORK_IDENTITY_BATCH_SIZE,
+) -> dict[str, int]:
+    """Cache verified Open Library work IDs for reads that could collide.
+
+    ISBN lookups are limited to reads by an author with an active, accepted
+    Open Library candidate whose title/edition identity does not already match.
+    This keeps requests focused and lets the exact work key, rather than fuzzy
+    title translation, decide whether two rows describe one work.
+    """
+
+    batch, total_targets = await asyncio.to_thread(
+        _select_read_work_identity_batch, limit
+    )
     if not batch:
         return {"checked": 0, "matched": 0, "lookup_failures": 0, "remaining": 0}
 
@@ -1237,17 +1273,12 @@ async def refresh_read_work_identities(
             )
             matched += bool(work_id)
 
-    with transaction() as con:
-        con.executemany(
-            "UPDATE reads SET openlibrary_work_id=?,"
-            "openlibrary_lookup_attempted_at=? WHERE id=?",
-            updates,
-        )
+    await asyncio.to_thread(_persist_read_work_identity_updates, updates)
     return {
         "checked": len(batch),
         "matched": int(matched),
         "lookup_failures": lookup_failures,
-        "remaining": max(0, len(targets) - len(batch)),
+        "remaining": max(0, total_targets - len(batch)),
     }
 
 
@@ -1749,11 +1780,7 @@ def _read_metadata_provenance_for_storage(existing, attempt, fields_added, verif
     return combined
 
 
-async def refresh_read_metadata(
-    limit: int = READ_METADATA_BATCH_SIZE,
-) -> dict[str, int]:
-    """Cache exact-identity public metadata without editing reads or ratings."""
-
+def _load_due_read_metadata_batch(limit: int) -> tuple[list[dict], str]:
     retry_before = datetime.now(timezone.utc) - timedelta(days=READ_METADATA_RETRY_DAYS)
     due = [
         read for read in _read_metadata_rows()
@@ -1762,12 +1789,170 @@ async def refresh_read_metadata(
     batch_size = max(1, min(int(limit), READ_METADATA_BATCH_SIZE))
     batch = due[:batch_size]
     if not batch:
+        return [], ""
+    google_books_api_key = private_setting("association_google_books_api_key", "").strip()
+    return batch, google_books_api_key
+
+
+def _persist_read_metadata_attempt(
+    read_id: int,
+    identity_hash: str,
+    work_id: str,
+    metadata: dict,
+    identity_evidence: dict,
+    verified_work_id: str,
+    identity_provider: str,
+    identity_provider_id: str,
+    metadata_provenance: dict,
+    description: str,
+    description_kind: str,
+    genres: list[str],
+    cover_url: str,
+    release_date: str,
+    date_kind: str,
+    checked_timestamp: str,
+) -> int:
+    with transaction() as con:
+        current = con.execute("SELECT * FROM reads WHERE id=?", (read_id,)).fetchone()
+        if current is None or read_metadata_identity_hash(dict(current)) != identity_hash:
+            # A title, author, or ISBN edit landed while fetching.
+            return 0
+        if book_openlibrary_work_id(dict(current)) != work_id:
+            # Do not attach work-specific metadata after identity
+            # verification changed in another job.
+            return 0
+        existing = con.execute("SELECT * FROM read_metadata WHERE read_id=?", (read_id,)).fetchone()
+        if existing and existing["identity_hash"] != identity_hash:
+            con.execute(
+                "DELETE FROM metadata_field_provenance WHERE entity_type='read' AND entity_id=?",
+                (read_id,),
+            )
+            con.execute("DELETE FROM read_metadata WHERE read_id=?", (read_id,))
+            existing = None
+
+        previous_genres = normalize_subjects(existing["genres"] if existing else [], limit=METADATA_GENRE_LIMIT)
+        merged_genres = normalize_subjects(previous_genres + genres, limit=METADATA_GENRE_LIMIT)
+        previous_description = existing["description"] if existing else ""
+        previous_cover = existing["cover_url"] if existing else ""
+        previous_release = existing["release_date"] if existing else ""
+        description_upgrade = _read_description_upgrade_allowed(
+            con,
+            read_id,
+            existing,
+            metadata,
+            description,
+            description_kind,
+        )
+        new_description = (
+            description
+            if not previous_description or description_upgrade
+            else previous_description
+        )
+        new_description_kind = (
+            description_kind
+            if not previous_description or description_upgrade
+            else existing["description_kind"]
+        )
+        new_cover = cover_url if cover_url and (not previous_cover or is_weak_cover_url(previous_cover)) else previous_cover
+        new_release = previous_release or release_date
+        new_date_kind = existing["date_kind"] if existing and previous_release else date_kind
+        fields_added = {
+            "description": bool(description and (not previous_description or description_upgrade)),
+            "genres": merged_genres != previous_genres,
+            "cover_url": bool(new_cover and new_cover != previous_cover),
+            "release_date": bool(release_date and not previous_release),
+        }
+        try:
+            existing_identity_evidence = json.loads(existing["identity_evidence"] or "{}") if existing else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            existing_identity_evidence = {}
+        preserve_identity = bool(
+            existing
+            and not identity_evidence
+            and existing["identity_provider"]
+            and existing["identity_provider_id"]
+            and isinstance(existing_identity_evidence, dict)
+            and existing_identity_evidence
+        )
+        stored_identity_provider = (
+            identity_provider if identity_evidence else str(existing["identity_provider"] or "") if preserve_identity else ""
+        )
+        stored_identity_provider_id = (
+            identity_provider_id if identity_evidence else str(existing["identity_provider_id"] or "") if preserve_identity else ""
+        )
+        stored_verified_work_id = (
+            verified_work_id if identity_evidence else str(existing["verified_work_id"] or "") if preserve_identity else ""
+        )
+        stored_identity_evidence = (
+            identity_evidence
+            if identity_evidence
+            else existing_identity_evidence if preserve_identity
+            else {}
+        )
+        stored_provenance = _read_metadata_provenance_for_storage(
+            existing,
+            metadata_provenance,
+            fields_added,
+            bool(identity_evidence),
+        )
+        con.execute(
+            """INSERT INTO read_metadata(
+                read_id,verified_work_id,identity_provider,identity_provider_id,
+                identity_evidence,metadata_provenance,identity_hash,
+                description,description_kind,genres,cover_url,release_date,
+                date_kind,metadata_checked_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(read_id) DO UPDATE SET
+                verified_work_id=excluded.verified_work_id,
+                identity_provider=excluded.identity_provider,
+                identity_provider_id=excluded.identity_provider_id,
+                identity_evidence=excluded.identity_evidence,
+                metadata_provenance=excluded.metadata_provenance,
+                identity_hash=excluded.identity_hash,
+                description=excluded.description,description_kind=excluded.description_kind,
+                genres=excluded.genres,cover_url=excluded.cover_url,
+                release_date=excluded.release_date,date_kind=excluded.date_kind,
+                metadata_checked_at=excluded.metadata_checked_at""",
+            (
+                read_id, stored_verified_work_id, stored_identity_provider, stored_identity_provider_id,
+                json.dumps(stored_identity_evidence, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(stored_provenance, ensure_ascii=False, separators=(",", ":")),
+                identity_hash, new_description, new_description_kind,
+                json.dumps(merged_genres, ensure_ascii=False, separators=(",", ":")),
+                new_cover, new_release, new_date_kind, checked_timestamp,
+            ),
+        )
+        provenance_item = dict(metadata)
+        provenance_item["_metadata_provenance"] = metadata.get("metadata_provenance", {})
+        for field, contributed in fields_added.items():
+            if contributed:
+                _persist_metadata_field_provenance(
+                    con,
+                    "read",
+                    read_id,
+                    field,
+                    provenance_item,
+                    default_provider=identity_provider,
+                    default_provider_id=identity_provider_id,
+                    default_confidence=1.0,
+                )
+        return int(any(fields_added.values()))
+
+
+async def refresh_read_metadata(
+    limit: int = READ_METADATA_BATCH_SIZE,
+) -> dict[str, int]:
+    """Cache exact-identity public metadata without editing reads or ratings."""
+
+    batch, google_books_api_key = await asyncio.to_thread(
+        _load_due_read_metadata_batch, limit
+    )
+    if not batch:
         return {"checked": 0, "updated": 0, "lookup_failures": 0, "remaining": 0}
 
     checked_at = lambda: datetime.now(timezone.utc).isoformat(timespec="microseconds")
     updated = 0
     lookup_failures = 0
-    google_books_api_key = private_setting("association_google_books_api_key", "").strip()
     async with metadata_client() as client:
         for read in batch:
             read_isbn13, read_isbn10 = isbn_parts(read.get("isbn"))
@@ -1857,137 +2042,32 @@ async def refresh_read_metadata(
             release_date = str(metadata.get("release_date") or "")
             date_kind = str(metadata.get("date_kind") or "")
 
-            with transaction() as con:
-                current = con.execute("SELECT * FROM reads WHERE id=?", (read["id"],)).fetchone()
-                if current is None or read_metadata_identity_hash(dict(current)) != identity_hash:
-                    # A title, author, or ISBN edit landed while fetching.
-                    continue
-                if book_openlibrary_work_id(dict(current)) != work_id:
-                    # Do not attach work-specific metadata after identity
-                    # verification changed in another job.
-                    continue
-                existing = con.execute("SELECT * FROM read_metadata WHERE read_id=?", (read["id"],)).fetchone()
-                if existing and existing["identity_hash"] != identity_hash:
-                    con.execute(
-                        "DELETE FROM metadata_field_provenance WHERE entity_type='read' AND entity_id=?",
-                        (read["id"],),
-                    )
-                    con.execute("DELETE FROM read_metadata WHERE read_id=?", (read["id"],))
-                    existing = None
+            updated += await asyncio.to_thread(
+                _persist_read_metadata_attempt,
+                int(read["id"]),
+                identity_hash,
+                work_id,
+                metadata,
+                identity_evidence,
+                verified_work_id,
+                identity_provider,
+                identity_provider_id,
+                metadata_provenance,
+                description,
+                description_kind,
+                genres,
+                cover_url,
+                release_date,
+                date_kind,
+                checked_at(),
+            )
 
-                previous_genres = normalize_subjects(existing["genres"] if existing else [], limit=METADATA_GENRE_LIMIT)
-                merged_genres = normalize_subjects(previous_genres + genres, limit=METADATA_GENRE_LIMIT)
-                previous_description = existing["description"] if existing else ""
-                previous_cover = existing["cover_url"] if existing else ""
-                previous_release = existing["release_date"] if existing else ""
-                description_upgrade = _read_description_upgrade_allowed(
-                    con,
-                    int(read["id"]),
-                    existing,
-                    metadata,
-                    description,
-                    description_kind,
-                )
-                new_description = (
-                    description
-                    if not previous_description or description_upgrade
-                    else previous_description
-                )
-                new_description_kind = (
-                    description_kind
-                    if not previous_description or description_upgrade
-                    else existing["description_kind"]
-                )
-                new_cover = cover_url if cover_url and (not previous_cover or is_weak_cover_url(previous_cover)) else previous_cover
-                new_release = previous_release or release_date
-                new_date_kind = existing["date_kind"] if existing and previous_release else date_kind
-                fields_added = {
-                    "description": bool(description and (not previous_description or description_upgrade)),
-                    "genres": merged_genres != previous_genres,
-                    "cover_url": bool(new_cover and new_cover != previous_cover),
-                    "release_date": bool(release_date and not previous_release),
-                }
-                try:
-                    existing_identity_evidence = json.loads(existing["identity_evidence"] or "{}") if existing else {}
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    existing_identity_evidence = {}
-                preserve_identity = bool(
-                    existing
-                    and not identity_evidence
-                    and existing["identity_provider"]
-                    and existing["identity_provider_id"]
-                    and isinstance(existing_identity_evidence, dict)
-                    and existing_identity_evidence
-                )
-                stored_identity_provider = (
-                    identity_provider if identity_evidence else str(existing["identity_provider"] or "") if preserve_identity else ""
-                )
-                stored_identity_provider_id = (
-                    identity_provider_id if identity_evidence else str(existing["identity_provider_id"] or "") if preserve_identity else ""
-                )
-                stored_verified_work_id = (
-                    verified_work_id if identity_evidence else str(existing["verified_work_id"] or "") if preserve_identity else ""
-                )
-                stored_identity_evidence = (
-                    identity_evidence
-                    if identity_evidence
-                    else existing_identity_evidence if preserve_identity
-                    else {}
-                )
-                metadata_provenance = _read_metadata_provenance_for_storage(
-                    existing,
-                    metadata_provenance,
-                    fields_added,
-                    bool(identity_evidence),
-                )
-                con.execute(
-                    """INSERT INTO read_metadata(
-                        read_id,verified_work_id,identity_provider,identity_provider_id,
-                        identity_evidence,metadata_provenance,identity_hash,
-                        description,description_kind,genres,cover_url,release_date,
-                        date_kind,metadata_checked_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(read_id) DO UPDATE SET
-                        verified_work_id=excluded.verified_work_id,
-                        identity_provider=excluded.identity_provider,
-                        identity_provider_id=excluded.identity_provider_id,
-                        identity_evidence=excluded.identity_evidence,
-                        metadata_provenance=excluded.metadata_provenance,
-                        identity_hash=excluded.identity_hash,
-                        description=excluded.description,description_kind=excluded.description_kind,
-                        genres=excluded.genres,cover_url=excluded.cover_url,
-                        release_date=excluded.release_date,date_kind=excluded.date_kind,
-                        metadata_checked_at=excluded.metadata_checked_at""",
-                    (
-                        read["id"], stored_verified_work_id, stored_identity_provider, stored_identity_provider_id,
-                        json.dumps(stored_identity_evidence, ensure_ascii=False, separators=(",", ":")),
-                        json.dumps(metadata_provenance, ensure_ascii=False, separators=(",", ":")),
-                        identity_hash, new_description, new_description_kind,
-                        json.dumps(merged_genres, ensure_ascii=False, separators=(",", ":")),
-                        new_cover, new_release, new_date_kind, checked_at(),
-                    ),
-                )
-                provenance_item = dict(metadata)
-                provenance_item["_metadata_provenance"] = metadata.get("metadata_provenance", {})
-                for field, contributed in fields_added.items():
-                    if contributed:
-                        _persist_metadata_field_provenance(
-                            con,
-                            "read",
-                            int(read["id"]),
-                            field,
-                            provenance_item,
-                            default_provider=identity_provider,
-                            default_provider_id=identity_provider_id,
-                            default_confidence=1.0,
-                        )
-                updated += int(any(fields_added.values()))
-
+    remaining = await asyncio.to_thread(read_metadata_refresh_remaining)
     return {
         "checked": len(batch),
         "updated": updated,
         "lookup_failures": lookup_failures,
-        "remaining": read_metadata_refresh_remaining(),
+        "remaining": remaining,
     }
 
 async def _fetch_bytes_with_client(
@@ -2270,6 +2350,8 @@ def goodreads_shelf_rss_url(read_rss_url: str, shelf: str) -> str:
 
 DEFAULT_GOODREADS_SHELVES: tuple[str, ...] = ("to-read", "currently-reading")
 GoodreadsShelfRow = tuple[str, str, str, str | None, str | None]
+_PRIVATE_GOODREADS_SHELF = "private_shelf"
+GoodreadsShelfFetchResult = list[GoodreadsShelfRow] | str | None
 
 
 def _parse_goodreads_shelf_rows(shelf: str, content: bytes) -> list[GoodreadsShelfRow]:
@@ -2283,7 +2365,7 @@ def _parse_goodreads_shelf_rows(shelf: str, content: bytes) -> list[GoodreadsShe
         ).strip()[:300]
         if not title:
             continue
-        isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip()[:32] or None
+        isbn = str(entry.get("isbn13") or entry.get("isbn") or "").strip('="')[:32] or None
         shelf_rows.append(
             (
                 shelf,
@@ -2300,10 +2382,15 @@ async def _fetch_goodreads_shelf(
     read_rss_url: str,
     shelf: str,
     client: httpx.AsyncClient,
-) -> list[GoodreadsShelfRow] | None:
+) -> GoodreadsShelfFetchResult:
     try:
         shelf_url = goodreads_shelf_rss_url(read_rss_url, shelf)
         content, _ = await fetch_bytes(shelf_url, allow_goodreads_http=True, client=client)
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 0
+        if status_code in {401, 403, 404, 410}:
+            return _PRIVATE_GOODREADS_SHELF
+        return None
     except Exception:
         return None
     return _parse_goodreads_shelf_rows(shelf, content)
@@ -2313,7 +2400,7 @@ async def _fetch_goodreads_shelves(
     read_rss_url: str,
     shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
     client: httpx.AsyncClient | None = None,
-) -> dict[str, list[GoodreadsShelfRow] | None]:
+) -> dict[str, GoodreadsShelfFetchResult]:
     if not shelves:
         return {}
     if client is None:
@@ -2328,8 +2415,45 @@ async def _fetch_goodreads_shelves(
     return dict(zip(shelves, fetched))
 
 
+def purge_deleted_shelf_evidence(con, previous_rows: list[dict]) -> None:
+    """Purge recommendation evidence for removed shelf rows not remaining on any shelf or in reads."""
+    if not previous_rows:
+        return
+    remaining_keys: set[tuple[str, ...]] = set()
+    for row in con.execute(
+        "SELECT shelf, title, author, additional_authors, isbn, openlibrary_work_id "
+        "FROM goodreads_shelf_items"
+    ).fetchall():
+        remaining_keys.update(book_row_identity_match_keys(dict(row)))
+    removed_rows = [
+        row
+        for row in previous_rows
+        if not set(book_row_identity_match_keys(row)).issubset(remaining_keys)
+    ]
+    if not removed_rows:
+        return
+    read_keys: set[tuple[str, ...]] = set()
+    for row in con.execute(
+        "SELECT title, author, additional_authors, isbn, openlibrary_work_id FROM reads"
+    ).fetchall():
+        read_keys.update(book_row_identity_match_keys(dict(row)))
+    # Intentional: books promoted from shelves into `reads` remain part
+    # of the user's library and retain prior batches/runs so read-outcome
+    # attribution and score provenance stay intact (erased via `read_ids`
+    # if the read row itself is later purged).
+    deleted_shelf_rows = [
+        row
+        for row in removed_rows
+        if not (set(book_row_identity_match_keys(row)) & read_keys)
+    ]
+    if deleted_shelf_rows:
+        from .decision_evidence import purge_recommendation_evidence
+
+        purge_recommendation_evidence(con, shelf_items=deleted_shelf_rows)
+
+
 def _apply_goodreads_shelves(
-    fetched_shelves: dict[str, list[GoodreadsShelfRow] | None],
+    fetched_shelves: dict[str, GoodreadsShelfFetchResult],
     shelves: tuple[str, ...] = DEFAULT_GOODREADS_SHELVES,
 ) -> dict[str, int]:
     imported: dict[str, int] = {}
@@ -2342,63 +2466,37 @@ def _apply_goodreads_shelves(
     if not updated_shelves:
         return imported
 
-    from .identity import book_row_identity_match_keys
-
     with transaction() as con:
         shelf_marks = ",".join("?" for _ in updated_shelves)
         previous_rows = [
             dict(row)
             for row in con.execute(
-                "SELECT shelf, title, author, isbn, openlibrary_work_id "
-                f"FROM goodreads_shelf_items WHERE shelf IN ({shelf_marks})",
+                "SELECT shelf, title, author, additional_authors, isbn, openlibrary_work_id "
+                f"FROM goodreads_shelf_items WHERE source='goodreads_rss' AND shelf IN ({shelf_marks})",
                 updated_shelves,
             ).fetchall()
         ]
         for shelf in updated_shelves:
-            shelf_rows = fetched_shelves[shelf] or []
-            con.execute("DELETE FROM goodreads_shelf_items WHERE shelf=?", (shelf,))
-            con.executemany(
-                "INSERT INTO goodreads_shelf_items(shelf, title, author, isbn, added_at) "
-                "VALUES(?, ?, ?, ?, ?) "
-                "ON CONFLICT(shelf, title, author) DO UPDATE SET "
-                "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
-                "added_at=COALESCE(excluded.added_at, goodreads_shelf_items.added_at), "
-                "updated_at=CURRENT_TIMESTAMP",
-                shelf_rows,
+            raw_rows = fetched_shelves.get(shelf)
+            shelf_rows = raw_rows if isinstance(raw_rows, list) else []
+            con.execute(
+                "DELETE FROM goodreads_shelf_items WHERE shelf=? AND source='goodreads_rss'",
+                (shelf,),
             )
+            if shelf_rows:
+                con.executemany(
+                    "INSERT INTO goodreads_shelf_items(shelf, source, title, author, isbn, added_at) "
+                    "VALUES(?, 'goodreads_rss', ?, ?, ?, ?) "
+                    "ON CONFLICT(source, title, author) DO UPDATE SET "
+                    "shelf=excluded.shelf, "
+                    "isbn=COALESCE(excluded.isbn, goodreads_shelf_items.isbn), "
+                    "added_at=COALESCE(excluded.added_at, goodreads_shelf_items.added_at), "
+                    "updated_at=CURRENT_TIMESTAMP",
+                    shelf_rows,
+                )
             imported[shelf] = len(shelf_rows)
 
-        if previous_rows:
-            remaining_keys: set[tuple[str, ...]] = set()
-            for row in con.execute(
-                "SELECT shelf, title, author, isbn, openlibrary_work_id "
-                "FROM goodreads_shelf_items"
-            ).fetchall():
-                remaining_keys.update(book_row_identity_match_keys(dict(row)))
-            removed_rows = [
-                row
-                for row in previous_rows
-                if not set(book_row_identity_match_keys(row)).issubset(remaining_keys)
-            ]
-            if removed_rows:
-                read_keys: set[tuple[str, ...]] = set()
-                for row in con.execute(
-                    "SELECT title, author, isbn, openlibrary_work_id FROM reads"
-                ).fetchall():
-                    read_keys.update(book_row_identity_match_keys(dict(row)))
-                # Intentional: books promoted from shelves into `reads` remain part
-                # of the user's library and retain prior batches/runs so read-outcome
-                # attribution and score provenance stay intact (erased via `read_ids`
-                # if the read row itself is later purged).
-                deleted_shelf_rows = [
-                    row
-                    for row in removed_rows
-                    if not (set(book_row_identity_match_keys(row)) & read_keys)
-                ]
-                if deleted_shelf_rows:
-                    from .decision_evidence import purge_recommendation_evidence
-
-                    purge_recommendation_evidence(con, shelf_items=deleted_shelf_rows)
+        purge_deleted_shelf_evidence(con, previous_rows)
     return imported
 
 
@@ -2441,10 +2539,11 @@ async def import_goodreads_rss(url: str, client: httpx.AsyncClient | None = None
         # Shelf-to-read promotion intentionally preserves prior scoring batches and
         # serving runs so `attribute_read_outcomes()` can attach outcomes to earlier
         # exposures while the book remains in `reads`.
-        con.executemany(
-            "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
-            ((item[0], item[1]) for item in read_rows),
-        )
+        if read_rows:
+            con.executemany(
+                "DELETE FROM goodreads_shelf_items WHERE title=? AND author=?",
+                ((item[0], item[1]) for item in read_rows),
+            )
         con.executemany(
             "INSERT INTO reads(title,author,rating,read_at,isbn,source) "
             "VALUES(?,?,?,?,?,'goodreads_rss') "
@@ -3133,7 +3232,9 @@ async def enrich_book_metadata(items):
         return []
     semaphore = asyncio.Semaphore(8)
     lookup_cache = {}
-    google_books_api_key = private_setting("association_google_books_api_key", "").strip()
+    google_books_api_key = (
+        await asyncio.to_thread(private_setting, "association_google_books_api_key", "")
+    ).strip()
 
     async with metadata_client() as client:
         async def enrich(item):
@@ -3392,16 +3493,18 @@ async def enrich_penguin_random_house_items(items):
     existing_metadata = {}
     if book_keys:
         placeholders = ",".join("?" for _ in book_keys)
+        existing_rows = await asyncio.to_thread(
+            rows,
+            "SELECT normalized_key,description,cover_url FROM candidates "
+            f"WHERE normalized_key IN ({placeholders})",
+            tuple(book_keys),
+        )
         existing_metadata = {
             record["normalized_key"]: {
                 "description": record.get("description", ""),
                 "cover_url": record.get("cover_url", ""),
             }
-            for record in rows(
-                "SELECT normalized_key,description,cover_url FROM candidates "
-                f"WHERE normalized_key IN ({placeholders})",
-                tuple(book_keys),
-            )
+            for record in existing_rows
         }
     def missing_detail_fields(item):
         existing = existing_metadata.get(
@@ -3728,14 +3831,11 @@ def candidate_metadata_refresh_remaining(
     return int(result["count"] if result else 0)
 
 
-async def refresh_missing_candidate_metadata(*, now: datetime | None = None):
-    """Backfill sparse metadata for catalog-accepted candidates only."""
-
+def _prepare_missing_candidate_metadata_inputs(
+    reference_time: datetime,
+) -> tuple[int, list[dict], list[dict]]:
     normalize_stored_candidate_subjects()
     normalized_catalog_dates = normalize_stored_candidate_catalog_dates()
-    reference_time = now or datetime.now(timezone.utc)
-    if reference_time.tzinfo is None:
-        reference_time = reference_time.replace(tzinfo=timezone.utc)
 
     candidates = rows(
         "SELECT c.id,c.title,c.author,c.description,c.cover_url,c.source_url,c.release_date,c.date_kind,c.genres,"
@@ -3777,7 +3877,7 @@ async def refresh_missing_candidate_metadata(*, now: datetime | None = None):
         ),
     )
     if not candidates:
-        return normalized_catalog_dates
+        return normalized_catalog_dates, [], []
     inputs = []
     for candidate in candidates:
         item = {**candidate, "genres": _stored_genre_values(candidate.get("genres"))}
@@ -3796,7 +3896,14 @@ async def refresh_missing_candidate_metadata(*, now: datetime | None = None):
             item["_expected_provider_id"] = candidate.get("_legacy_metadata_provider_id") or ""
             item["_prefer_catalog_synopsis"] = True
         inputs.append(item)
-    enriched = await enrich_book_metadata(inputs)
+    return normalized_catalog_dates, candidates, inputs
+
+
+def _persist_missing_candidate_metadata(
+    candidates: list[dict],
+    enriched: list[dict],
+    reference_time: datetime,
+) -> int:
     changed = 0
     with transaction() as con:
         for previous, item in zip(candidates, enriched):
@@ -3918,6 +4025,27 @@ async def refresh_missing_candidate_metadata(*, now: datetime | None = None):
                     item["id"],
                 ),
             )
+    return changed
+
+
+async def refresh_missing_candidate_metadata(*, now: datetime | None = None):
+    """Backfill sparse metadata for catalog-accepted candidates only."""
+
+    reference_time = now or datetime.now(timezone.utc)
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
+    normalized_catalog_dates, candidates, inputs = await asyncio.to_thread(
+        _prepare_missing_candidate_metadata_inputs, reference_time
+    )
+    if not candidates:
+        return normalized_catalog_dates
+    enriched = await enrich_book_metadata(inputs)
+    changed = await asyncio.to_thread(
+        _persist_missing_candidate_metadata,
+        candidates,
+        enriched,
+        reference_time,
+    )
     return changed + normalized_catalog_dates
 
 
@@ -4178,6 +4306,108 @@ async def preview_source(url, filters=None):
         "sample": filtered[:5],
     }
 
+def _load_stored_scan_candidates(possible_keys: list[str]) -> dict[str, dict]:
+    stored_candidates = {}
+    for start in range(0, len(possible_keys), 400):
+        key_batch = possible_keys[start : start + 400]
+        if not key_batch:
+            continue
+        placeholders = ",".join("?" for _ in key_batch)
+        for candidate in rows(
+            "SELECT c.normalized_key,c.description,c.cover_url,c.release_date,c.date_kind,c.genres,"
+            "COALESCE(NULLIF(c.isbn13,''),NULLIF(q.isbn13,''),'') AS isbn13,"
+            "COALESCE(NULLIF(c.isbn10,''),NULLIF(q.isbn10,''),'') AS isbn10,"
+            "q.metadata_checked_at,q.metadata_version "
+            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
+            f"WHERE c.normalized_key IN ({placeholders})",
+            tuple(key_batch),
+        ):
+            stored_candidates[candidate["normalized_key"]] = candidate
+    return stored_candidates
+
+
+def _persist_scanned_candidate_chunk(
+    source: dict, chunk_to_persist: list[dict], checked_at: str
+) -> None:
+    with transaction() as con:
+        _persist_scanned_candidate_items(
+            con,
+            source,
+            chunk_to_persist,
+            checked_at=checked_at,
+        )
+
+
+def _finalize_scanned_source_items(
+    source: dict,
+    items: list[dict],
+    remaining_items: list[dict],
+    raw_count: int,
+) -> None:
+    with transaction() as con:
+        _persist_scanned_candidate_items(con, source, remaining_items)
+        seen = [
+            normalize_key(item["title"], item.get("author", "Unknown author"))
+            for item in items
+        ]
+        if seen:
+            unique_seen = list(dict.fromkeys(seen))
+            placeholders = ",".join("?" for _ in unique_seen)
+            stale_ids = [
+                int(item["id"])
+                for item in con.execute(
+                    f"""SELECT c.id FROM candidates c
+                    WHERE (
+                        EXISTS (
+                            SELECT 1 FROM candidate_sources cs
+                            WHERE cs.candidate_id=c.id AND cs.source_id=?
+                        )
+                        OR c.source_id=?
+                    )
+                    AND c.normalized_key NOT IN ({placeholders})""",
+                    (source["id"], source["id"], *unique_seen),
+                ).fetchall()
+            ]
+            if stale_ids:
+                for start in range(0, len(stale_ids), 500):
+                    batch = stale_ids[start : start + 500]
+                    id_marks = ",".join("?" for _ in batch)
+                    con.execute(
+                        f"DELETE FROM candidate_sources WHERE source_id=? AND candidate_id IN ({id_marks})",
+                        (source["id"], *batch),
+                    )
+                    con.execute(
+                        f"""DELETE FROM candidates
+                        WHERE id IN ({id_marks})
+                          AND status IN ('new', 'recommended')
+                          AND NOT EXISTS (
+                              SELECT 1 FROM candidate_sources cs WHERE cs.candidate_id=candidates.id
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM feedback f WHERE f.candidate_id=candidates.id
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM librarr_imports li WHERE li.candidate_id=candidates.id
+                          )""",
+                        batch,
+                    )
+                recompute_candidate_sources(con, stale_ids)
+                demote_orphaned_recommended_candidates(con, stale_ids)
+            con.execute(
+                "UPDATE sources SET last_status=?, last_scanned_at=CURRENT_TIMESTAMP, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
+                (f"ok:{len(items)}", source["id"]),
+            )
+        else:
+            # An empty upstream response or a zero-match filter run must not
+            # delete previously discovered candidates or overwrite the age of
+            # the last good scan.
+            status = "filtered:0" if raw_count else "empty:0"
+            con.execute(
+                "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, source["id"]),
+            )
+
+
 async def scan_source(source):
     _, items = await _fetch_and_parse_source(source["url"])
     raw_count = len(items)
@@ -4216,22 +4446,11 @@ async def scan_source(source):
             for item in possible
         )
     )
-    stored_candidates = {}
-    for start in range(0, len(possible_keys), 400):
-        key_batch = possible_keys[start : start + 400]
-        if not key_batch:
-            continue
-        placeholders = ",".join("?" for _ in key_batch)
-        for candidate in rows(
-            "SELECT c.normalized_key,c.description,c.cover_url,c.release_date,c.date_kind,c.genres,"
-            "COALESCE(NULLIF(c.isbn13,''),NULLIF(q.isbn13,''),'') AS isbn13,"
-            "COALESCE(NULLIF(c.isbn10,''),NULLIF(q.isbn10,''),'') AS isbn10,"
-            "q.metadata_checked_at,q.metadata_version "
-            "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
-            f"WHERE c.normalized_key IN ({placeholders})",
-            tuple(key_batch),
-        ):
-            stored_candidates[candidate["normalized_key"]] = candidate
+    stored_candidates = (
+        await asyncio.to_thread(_load_stored_scan_candidates, possible_keys)
+        if possible_keys
+        else {}
+    )
     due_for_enrichment_ids = set()
     for item_index, item in enumerate(possible):
         item["_scan_enrichment_id"] = item_index
@@ -4351,13 +4570,12 @@ async def scan_source(source):
                 {k: v for k, v in item.items() if k != "_scan_enrichment_id"}
                 for item in chunk_accepted
             ]
-            with transaction() as con:
-                _persist_scanned_candidate_items(
-                    con,
-                    source,
-                    chunk_to_persist,
-                    checked_at=chunk_checked_at,
-                )
+            await asyncio.to_thread(
+                _persist_scanned_candidate_chunk,
+                source,
+                chunk_to_persist,
+                chunk_checked_at,
+            )
 
     merged_items = [
         enriched_by_id.get(item.get("_scan_enrichment_id"), item)
@@ -4372,66 +4590,11 @@ async def scan_source(source):
         item.pop("_scan_enrichment_id", None)
     items = filter_source_items(_clean_parsed_subjects(merged_items), configured_filters)
     remaining_items = filter_source_items(_clean_parsed_subjects(unpersisted_items), configured_filters)
-    with transaction() as con:
-        _persist_scanned_candidate_items(con, source, remaining_items)
-        seen = [
-            normalize_key(item["title"], item.get("author", "Unknown author"))
-            for item in items
-        ]
-        if seen:
-            unique_seen = list(dict.fromkeys(seen))
-            placeholders = ",".join("?" for _ in unique_seen)
-            stale_ids = [
-                int(item["id"])
-                for item in con.execute(
-                    f"""SELECT c.id FROM candidates c
-                    WHERE (
-                        EXISTS (
-                            SELECT 1 FROM candidate_sources cs
-                            WHERE cs.candidate_id=c.id AND cs.source_id=?
-                        )
-                        OR c.source_id=?
-                    )
-                    AND c.normalized_key NOT IN ({placeholders})""",
-                    (source["id"], source["id"], *unique_seen),
-                ).fetchall()
-            ]
-            if stale_ids:
-                for start in range(0, len(stale_ids), 500):
-                    batch = stale_ids[start : start + 500]
-                    id_marks = ",".join("?" for _ in batch)
-                    con.execute(
-                        f"DELETE FROM candidate_sources WHERE source_id=? AND candidate_id IN ({id_marks})",
-                        (source["id"], *batch),
-                    )
-                    con.execute(
-                        f"""DELETE FROM candidates
-                        WHERE id IN ({id_marks})
-                          AND status IN ('new', 'recommended')
-                          AND NOT EXISTS (
-                              SELECT 1 FROM candidate_sources cs WHERE cs.candidate_id=candidates.id
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1 FROM feedback f WHERE f.candidate_id=candidates.id
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1 FROM librarr_imports li WHERE li.candidate_id=candidates.id
-                          )""",
-                        batch,
-                    )
-                recompute_candidate_sources(con, stale_ids)
-                demote_orphaned_recommended_candidates(con, stale_ids)
-            con.execute(
-                "UPDATE sources SET last_status=?, last_scanned_at=CURRENT_TIMESTAMP, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
-                (f"ok:{len(items)}", source["id"]),
-            )
-        else:
-            # An empty upstream response or a zero-match filter run must not
-            # delete previously discovered candidates or overwrite the age of
-            # the last good scan.
-            status = "filtered:0" if raw_count else "empty:0"
-            con.execute(
-                "UPDATE sources SET last_status=?, last_attempted_at=CURRENT_TIMESTAMP WHERE id=?",
-                (status, source["id"]),
-            )
+    await asyncio.to_thread(
+        _finalize_scanned_source_items,
+        source,
+        items,
+        remaining_items,
+        raw_count,
+    )
     return len(items)
