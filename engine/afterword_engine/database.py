@@ -2,6 +2,7 @@ import functools
 import json
 import logging
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -1532,6 +1533,87 @@ MIGRATIONS = [
         DROP TABLE temp._m31_demo_reads;
         """,
     ),
+    (
+        32,
+        """
+        -- DYNAMIC_GOODREADS_SHELF_ITEMS_REBUILD
+        DROP TABLE IF EXISTS goodreads_shelf_items_v2;
+        CREATE TABLE goodreads_shelf_items_v2 (
+            id INTEGER PRIMARY KEY,
+            shelf TEXT NOT NULL CHECK(shelf IN ('to-read', 'currently-reading')),
+            source TEXT NOT NULL DEFAULT 'goodreads_csv' CHECK(source IN ('goodreads_csv', 'goodreads_rss', 'legacy')),
+            title TEXT NOT NULL,
+            author TEXT NOT NULL,
+            isbn TEXT,
+            openlibrary_work_id TEXT,
+            added_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            additional_authors TEXT NOT NULL DEFAULT '',
+            UNIQUE(source, title, author)
+        );
+        INSERT INTO goodreads_shelf_items_v2(
+            shelf, source, title, author, isbn, openlibrary_work_id, added_at, updated_at, additional_authors
+        )
+        SELECT
+            shelf,
+            'legacy',
+            title,
+            author,
+            isbn,
+            openlibrary_work_id,
+            added_at,
+            updated_at,
+            additional_authors
+        FROM (
+            SELECT shelf, title, author, isbn, openlibrary_work_id, added_at, updated_at, additional_authors
+            FROM goodreads_shelf_items
+            ORDER BY updated_at ASC, id ASC
+            LIMIT -1
+        )
+        WHERE 1=1
+        ON CONFLICT(source, title, author) DO UPDATE SET
+            shelf=excluded.shelf,
+            isbn=COALESCE(excluded.isbn, goodreads_shelf_items_v2.isbn),
+            openlibrary_work_id=COALESCE(NULLIF(excluded.openlibrary_work_id, ''), goodreads_shelf_items_v2.openlibrary_work_id),
+            added_at=COALESCE(excluded.added_at, goodreads_shelf_items_v2.added_at),
+            updated_at=excluded.updated_at,
+            additional_authors=COALESCE(NULLIF(excluded.additional_authors, ''), goodreads_shelf_items_v2.additional_authors, excluded.additional_authors);
+        DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf;
+        DROP INDEX IF EXISTS idx_goodreads_shelf_items_source_shelf;
+        DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author;
+        DROP TABLE goodreads_shelf_items;
+        ALTER TABLE goodreads_shelf_items_v2 RENAME TO goodreads_shelf_items;
+        CREATE INDEX idx_goodreads_shelf_items_shelf
+            ON goodreads_shelf_items(shelf, updated_at DESC);
+        CREATE INDEX idx_goodreads_shelf_items_source_shelf
+            ON goodreads_shelf_items(source, shelf);
+        CREATE INDEX idx_goodreads_shelf_items_title_author
+            ON goodreads_shelf_items(title, author);
+        UPDATE candidates
+        SET status='new', score=0, explanation='[]', score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
+        WHERE status='hidden'
+          AND NOT EXISTS (
+              SELECT 1 FROM feedback f
+              WHERE f.candidate_id = candidates.id
+                AND f.undone_at IS NULL
+                AND f.action IN ('reject', 'maybe_later')
+                AND f.id = (
+                    SELECT MAX(f2.id) FROM feedback f2
+                    WHERE f2.candidate_id = candidates.id
+                      AND f2.undone_at IS NULL
+                )
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM recommendation_events e
+              WHERE e.candidate_id = candidates.id
+                AND e.event_type IN ('reject', 'maybe_later')
+                AND e.id = (
+                    SELECT MAX(e2.id) FROM recommendation_events e2
+                    WHERE e2.candidate_id = candidates.id
+                )
+          );
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -1888,7 +1970,7 @@ class _ProfileDatabaseLock:
             self.release_connection(owner)
 
     @contextmanager
-    def try_shared(self):
+    def try_shared(self, *, allow_during_quiesce: bool = False):
         owner = threading.get_ident()
         with self._condition:
             if self._deleted:
@@ -1896,8 +1978,13 @@ class _ProfileDatabaseLock:
             owns_connection = self._connections_by_thread.get(owner, 0) > 0
             if self._closing_for_delete and self._writer != owner and not owns_connection:
                 raise ProfileDeletedError("Profile has been deleted")
+            restoring_blocked = (
+                self._restoring_count > 0
+                and self._writer != owner
+                and not allow_during_quiesce
+            )
             if (
-                (self._restoring_count > 0 and self._writer != owner)
+                restoring_blocked
                 or self._writer not in (None, owner)
                 or (
                     self._waiting_writers
@@ -2387,6 +2474,193 @@ def persist_metadata_field_provenance(
     return written
 
 
+_SQLITE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _quote_sqlite_ident(name: str) -> str:
+    if not _SQLITE_IDENT_RE.fullmatch(name):
+        raise sqlite3.DatabaseError(f"Unsafe SQLite identifier in schema migration: {name!r}")
+    return f'"{name}"'
+
+
+def _rebuild_goodreads_shelf_items_migration(con: sqlite3.Connection) -> None:
+    """Rebuild goodreads_shelf_items with neutral 'legacy' provenance while preserving extra columns."""
+
+    table_info = con.execute("PRAGMA table_info(goodreads_shelf_items)").fetchall()
+    existing_names = {str(col[1]) for col in table_info}
+    core_columns = {
+        "id",
+        "shelf",
+        "source",
+        "title",
+        "author",
+        "isbn",
+        "openlibrary_work_id",
+        "added_at",
+        "updated_at",
+    }
+    extra_cols = [col for col in table_info if str(col[1]) not in core_columns]
+    extra_ddls = []
+    extra_quoted = []
+    extra_conflict_updates = []
+    for col in extra_cols:
+        col_name = str(col[1])
+        col_type = str(col[2] or "").strip()
+        notnull = bool(col[3])
+        dflt_value = col[4]
+        qname = _quote_sqlite_ident(col_name)
+        parts = [qname]
+        if col_type:
+            parts.append(col_type)
+        if notnull:
+            parts.append("NOT NULL")
+        if dflt_value is not None:
+            parts.append(f"DEFAULT {dflt_value}")
+        extra_ddls.append(" ".join(parts))
+        extra_quoted.append(qname)
+        extra_conflict_updates.append(
+            f"{qname}=COALESCE(NULLIF(excluded.{qname}, ''), goodreads_shelf_items_v2.{qname}, excluded.{qname})"
+        )
+
+    canonical_index_names = {
+        "idx_goodreads_shelf_items_shelf",
+        "idx_goodreads_shelf_items_source_shelf",
+        "idx_goodreads_shelf_items_title_author",
+    }
+    extra_index_sqls = [
+        str(idx_row[1])
+        for idx_row in con.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='goodreads_shelf_items' AND sql IS NOT NULL"
+        ).fetchall()
+        if str(idx_row[0]) not in canonical_index_names
+    ]
+
+    extra_ddl_clause = (
+        ",\n            " + ",\n            ".join(extra_ddls) if extra_ddls else ""
+    )
+    con.execute("DROP TABLE IF EXISTS goodreads_shelf_items_v2")
+    con.execute(
+        f"""
+        CREATE TABLE goodreads_shelf_items_v2 (
+            id INTEGER PRIMARY KEY,
+            shelf TEXT NOT NULL CHECK(shelf IN ('to-read', 'currently-reading')),
+            source TEXT NOT NULL DEFAULT 'goodreads_csv' CHECK(source IN ('goodreads_csv', 'goodreads_rss', 'legacy')),
+            title TEXT NOT NULL,
+            author TEXT NOT NULL,
+            isbn TEXT,
+            openlibrary_work_id TEXT,
+            added_at TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP{extra_ddl_clause},
+            UNIQUE(source, title, author)
+        )
+        """
+    )
+
+    has_source = "source" in existing_names
+    inner_cols = ["shelf"]
+    if has_source:
+        inner_cols.append("source")
+    inner_cols.extend(
+        ["title", "author", "isbn", "openlibrary_work_id", "added_at", "updated_at", *extra_quoted]
+    )
+    outer_select_cols = [
+        "shelf",
+        (
+            "CASE WHEN source IN ('goodreads_csv', 'goodreads_rss', 'legacy') THEN source ELSE 'legacy' END"
+            if has_source
+            else "'legacy'"
+        ),
+        "title",
+        "author",
+        "isbn",
+        "openlibrary_work_id",
+        "added_at",
+        "updated_at",
+        *extra_quoted,
+    ]
+    target_cols = [
+        "shelf",
+        "source",
+        "title",
+        "author",
+        "isbn",
+        "openlibrary_work_id",
+        "added_at",
+        "updated_at",
+        *extra_quoted,
+    ]
+    conflict_updates = [
+        "shelf=excluded.shelf",
+        "isbn=COALESCE(excluded.isbn, goodreads_shelf_items_v2.isbn)",
+        "openlibrary_work_id=COALESCE(NULLIF(excluded.openlibrary_work_id, ''), goodreads_shelf_items_v2.openlibrary_work_id)",
+        "added_at=COALESCE(excluded.added_at, goodreads_shelf_items_v2.added_at)",
+        "updated_at=excluded.updated_at",
+        *extra_conflict_updates,
+    ]
+    con.execute(
+        f"""
+        INSERT INTO goodreads_shelf_items_v2({", ".join(target_cols)})
+        SELECT {", ".join(outer_select_cols)}
+        FROM (
+            SELECT {", ".join(inner_cols)}
+            FROM goodreads_shelf_items
+            ORDER BY updated_at ASC, id ASC
+            LIMIT -1
+        )
+        WHERE 1=1
+        ON CONFLICT(source, title, author) DO UPDATE SET
+            {", ".join(conflict_updates)}
+        """
+    )
+    con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_shelf")
+    con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_source_shelf")
+    con.execute("DROP INDEX IF EXISTS idx_goodreads_shelf_items_title_author")
+    con.execute("DROP TABLE goodreads_shelf_items")
+    con.execute("ALTER TABLE goodreads_shelf_items_v2 RENAME TO goodreads_shelf_items")
+    con.execute(
+        "CREATE INDEX idx_goodreads_shelf_items_shelf "
+        "ON goodreads_shelf_items(shelf, updated_at DESC)"
+    )
+    con.execute(
+        "CREATE INDEX idx_goodreads_shelf_items_source_shelf "
+        "ON goodreads_shelf_items(source, shelf)"
+    )
+    con.execute(
+        "CREATE INDEX idx_goodreads_shelf_items_title_author "
+        "ON goodreads_shelf_items(title, author)"
+    )
+    for index_sql in extra_index_sqls:
+        con.execute(index_sql)
+    con.execute(
+        """
+        UPDATE candidates
+        SET status='new', score=0, explanation='[]', score_batch_id=NULL, updated_at=CURRENT_TIMESTAMP
+        WHERE status='hidden'
+          AND NOT EXISTS (
+              SELECT 1 FROM feedback f
+              WHERE f.candidate_id = candidates.id
+                AND f.undone_at IS NULL
+                AND f.action IN ('reject', 'maybe_later')
+                AND f.id = (
+                    SELECT MAX(f2.id) FROM feedback f2
+                    WHERE f2.candidate_id = candidates.id
+                      AND f2.undone_at IS NULL
+                )
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM recommendation_events e
+              WHERE e.candidate_id = candidates.id
+                AND e.event_type IN ('reject', 'maybe_later')
+                AND e.id = (
+                    SELECT MAX(e2.id) FROM recommendation_events e2
+                    WHERE e2.candidate_id = candidates.id
+                )
+          )
+        """
+    )
+
+
 def purge_demo_reads(con: sqlite3.Connection) -> int:
     """Purge synthetic cold-start demo reads, derived evidence, and stale candidate status."""
 
@@ -2568,6 +2842,9 @@ def purge_demo_reads(con: sqlite3.Connection) -> int:
 def _execute_migration_script(con: sqlite3.Connection, script: str) -> None:
     """Execute complete SQL statements on the caller's active transaction."""
 
+    if "-- DYNAMIC_GOODREADS_SHELF_ITEMS_REBUILD" in script:
+        _rebuild_goodreads_shelf_items_migration(con)
+        return
     start = 0
     for index, character in enumerate(script):
         if character == ";" and sqlite3.complete_statement(script[start : index + 1]):
@@ -2580,17 +2857,41 @@ def _execute_migration_script(con: sqlite3.Connection, script: str) -> None:
         con.execute(pending)
 
 
+def _validate_migrations() -> None:
+    versions = [version for version, _ in MIGRATIONS]
+    expected = list(range(1, len(MIGRATIONS) + 1))
+    if versions != expected:
+        raise RuntimeError(
+            f"MIGRATIONS must have unique sequential versions 1..{len(MIGRATIONS)}, got {versions}"
+        )
+
+
 def initialize(*, seed_demo: bool = True):
+    _validate_migrations()
     db_path = profile_database_path()
     if database_lock(db_path).is_deleted:
         raise ProfileDeletedError("Profile has been deleted")
-    was_missing = not has_database_path_override() and (
-        not db_path.is_file() or db_path.stat().st_size == 0
-    )
     db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with connect() as con:
         con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         applied = {item[0] for item in con.execute("SELECT version FROM schema_migrations")}
+        has_surviving_backups = False
+        if not has_database_path_override() and not applied:
+            existing_tables = {
+                item[0]
+                for item in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            has_legacy_rows = any(
+                table in existing_tables
+                and con.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+                for table in ("reads", "candidates", "sources")
+            )
+            if not has_legacy_rows:
+                from . import backups
+
+                has_surviving_backups = bool(backups.list_backups())
         for version, script in MIGRATIONS:
             if version in applied:
                 continue
@@ -2602,6 +2903,24 @@ def initialize(*, seed_demo: bool = True):
                 if already_applied:
                     con.commit()
                     continue
+                if version == 1 and has_surviving_backups:
+                    from . import backups
+
+                    con.execute(
+                        "CREATE TABLE IF NOT EXISTS settings ("
+                        "key TEXT PRIMARY KEY, "
+                        "value TEXT NOT NULL, "
+                        "secret INTEGER NOT NULL DEFAULT 0, "
+                        "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+                        ")"
+                    )
+                    con.execute(
+                        "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
+                        (
+                            backups.RECOVERY_HOLD_KEY,
+                            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        ),
+                    )
                 _execute_migration_script(con, script)
                 con.execute(
                     "INSERT INTO schema_migrations(version) VALUES(?)", (version,)
@@ -2767,15 +3086,6 @@ def initialize(*, seed_demo: bool = True):
             if current and (is_weak_cover_url(current["cover_url"]) or current["cover_url"].startswith("https://placehold.co/")) and not is_weak_cover_url(item.get("cover_url", "")):
                 con.execute("UPDATE candidates SET cover_url=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (fallback_cover_url(item["title"], item["author"], item.get("cover_url", ""), item.get("source_url", "")), current["id"]))
         _backfill_source_isbns(con)
-        if was_missing:
-            from . import backups
-
-            if backups.list_backups():
-                hold_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                con.execute(
-                    "INSERT OR IGNORE INTO settings(key,value,secret) VALUES(?,?,0)",
-                    (backups.RECOVERY_HOLD_KEY, hold_at),
-                )
     _restrict_database_files()
 
 

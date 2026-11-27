@@ -317,6 +317,30 @@ describe('admin page load and actions', () => {
 		assertNoPasswordEcho(result, tempCandidate);
 	});
 
+	it('rejects oidc:-prefixed usernames in create with structured fieldErrors without echoing password', async () => {
+		const tempCandidate = makeLongInput();
+		const body = new FormData();
+		body.set('username', 'oidc:reserved');
+		body.set('display_name', 'Reserved Reader');
+		body.set('password', tempCandidate);
+		body.set('role', 'user');
+		const result = await actions.create!({
+			request: new Request('https://bookward.test/admin', { method: 'POST', body })
+		} as never);
+
+		expect(result).toMatchObject({
+			status: 400,
+			data: {
+				formId: 'create',
+				error: true,
+				fieldErrors: { username: "Usernames cannot start with 'oidc:'." },
+				values: { username: 'oidc:reserved', display_name: 'Reserved Reader', role: 'user' }
+			}
+		});
+		assertNoPasswordEcho(result, tempCandidate);
+		expect(engine).not.toHaveBeenCalled();
+	});
+
 	it('scopes resetPassword validation and engine errors to the submitted account row without echoing password', async () => {
 		const shortCandidate = makeShortInput();
 		const body = new FormData();
@@ -493,6 +517,25 @@ describe('admin page load and actions', () => {
 			formId: 'deleteAccount',
 			message: 'Account alice deleted.'
 		});
+
+		engine.mockResolvedValueOnce({
+			deleted: true,
+			username: 'oidc:deadbeefcafebabe1234567890',
+			has_local_username: false,
+			display_name: 'SSO Reader'
+		});
+		const deletedSso = await actions.deleteAccount!({
+			request: makeRequest({
+				account_id: 'sso-2',
+				confirm_username: 'SSO Reader',
+				current_password: adminCandidate
+			}),
+			locals
+		} as never);
+		expect(deletedSso).toEqual({
+			formId: 'deleteAccount',
+			message: 'Account SSO Reader deleted.'
+		});
 	});
 
 	it('surfaces engine errors when attempting to delete self or sole administrator', async () => {
@@ -616,6 +659,26 @@ describe('admin page load and actions', () => {
 		expect(zeroUnlocked).toEqual({
 			formId: 'unlock-acc-reader',
 			message: 'Sign-in lockouts cleared for reader.'
+		});
+
+		engine.mockResolvedValueOnce({
+			unlocked: true,
+			username: 'oidc:deadbeefcafebabe1234567890',
+			has_local_username: false,
+			display_name: 'SSO Reader',
+			cleared_attempts: 3
+		});
+		const ssoForm = new FormData();
+		ssoForm.set('account_id', 'acc-sso');
+		const ssoUnlocked = await actions.unlock({
+			request: new Request('https://bookward.test/admin?/unlock', {
+				method: 'POST',
+				body: ssoForm
+			})
+		} as never);
+		expect(ssoUnlocked).toEqual({
+			formId: 'unlock-acc-sso',
+			message: 'Unlocked SSO Reader (3 failed sign-in attempts cleared).'
 		});
 	});
 });

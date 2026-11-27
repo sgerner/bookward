@@ -13,6 +13,7 @@ type Account = {
 	id: string;
 	profile_id: string;
 	username: string;
+	has_local_username?: boolean;
 	display_name: string;
 	role: 'admin' | 'user';
 	status: 'active' | 'disabled';
@@ -74,8 +75,19 @@ export const load: PageServerLoad = async ({ locals }) => {
 	const identityBackup = rawIdentityBackup
 		? { ...rawIdentityBackup, recovery_hold: Boolean(rawIdentityBackup.recovery_hold) }
 		: null;
+	const accounts = result.accounts.map((account) => {
+		const hasLocal =
+			typeof account.has_local_username === 'boolean'
+				? account.has_local_username
+				: Boolean(account.username.trim()) && !account.username.trim().toLowerCase().startsWith('oidc:');
+		return {
+			...account,
+			username: hasLocal ? account.username : '',
+			has_local_username: hasLocal
+		};
+	});
 	return {
-		accounts: result.accounts,
+		accounts,
 		current_user_id: locals.user.id,
 		identityBackup,
 		password_enabled: methods.password_enabled
@@ -94,6 +106,8 @@ export const actions: Actions = {
 		const fieldErrors: Record<string, string> = {};
 		if (!username || username.length > 160 || hasControlCharacters(username)) {
 			fieldErrors.username = 'Enter a valid username.';
+		} else if (username.toLowerCase().startsWith('oidc:')) {
+			fieldErrors.username = "Usernames cannot start with 'oidc:'.";
 		}
 		if (display_name.length > 160) {
 			fieldErrors.display_name = 'Use 160 characters or fewer.';
@@ -217,16 +231,28 @@ export const actions: Actions = {
 			});
 		}
 		try {
-			const result = await engine<{ unlocked: boolean; username: string; cleared_attempts: number }>(
-				`/admin/accounts/${encodeURIComponent(account_id)}/unlock`,
-				{ method: 'POST', body: '{}' }
-			);
+			const result = await engine<{
+				unlocked: boolean;
+				username: string;
+				has_local_username?: boolean;
+				display_name?: string;
+				cleared_attempts: number;
+			}>(`/admin/accounts/${encodeURIComponent(account_id)}/unlock`, {
+				method: 'POST',
+				body: '{}'
+			});
+			const hasLocal =
+				typeof result.has_local_username === 'boolean'
+					? result.has_local_username
+					: Boolean(result.username.trim()) &&
+						!result.username.trim().toLowerCase().startsWith('oidc:');
+			const label = hasLocal ? result.username : result.display_name?.trim() || 'SSO-only account';
 			return {
 				formId,
 				message:
 					result.cleared_attempts > 0
-						? `Unlocked ${result.username} (${result.cleared_attempts} failed sign-in attempt${result.cleared_attempts === 1 ? '' : 's'} cleared).`
-						: `Sign-in lockouts cleared for ${result.username}.`
+						? `Unlocked ${label} (${result.cleared_attempts} failed sign-in attempt${result.cleared_attempts === 1 ? '' : 's'} cleared).`
+						: `Sign-in lockouts cleared for ${label}.`
 			};
 		} catch (error) {
 			return failure(formId, error);
@@ -268,7 +294,11 @@ export const actions: Actions = {
 			const deleted = await withRequestContext(
 				{ sessionToken: currentSessionToken(), clientIp },
 				() =>
-					engine<{ username?: string }>(
+					engine<{
+						username?: string;
+						has_local_username?: boolean;
+						display_name?: string;
+					}>(
 						`/admin/accounts/${encodeURIComponent(account_id)}`,
 						{
 							method: 'DELETE',
@@ -280,9 +310,17 @@ export const actions: Actions = {
 						10 * 60_000
 					)
 			);
+			const deletedHasLocal =
+				typeof deleted.has_local_username === 'boolean'
+					? deleted.has_local_username
+					: Boolean(deleted.username?.trim()) &&
+						!deleted.username!.trim().toLowerCase().startsWith('oidc:');
+			const deletedLabel = deletedHasLocal
+				? deleted.username || confirm_username
+				: deleted.display_name?.trim() || 'SSO-only account';
 			return {
 				formId: 'deleteAccount',
-				message: `Account ${deleted.username || confirm_username} deleted.`
+				message: `Account ${deletedLabel} deleted.`
 			};
 		} catch (error) {
 			if (error instanceof EngineError && error.status === 429) {

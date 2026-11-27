@@ -153,6 +153,9 @@
 			<p class="rounded-xl p-3 text-sm preset-tonal-error" role="alert">{accountsSectionError}</p>
 		{/if}
 		{#each data.accounts as account}
+			{@const hasLocalUsername = account.has_local_username ?? !account.username.trim().toLowerCase().startsWith('oidc:')}
+			{@const loginLabel = hasLocalUsername ? account.username : 'SSO-only'}
+			{@const headingLabel = account.display_name || loginLabel}
 			{@const lockedCount = account.locked_bucket_count ?? 0}
 			{@const failedCount = account.recent_failed_attempts ?? 0}
 			{@const statusFormId = `setStatus-${account.id}`}
@@ -171,7 +174,7 @@
 				<div class="flex flex-wrap items-start justify-between gap-4">
 					<div>
 						<div class="flex flex-wrap items-center gap-2">
-							<h3 class="font-semibold">{account.display_name || account.username}</h3>
+							<h3 class="font-semibold">{headingLabel}</h3>
 							{#if lockedCount > 0}
 								<span class="badge preset-tonal-warning">
 									Rate-limited ({lockedCount} {lockedCount === 1 ? 'source' : 'sources'} <span aria-hidden="true">·</span> {formatWaitDuration(account.lockout_retry_after_seconds)} left)
@@ -179,7 +182,7 @@
 							{/if}
 						</div>
 						<p class="text-sm text-surface-700-300">
-							{account.username} <span aria-hidden="true">·</span> {account.role} <span aria-hidden="true">·</span> {account.status}{#if failedCount > 0} <span aria-hidden="true">·</span> {failedCount} recent failed sign-in attempt{failedCount === 1 ? '' : 's'}{/if}
+							{loginLabel} <span aria-hidden="true">·</span> {account.role} <span aria-hidden="true">·</span> {account.status}{#if failedCount > 0} <span aria-hidden="true">·</span> {failedCount} recent failed sign-in attempt{failedCount === 1 ? '' : 's'}{/if}
 						</p>
 					</div>
 					<div class="flex flex-wrap items-start gap-2">
@@ -189,17 +192,18 @@
 							<button
 								class="btn btn-sm btn-reflow {lockedCount > 0 ? 'preset-tonal-warning' : 'preset-tonal-surface'}"
 								type="submit"
-								aria-label={`Unlock account ${account.display_name || account.username}`}
+								aria-label={`Unlock account ${headingLabel}`}
 							>
 								Unlock
 							</button>
 						</form>
 						{#if account.id !== data.current_user_id}
+							{@const confirmTarget = hasLocalUsername ? account.username : account.display_name.trim() || 'DELETE'}
 							<form method="POST" action="?/setStatus" use:enhance={enhanceForm}>
-								<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm btn-reflow {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${account.display_name || account.username}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button>
+								<ProfileField profileId={data.user?.profile_id} /><input type="hidden" name="account_id" value={account.id} /><input type="hidden" name="status" value={account.status === 'active' ? 'disabled' : 'active'} /><button class="btn btn-sm btn-reflow {account.status === 'active' ? 'preset-tonal-error' : 'preset-tonal-success'}" type="submit" aria-label={`${account.status === 'active' ? 'Disable' : 'Enable'} account ${headingLabel}`}>{account.status === 'active' ? 'Disable' : 'Enable'}</button>
 							</form>
 							<details open={deleteHasError} class="max-w-full">
-								<summary class="btn btn-sm btn-reflow cursor-pointer preset-tonal-error" aria-label={`Delete account ${account.display_name || account.username}`}>Delete</summary>
+								<summary class="btn btn-sm btn-reflow cursor-pointer preset-tonal-error" aria-label={`Delete account ${headingLabel}`}>Delete</summary>
 								<form method="POST" action="?/deleteAccount" use:enhance={enhanceForm} class="mt-3 grid max-w-xs min-w-0 gap-3 rounded-xl border border-surface-300-700 bg-surface-50-900 p-3">
 									<ProfileField profileId={data.user?.profile_id} />
 									<input type="hidden" name="account_id" value={account.id} />
@@ -208,7 +212,7 @@
 										<FormField
 											id={`delete-password-${account.id}`}
 											label="Your password"
-											srLabel={`to delete ${account.display_name || account.username}`}
+											srLabel={`to delete ${headingLabel}`}
 											error={fieldError(form, deleteFormId, 'current_password')}
 											class="grid min-w-0 gap-1"
 											labelClass="block text-xs font-medium text-surface-800-200"
@@ -222,9 +226,9 @@
 									{/if}
 									<FormField
 										id={`delete-confirm-${account.id}`}
-										label="Confirm username"
-										srLabel={`for ${account.display_name || account.username}`}
-										hint={`Type ${account.username} to confirm.`}
+										label={hasLocalUsername ? 'Confirm username' : 'Confirm account'}
+										srLabel={`for ${headingLabel}`}
+										hint={`Type ${confirmTarget} to confirm.`}
 										error={fieldError(form, deleteFormId, 'confirm_username')}
 										class="grid min-w-0 gap-1"
 										labelClass="block text-xs font-medium text-surface-800-200"
@@ -236,7 +240,7 @@
 									{#if formErrorBanner(form, deleteFormId)}
 										<p class="rounded-xl p-2 text-xs {deleteRateLimited ? 'preset-tonal-warning' : 'preset-tonal-error'}" role="alert">{formErrorBanner(form, deleteFormId)}</p>
 									{/if}
-									<button class="btn btn-sm btn-reflow preset-filled-error-500 justify-self-start" type="submit" aria-label={`Confirm deleting account ${account.display_name || account.username}`}>Delete permanently</button>
+									<button class="btn btn-sm btn-reflow preset-filled-error-500 justify-self-start" type="submit" aria-label={`Confirm deleting account ${headingLabel}`}>Delete permanently</button>
 								</form>
 							</details>
 						{:else}
@@ -260,34 +264,55 @@
 					{#if formSuccessBanner(form, resetFormId)}
 						<p class="mt-3 rounded-xl p-3 text-sm preset-tonal-success" role="status">{formSuccessBanner(form, resetFormId)}</p>
 					{/if}
-					<form method="POST" action="?/resetPassword" use:enhance={enhanceForm} class="mt-4 flex flex-wrap items-start gap-3">
-						<ProfileField profileId={data.user?.profile_id} />
-						<input type="hidden" name="account_id" value={account.id} />
-						<FormField
-							id={`reset-password-${account.id}`}
-							label="Set password"
-							srLabel={`for ${account.display_name || account.username}`}
-							hint="Use at least 12 characters."
-							error={fieldError(form, resetFormId, 'password')}
-							class="grid min-w-64 flex-1 gap-2"
-						>
-							{#snippet children(field)}
-								<input
-									{...field}
-									class="input"
-									type="password"
-									name="password"
-									minlength="12"
-									required
-									autocomplete="new-password"
-								/>
-							{/snippet}
-						</FormField>
-						<button class="btn btn-sm btn-reflow preset-tonal-surface sm:mt-7" type="submit" aria-label={`Reset password for ${account.display_name || account.username}`}>Reset password</button>
-						{#if formErrorBanner(form, resetFormId)}
-							<p class="w-full rounded-xl p-3 text-sm preset-tonal-error" role="alert">{formErrorBanner(form, resetFormId)}</p>
-						{/if}
-					</form>
+					{#if hasLocalUsername}
+						<form method="POST" action="?/resetPassword" use:enhance={enhanceForm} class="mt-4 flex flex-wrap items-start gap-3">
+							<ProfileField profileId={data.user?.profile_id} />
+							<input type="hidden" name="account_id" value={account.id} />
+							<FormField
+								id={`reset-password-${account.id}`}
+								label="Set password"
+								srLabel={`for ${headingLabel}`}
+								hint="Use at least 12 characters."
+								error={fieldError(form, resetFormId, 'password')}
+								class="grid min-w-64 flex-1 gap-2"
+							>
+								{#snippet children(field)}
+									<input
+										{...field}
+										class="input"
+										type="password"
+										name="password"
+										minlength="12"
+										required
+										autocomplete="new-password"
+									/>
+								{/snippet}
+							</FormField>
+							<button class="btn btn-sm btn-reflow preset-tonal-surface sm:mt-7" type="submit" aria-label={`Reset password for ${headingLabel}`}>Reset password</button>
+							{#if formErrorBanner(form, resetFormId)}
+								<p class="w-full rounded-xl p-3 text-sm preset-tonal-error" role="alert">{formErrorBanner(form, resetFormId)}</p>
+							{/if}
+						</form>
+					{:else}
+						<div class="mt-4 flex flex-wrap items-start gap-3">
+							<FormField
+								id={`reset-password-${account.id}`}
+								label="Set password"
+								srLabel={`unavailable for SSO-only account ${headingLabel}`}
+								hint="SSO-only — local password reset is unavailable until this reader sets a username in Account settings."
+								class="grid min-w-64 flex-1 gap-2"
+								labelClass="block text-sm font-medium text-surface-700-300"
+							>
+								{#snippet children(field)}
+									<input {...field} class="input" type="password" disabled />
+								{/snippet}
+							</FormField>
+							<button class="btn btn-sm btn-reflow preset-tonal-surface sm:mt-7" type="button" disabled aria-label={`Reset password unavailable for ${headingLabel}`}>Reset password</button>
+							{#if formErrorBanner(form, resetFormId)}
+								<p class="w-full rounded-xl p-3 text-sm preset-tonal-error" role="alert">{formErrorBanner(form, resetFormId)}</p>
+							{/if}
+						</div>
+					{/if}
 				{/if}
 			</article>
 		{/each}

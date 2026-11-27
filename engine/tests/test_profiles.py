@@ -1,5 +1,6 @@
 from pathlib import Path
 import asyncio
+from datetime import timedelta
 import hashlib
 import logging
 import sqlite3
@@ -1662,6 +1663,522 @@ def test_exclusive_profile_lock_waits_for_open_connections(identity_store):
         restore.result(timeout=2)
 
 
+def test_event_loop_timer_stays_responsive_during_exclusive_profile_lock(
+    identity_store, monkeypatch
+):
+    monkeypatch.setattr("afterword_engine.main.SCHEDULER_INITIAL_DELAY_SECONDS", 0.01)
+    monkeypatch.setattr("afterword_engine.main.SCHEDULER_POLL_SECONDS", 0.1)
+    alice = profiles.create_account("timer-alice", "timer-alice-password-long")
+    bob = profiles.create_account("timer-bob", "timer-bob-password-long")
+    for account, kind in ((alice, "alice_job"), (bob, "bob_job")):
+        with profile_scope(account["profile_id"]):
+            initialize(seed_demo=False)
+            enqueue_job(kind)
+
+    alice_path = profile_database_path(alice["profile_id"])
+    lock_acquired = Event()
+    release_lock = Event()
+
+    def hold_exclusive_lock():
+        with database_lock(alice_path):
+            lock_acquired.set()
+            release_lock.wait(timeout=5)
+
+    def contended_alice_read():
+        with profile_scope(alice["profile_id"]), connect() as con:
+            return con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+    from afterword_engine.main import (
+        digest_scheduler_loop,
+        goodreads_rss_scheduler_loop,
+        source_scheduler_loop,
+    )
+
+    handled: list[tuple[str | None, str]] = []
+    bob_done = asyncio.Event()
+    alice_done = asyncio.Event()
+    stop = asyncio.Event()
+
+    async def handler(kind: str):
+        owner = current_profile_id()
+        handled.append((owner, kind))
+        if kind == "bob_job":
+            bob_done.set()
+        elif kind == "alice_job":
+            alice_done.set()
+            stop.set()
+        return {"kind": kind}
+
+    async def run_scenario():
+        lock_thread = Thread(target=hold_exclusive_lock, daemon=True)
+        lock_thread.start()
+        assert await asyncio.to_thread(lock_acquired.wait, 2)
+
+        tick_durations: list[float] = []
+        measure_ticks = True
+
+        async def timer_probe():
+            loop = asyncio.get_running_loop()
+            while measure_ticks:
+                started_at = loop.time()
+                await asyncio.sleep(0.05)
+                tick_durations.append(loop.time() - started_at)
+
+        background_tasks = [
+            asyncio.create_task(worker_loop(handler, stop)),
+            asyncio.create_task(source_scheduler_loop(stop)),
+            asyncio.create_task(digest_scheduler_loop(stop)),
+            asyncio.create_task(goodreads_rss_scheduler_loop(stop)),
+            asyncio.create_task(backups.backup_scheduler_loop(stop)),
+        ]
+        probe_task = asyncio.create_task(timer_probe())
+        alice_read_task = asyncio.create_task(asyncio.to_thread(contended_alice_read))
+        try:
+            await asyncio.wait_for(bob_done.wait(), timeout=2)
+            # Hold the exclusive lock across at least one full 0.5s worker poll.
+            await asyncio.sleep(0.65)
+            assert not alice_done.is_set()
+            assert not alice_read_task.done()
+            assert len(tick_durations) >= 10
+            assert max(tick_durations) < 0.25
+
+            release_lock.set()
+            # Locked profiles must skip without PROFILE_RETRY_SECONDS (60s) backoff.
+            await asyncio.wait_for(alice_done.wait(), timeout=2)
+            assert await asyncio.wait_for(alice_read_task, timeout=2) >= 1
+        finally:
+            release_lock.set()
+            measure_ticks = False
+            stop.set()
+            await asyncio.gather(probe_task, *background_tasks, return_exceptions=True)
+            await asyncio.to_thread(lock_thread.join, 2)
+
+    asyncio.run(run_scenario())
+    assert [
+        item for item in handled if item[1] in {"bob_job", "alice_job"}
+    ] == [
+        (bob["profile_id"], "bob_job"),
+        (alice["profile_id"], "alice_job"),
+    ]
+
+
+def test_try_shared_releases_condition_before_yielding(identity_store):
+    alice = profiles.create_account("try-shared-alice", "try-shared-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+    alice_path = profile_database_path(alice["profile_id"])
+    lock = database_lock(alice_path)
+
+    with lock.try_shared() as acquired:
+        assert acquired is True
+        assert not lock._condition._is_owned()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            assert executor.submit(lock.is_locked).result(timeout=2) is False
+
+    lock_held = Event()
+    release_lock = Event()
+
+    def hold_exclusive():
+        with lock:
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    holder = Thread(target=hold_exclusive, daemon=True)
+    holder.start()
+    try:
+        assert lock_held.wait(timeout=2)
+        with lock.try_shared() as acquired:
+            assert acquired is False
+            assert not lock._condition._is_owned()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                assert executor.submit(lock.is_locked).result(timeout=2) is True
+    finally:
+        release_lock.set()
+        holder.join(timeout=2)
+
+
+def test_worker_heartbeat_logs_deferred_lease_renewal_when_profile_locked(
+    identity_store, monkeypatch, caplog
+):
+    import logging
+
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    alice = profiles.create_account("hb-alice", "hb-alice-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("read_metadata")
+
+    status, claimed_job, lease_token, claimed_epoch = jobs._claim_profile_job(
+        alice["profile_id"],
+        time.monotonic(),
+        {alice["profile_id"]},
+        {alice["profile_id"]: 0},
+        {},
+        {alice["profile_id"]: time.monotonic()},
+        {},
+        set(),
+    )
+    assert (
+        status == "claimed"
+        and claimed_job is not None
+        and lease_token is not None
+        and claimed_epoch == 0
+    )
+    assert claimed_job["id"] == job_id
+
+    alice_path = profile_database_path(alice["profile_id"])
+    lock_held = Event()
+    release_lock = Event()
+    hb_stop = Event()
+
+    def hold_exclusive():
+        with database_lock(alice_path):
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    holder = Thread(target=hold_exclusive, daemon=True)
+    holder.start()
+    heartbeat = Thread(
+        target=jobs._heartbeat,
+        args=(alice["profile_id"], job_id, lease_token, hb_stop),
+        daemon=True,
+    )
+    try:
+        assert lock_held.wait(timeout=2)
+        with caplog.at_level(logging.INFO, logger="afterword_engine.jobs"):
+            heartbeat.start()
+            deadline = time.monotonic() + 2.0
+            while (
+                f"Deferred lease renewal for job {job_id}" not in caplog.text
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            hb_stop.set()
+            heartbeat.join(timeout=2)
+    finally:
+        hb_stop.set()
+        release_lock.set()
+        holder.join(timeout=2)
+
+    assert (
+        f"Deferred lease renewal for job {job_id} while profile database lock is held"
+        in caplog.text
+    )
+
+
+def test_deferred_heartbeat_cancels_live_job_at_lease_expiry_before_duplicate_reap(
+    identity_store, monkeypatch, caplog
+):
+    import logging
+
+    monkeypatch.setattr(jobs, "JOB_LEASE_SECONDS", 0.12)
+    monkeypatch.setattr(jobs, "JOB_HEARTBEAT_SECONDS", 0.02)
+    monkeypatch.setattr(jobs, "JOB_DEFERRED_HEARTBEAT_RETRY_SECONDS", 0.02)
+    monkeypatch.setattr(jobs, "JOB_REAPER_SECONDS", 0.02)
+
+    alice = profiles.create_account("hb-bound-alice", "hb-bound-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("lease_bound_check")
+
+    alice_path = profile_database_path(alice["profile_id"])
+    first_started = Event()
+    first_cancelled = Event()
+    lock_held = Event()
+    release_lock = Event()
+    stop = asyncio.Event()
+    active_count = 0
+    max_concurrent = 0
+    attempts_seen = 0
+
+    def hold_long_exclusive_lock():
+        with database_lock(alice_path):
+            lock_held.set()
+            release_lock.wait(timeout=5)
+
+    async def handler(kind: str):
+        nonlocal active_count, max_concurrent, attempts_seen
+        assert kind == "lease_bound_check"
+        attempts_seen += 1
+        active_count += 1
+        max_concurrent = max(max_concurrent, active_count)
+        try:
+            if attempts_seen == 1:
+                first_started.set()
+                await asyncio.Event().wait()
+            stop.set()
+            return {"attempt": attempts_seen}
+        except asyncio.CancelledError:
+            first_cancelled.set()
+            raise
+        finally:
+            active_count -= 1
+
+    async def run_scenario():
+        worker = asyncio.create_task(worker_loop(handler, stop))
+        holder = Thread(target=hold_long_exclusive_lock, daemon=True)
+        try:
+            assert await asyncio.to_thread(first_started.wait, 2)
+            holder.start()
+            assert await asyncio.to_thread(lock_held.wait, 2)
+            # Hold the lock past JOB_LEASE_SECONDS (0.12s); _heartbeat must
+            # cancel the live handler before releasing the lock so the reaper
+            # can never start a second copy concurrently.
+            assert await asyncio.to_thread(first_cancelled.wait, 2)
+            with profile_scope(alice["profile_id"]):
+                assert database_lock(alice_path).is_locked()
+            release_lock.set()
+            await asyncio.to_thread(holder.join, 2)
+            await asyncio.wait_for(worker, timeout=3)
+        finally:
+            release_lock.set()
+            stop.set()
+            await asyncio.gather(worker, return_exceptions=True)
+            if holder.is_alive():
+                await asyncio.to_thread(holder.join, 2)
+
+    with caplog.at_level(logging.WARNING, logger="afterword_engine.jobs"):
+        asyncio.run(run_scenario())
+
+    assert (
+        f"Lease expired for job {job_id} while profile database lock was held; cancelling active handler"
+        in caplog.text
+    )
+    assert max_concurrent == 1
+    assert attempts_seen == 2
+    with profile_scope(alice["profile_id"]), connect() as con:
+        final_job = con.execute(
+            "SELECT status,attempts,result FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert final_job["status"] == "complete"
+    assert final_job["attempts"] == 2
+    assert final_job["result"] == '{"attempt": 2}'
+
+
+def test_quiesce_requeues_active_worker_job_and_times_out_on_stuck_connection(
+    identity_store,
+):
+    alice = profiles.create_account("quiesce-alice", "quiesce-alice-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        job_id = enqueue_job("quiesce_job")
+
+    alice_path = profile_database_path(alice["profile_id"])
+    lock = database_lock(alice_path)
+    job_started = Event()
+    job_cancelled = Event()
+    quiesced_and_locked = Event()
+    stop = asyncio.Event()
+
+    async def blocking_async_handler(kind: str):
+        assert kind == "quiesce_job"
+        job_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            job_cancelled.set()
+            raise
+
+    def run_quiesce_and_exclusive():
+        with lock.quiesce(timeout=2.0) as deadline, lock.exclusive(deadline):
+            quiesced_and_locked.set()
+
+    async def run_quiesce_scenario():
+        worker = asyncio.create_task(worker_loop(blocking_async_handler, stop))
+        try:
+            assert await asyncio.to_thread(job_started.wait, 2)
+            # Pause worker from re-claiming once restore finishes so we can inspect the row.
+            stop.set()
+            await asyncio.to_thread(run_quiesce_and_exclusive)
+            assert job_cancelled.is_set()
+            assert quiesced_and_locked.is_set()
+            await asyncio.wait_for(worker, timeout=2)
+        finally:
+            stop.set()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    asyncio.run(run_quiesce_scenario())
+    with profile_scope(alice["profile_id"]), connect() as con:
+        requeued = con.execute(
+            "SELECT status,attempts,lease_token FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    assert requeued["status"] == "queued"
+    assert requeued["attempts"] == 0
+    assert requeued["lease_token"] is None
+
+    # A stuck open connection must cause lock.exclusive(deadline) to fail with BackupError
+    # after the quiescence timeout and leave the profile lock cleanly released.
+    with profile_scope(alice["profile_id"]):
+        stuck = connect()
+        try:
+            with pytest.raises(
+                backups.BackupError, match="could not be safely closed for restore"
+            ):
+                with lock.quiesce(timeout=0.05) as deadline, lock.exclusive(deadline):
+                    pass
+            assert not lock.is_locked()
+            assert not lock.is_restoring()
+        finally:
+            stuck.close()
+
+
+def test_real_handle_job_offloads_sync_db_work_and_supports_cancellation(
+    identity_store, monkeypatch
+):
+    from afterword_engine.main import handle_job
+
+    alice = profiles.create_account("real-job-alice", "real-job-alice-password-long")
+    bob = profiles.create_account("real-job-bob", "real-job-bob-password-long")
+    with profile_scope(alice["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,?,?,?)",
+                (
+                    "The Left Hand of Darkness",
+                    "Ursula K. Le Guin",
+                    5,
+                    "9780441478125",
+                    "test",
+                ),
+            )
+        alice_job_id = enqueue_job("read_metadata")
+
+    with profile_scope(bob["profile_id"]):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute(
+                "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,?,?,?)",
+                ("Kindred", "Octavia E. Butler", 5, "9780807083697", "test"),
+            )
+        bob_job_id = enqueue_job("read_metadata")
+
+    alice_path = profile_database_path(alice["profile_id"])
+    alice_lookup_entered = Event()
+    release_alice_lookup = asyncio.Event()
+    cancel_lookup_entered = Event()
+    lock_acquired = Event()
+    release_lock = Event()
+    pause_cancel_lookup = False
+
+    async def fake_resolve_book_metadata(title, author, **_kwargs):
+        if title == "The Left Hand of Darkness":
+            alice_lookup_entered.set()
+            await release_alice_lookup.wait()
+        elif pause_cancel_lookup and title == "Parable of the Sower":
+            cancel_lookup_entered.set()
+            await asyncio.Event().wait()
+        return {}
+
+    monkeypatch.setattr(
+        "afterword_engine.ingestion.resolve_book_metadata",
+        fake_resolve_book_metadata,
+    )
+
+    def hold_exclusive_lock():
+        with database_lock(alice_path):
+            lock_acquired.set()
+            release_lock.wait(timeout=5)
+
+    def job_status(profile_id: str, job_id: str) -> str:
+        with profile_scope(profile_id), connect() as con:
+            found = con.execute(
+                "SELECT status FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            return str(found["status"]) if found else ""
+
+    async def run_real_worker():
+        nonlocal pause_cancel_lookup
+        stop = asyncio.Event()
+        worker = asyncio.create_task(worker_loop(handle_job, stop))
+        tick_durations: list[float] = []
+        measure_ticks = True
+
+        async def timer_probe():
+            loop = asyncio.get_running_loop()
+            while measure_ticks:
+                started_at = loop.time()
+                await asyncio.sleep(0.05)
+                tick_durations.append(loop.time() - started_at)
+
+        probe_task = asyncio.create_task(timer_probe())
+        lock_thread = Thread(target=hold_exclusive_lock, daemon=True)
+        try:
+            assert await asyncio.to_thread(alice_lookup_entered.wait, 3)
+            # Lock Alice's DB while handle_job("read_metadata") is mid-HTTP lookup,
+            # then let the lookup return so _persist_read_metadata_attempt hits
+            # database_lock(alice_path). It must wait in a worker thread rather
+            # than blocking the event loop.
+            lock_thread.start()
+            assert await asyncio.to_thread(lock_acquired.wait, 2)
+            release_alice_lookup.set()
+
+            await asyncio.sleep(0.35)
+            assert len(tick_durations) >= 5
+            assert max(tick_durations) < 0.25
+
+            release_lock.set()
+            await asyncio.to_thread(lock_thread.join, 2)
+
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                alice_state = await asyncio.to_thread(
+                    job_status, alice["profile_id"], alice_job_id
+                )
+                bob_state = await asyncio.to_thread(
+                    job_status, bob["profile_id"], bob_job_id
+                )
+                if alice_state == "complete" and bob_state == "complete":
+                    break
+                await asyncio.sleep(0.05)
+            assert alice_state == "complete"
+            assert bob_state == "complete"
+
+            # Verify cancelling an in-flight worker task cancels handle_job cleanly
+            # and immediately returns the interrupted job to queued without waiting
+            # for the 300s lease reaper.
+            pause_cancel_lookup = True
+            with profile_scope(bob["profile_id"]):
+                with transaction() as con:
+                    con.execute(
+                        "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,?,?,?)",
+                        (
+                            "Parable of the Sower",
+                            "Octavia E. Butler",
+                            5,
+                            "9780446675505",
+                            "test",
+                        ),
+                    )
+                cancelled_job_id = enqueue_job("read_metadata")
+
+            assert await asyncio.to_thread(cancel_lookup_entered.wait, 3)
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+            with profile_scope(bob["profile_id"]), connect() as con:
+                cancelled_row = con.execute(
+                    "SELECT status,attempts,lease_token FROM jobs WHERE id=?",
+                    (cancelled_job_id,),
+                ).fetchone()
+            assert cancelled_row["status"] == "queued"
+            assert cancelled_row["attempts"] == 0
+            assert cancelled_row["lease_token"] is None
+        finally:
+            release_lock.set()
+            release_alice_lookup.set()
+            measure_ticks = False
+            stop.set()
+            if not worker.done():
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+            await asyncio.gather(probe_task, return_exceptions=True)
+            if lock_thread.is_alive():
+                await asyncio.to_thread(lock_thread.join, 2)
+
+    asyncio.run(run_real_worker())
+
+
 def test_heartbeat_zero_row_update_cancels_handler_and_resets_ready_profiles_on_restore(
     identity_store, monkeypatch
 ):
@@ -2251,6 +2768,222 @@ def test_existing_oidc_transactions_gain_the_session_binding_column(identity_sto
     with profiles.auth_connect() as con:
         columns = {row[1] for row in con.execute("PRAGMA table_info(auth_transactions)")}
     assert "session_hash" in columns
+
+
+def test_populated_auth_registry_upgrades_transactions_sessions_and_accounts_on_startup(
+    identity_store,
+):
+    reader = profiles.create_account("upgrade-reader", "upgrade-reader-password-long")
+    sso_reader = profiles.create_oidc_account(
+        "https://identity.example", "upgrade-sso-sub", "upgrade@example.test", "Upgrade SSO"
+    )
+    reader_session, _ = profiles.create_session(reader["id"])
+    other_session, _ = profiles.create_session(reader["id"])
+    sso_session, _ = profiles.create_session(sso_reader["id"])
+
+    future_expiry = profiles.iso(profiles.utc_now() + timedelta(minutes=9))
+    created_stamp = "2026-10-01T12:00:00+00:00"
+    login_state_hash = hashlib.sha256(b"preupgrade-login-state").hexdigest()
+    login_csrf_hash = hashlib.sha256(b"preupgrade-login-csrf").hexdigest()
+    link_state_hash = hashlib.sha256(b"preupgrade-link-state").hexdigest()
+    link_csrf_hash = hashlib.sha256(b"preupgrade-link-csrf").hexdigest()
+    reader_session_hash = hashlib.sha256(reader_session.encode()).hexdigest()
+
+    # Downgrade a populated auth registry to the pre-PR schema on `main`:
+    # - `accounts` without `has_local_username`
+    # - `auth_sessions` without `enrollment_verified_at`
+    # - `auth_transactions` with `CHECK(purpose IN ('login','link'))` and populated in-flight rows
+    with profiles.auth_connect() as con:
+        con.execute("ALTER TABLE accounts DROP COLUMN has_local_username")
+        con.execute("ALTER TABLE auth_sessions DROP COLUMN enrollment_verified_at")
+        con.execute("DROP TABLE auth_transactions")
+        con.execute(
+            """
+            CREATE TABLE auth_transactions (
+                state_hash TEXT PRIMARY KEY,
+                csrf_hash TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                code_verifier TEXT NOT NULL,
+                purpose TEXT NOT NULL CHECK(purpose IN ('login','link')),
+                account_id TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+                session_hash TEXT,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO auth_transactions(
+                state_hash, csrf_hash, nonce, code_verifier, purpose, account_id, session_hash, expires_at, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?), (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                login_state_hash,
+                login_csrf_hash,
+                "login-nonce",
+                "login-verifier",
+                "login",
+                None,
+                None,
+                future_expiry,
+                created_stamp,
+            )
+            + (
+                link_state_hash,
+                link_csrf_hash,
+                "link-nonce",
+                "link-verifier",
+                "link",
+                reader["id"],
+                reader_session_hash,
+                future_expiry,
+                created_stamp,
+            ),
+        )
+
+    # Run startup initialization twice to verify both populated migration and idempotence.
+    profiles.initialize_auth()
+    profiles.initialize_auth()
+
+    with profiles.auth_connect() as con:
+        legacy_table = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_transactions_legacy'"
+        ).fetchone()
+        table_sql = con.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='auth_transactions'"
+        ).fetchone()[0]
+        rows = con.execute(
+            "SELECT state_hash, purpose, account_id, session_hash, created_at FROM auth_transactions"
+        ).fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                """
+                INSERT INTO auth_transactions(
+                    state_hash, csrf_hash, nonce, code_verifier, purpose, expires_at
+                ) VALUES ('bad-state', 'bad-csrf', 'n', 'v', 'bogus', ?)
+                """,
+                (future_expiry,),
+            )
+
+    assert legacy_table is None
+    assert "'enroll'" in table_sql
+    assert len(rows) == 2
+    assert profiles.account_by_id(reader["id"])["has_local_username"] is True
+    assert profiles.account_by_id(sso_reader["id"])["has_local_username"] is False
+
+    # Pre-upgrade login and session-bound link transactions survive intact and enforce session binding.
+    consumed_login = profiles.consume_oidc_transaction(
+        "preupgrade-login-state", "preupgrade-login-csrf"
+    )
+    assert consumed_login is not None
+    assert consumed_login["purpose"] == "login"
+    assert consumed_login["nonce"] == "login-nonce"
+    assert consumed_login["created_at"] == created_stamp
+
+    assert (
+        profiles.consume_oidc_transaction(
+            "preupgrade-link-state", "preupgrade-link-csrf", other_session
+        )
+        is None
+    )
+    consumed_link = profiles.consume_oidc_transaction(
+        "preupgrade-link-state", "preupgrade-link-csrf", reader_session
+    )
+    assert consumed_link is not None
+    assert consumed_link["purpose"] == "link"
+    assert consumed_link["account_id"] == reader["id"]
+    assert consumed_link["session_hash"] == reader_session_hash
+
+    # Newly supported `enroll` transactions and `ON DELETE CASCADE` work after the rebuild.
+    profiles.create_oidc_transaction(
+        state="postupgrade-enroll-state",
+        csrf="postupgrade-enroll-csrf",
+        nonce="enroll-nonce",
+        verifier="enroll-verifier",
+        purpose="enroll",
+        account_id=sso_reader["id"],
+        session_token=sso_session,
+    )
+    consumed_enroll = profiles.consume_oidc_transaction(
+        "postupgrade-enroll-state", "postupgrade-enroll-csrf", sso_session
+    )
+    assert consumed_enroll is not None
+    assert consumed_enroll["purpose"] == "enroll"
+    assert consumed_enroll["account_id"] == sso_reader["id"]
+
+    profiles.create_oidc_transaction(
+        state="cascade-enroll-state",
+        csrf="cascade-enroll-csrf",
+        nonce="cascade-nonce",
+        verifier="cascade-verifier",
+        purpose="enroll",
+        account_id=sso_reader["id"],
+        session_token=sso_session,
+    )
+    with profiles.auth_connect() as con:
+        con.execute("DELETE FROM accounts WHERE id=?", (sso_reader["id"],))
+        remaining = con.execute(
+            "SELECT COUNT(*) FROM auth_transactions WHERE account_id=?", (sso_reader["id"],)
+        ).fetchone()[0]
+    assert remaining == 0
+
+    # Also cover upgrading an even older pre-`session_hash` table containing a populated login row
+    # alongside a dangling `account_id` row from before foreign-key enforcement.
+    orphan_login_state = hashlib.sha256(b"legacy-nosession-login").hexdigest()
+    orphan_login_csrf = hashlib.sha256(b"legacy-nosession-csrf").hexdigest()
+    with profiles.auth_connect() as con:
+        con.execute("DROP TABLE auth_transactions")
+        con.execute(
+            """
+            CREATE TABLE auth_transactions (
+                state_hash TEXT PRIMARY KEY,
+                csrf_hash TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                code_verifier TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                account_id TEXT,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO auth_transactions(
+                state_hash, csrf_hash, nonce, code_verifier, purpose, account_id, expires_at
+            ) VALUES (?,?,?,?,?,?,?), (?,?,?,?,?,?,?)
+            """,
+            (
+                orphan_login_state,
+                orphan_login_csrf,
+                "legacy-nonce",
+                "legacy-verifier",
+                "login",
+                None,
+                future_expiry,
+            )
+            + (
+                hashlib.sha256(b"dangling-link").hexdigest(),
+                hashlib.sha256(b"dangling-csrf").hexdigest(),
+                "dangling-nonce",
+                "dangling-verifier",
+                "link",
+                "deleted-account-id",
+                future_expiry,
+            ),
+        )
+
+    profiles.initialize_auth()
+
+    recovered_login = profiles.consume_oidc_transaction(
+        "legacy-nosession-login", "legacy-nosession-csrf"
+    )
+    assert recovered_login is not None
+    assert recovered_login["purpose"] == "login"
+    assert recovered_login["session_hash"] is None
+    with profiles.auth_connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM auth_transactions").fetchone()[0] == 0
 
 
 def test_profile_api_token_authentication_uses_the_shared_registry_key(identity_store):
@@ -3479,3 +4212,625 @@ def test_locked_auth_registry_fails_closed_for_cached_and_uncached_requests(
         )
 
 
+@respx.mock
+def test_oidc_account_enrolls_unique_local_username_and_blocks_lockout_unlink(
+    identity_store, monkeypatch
+):
+    issuer = "https://identity.example"
+    client_id = "bookward-client"
+    monkeypatch.setattr(settings, "oidc_issuer", issuer)
+    monkeypatch.setattr(settings, "oidc_client_id", client_id)
+    monkeypatch.setattr(settings, "oidc_client_secret", "test-client-secret")
+    monkeypatch.setattr(settings, "oidc_redirect_uri", "https://bookward.example/auth/oidc/callback")
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public = private_key.public_key().public_numbers()
+
+    def encoded_integer(value: int) -> str:
+        raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    respx.get(f"{issuer}/.well-known/openid-configuration").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "issuer": issuer,
+                "authorization_endpoint": f"{issuer}/authorize",
+                "token_endpoint": f"{issuer}/token",
+                "jwks_uri": f"{issuer}/jwks",
+            },
+        )
+    )
+    respx.get(f"{issuer}/jwks").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "keys": [
+                    {
+                        "kty": "RSA",
+                        "use": "sig",
+                        "alg": "RS256",
+                        "kid": "enroll-signing-key",
+                        "n": encoded_integer(public.n),
+                        "e": encoded_integer(public.e),
+                    }
+                ]
+            },
+        )
+    )
+    token_specs: dict[str, dict] = {}
+
+    def issue_token(request):
+        code = parse_qs(request.content.decode())["code"][0]
+        spec = token_specs[code]
+        now = int(time.time())
+        claims = {
+            "iss": issuer,
+            "sub": spec["sub"],
+            "aud": client_id,
+            "iat": now,
+            "exp": now + 600,
+            "nonce": spec["nonce"],
+            "email": "sso@example.test",
+            "email_verified": True,
+            "name": "SSO Reader",
+        }
+        if "auth_time" in spec:
+            claims["auth_time"] = spec["auth_time"]
+        signed = jwt.encode(
+            claims, private_key, algorithm="RS256", headers={"kid": "enroll-signing-key"}
+        )
+        return httpx.Response(200, json={"id_token": signed})
+
+    respx.post(f"{issuer}/token").mock(side_effect=issue_token)
+
+    sso_reader = profiles.create_oidc_account(
+        issuer, "enroll-subject-1", "sso@example.test", "SSO Reader"
+    )
+    with profile_scope(sso_reader["profile_id"]):
+        initialize(seed_demo=False)
+    sso_api_token = profiles.create_profile_api_token(
+        sso_reader["profile_id"], "SSO Personal Token"
+    )["token"]
+    existing_local = profiles.create_account("taken-name", "taken-reader-password-long")
+    assert sso_reader["has_local_username"] is False
+    assert existing_local["has_local_username"] is True
+
+    admin_session, _ = profiles.create_session(identity_store["id"])
+    sso_session, _ = profiles.create_session(sso_reader["id"])
+    enroll_session, _ = profiles.create_session(sso_reader["id"])
+    local_only_session, _ = profiles.create_session(existing_local["id"])
+
+    with TestClient(app) as client:
+        me = client.get("/auth/me", headers={"x-bookward-session": sso_session})
+        assert me.status_code == 200
+        assert me.json()["has_local_username"] is False
+
+        methods = client.get("/auth/identities", headers={"x-bookward-session": sso_session})
+        assert methods.status_code == 200
+        assert methods.json()["has_local_username"] is False
+        assert methods.json()["password_enabled"] is False
+        assert methods.json()["enrollment_verified"] is False
+        identity_id = methods.json()["oidc_identities"][0]["id"]
+
+        admin_list = client.get("/admin/accounts", headers={"x-bookward-session": admin_session})
+        assert admin_list.status_code == 200
+        sso_entry = next(item for item in admin_list.json()["accounts"] if item["id"] == sso_reader["id"])
+        assert sso_entry["has_local_username"] is False
+
+        # Sole SSO identity cannot be unlinked before local username + password exist.
+        unlink_without_password = client.delete(
+            f"/auth/identities/{identity_id}",
+            headers={"x-bookward-session": sso_session},
+        )
+        assert unlink_without_password.status_code == 400
+
+        # Simulate a row that had password_hash set while still owning an oidc: surrogate username.
+        with profiles.auth_connect() as con:
+            con.execute(
+                "UPDATE accounts SET password_hash=? WHERE id=?",
+                (profiles.PASSWORD_HASHER.hash("legacy-unusable-password-long"), sso_reader["id"]),
+            )
+        assert profiles.authenticate_local(sso_reader["username"], "legacy-unusable-password-long") is None
+        unlink_with_surrogate_username = client.delete(
+            f"/auth/identities/{identity_id}",
+            headers={"x-bookward-session": sso_session},
+        )
+        assert unlink_with_surrogate_username.status_code == 400
+
+        # A freshly minted login session (< 10 minutes old) is NOT enough to attach local credentials:
+        # enrollment requires an explicit intent=enroll OIDC round trip.
+        unconfirmed_fresh_attempt = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": enroll_session},
+            json={"username": "chosen-reader", "new_password": "chosen-reader-password-long"},
+        )
+        assert unconfirmed_fresh_attempt.status_code == 401
+
+        # intent=enroll start requires an authenticated session and a linked OIDC identity.
+        assert client.get("/auth/oidc/start?intent=enroll").status_code == 401
+        assert (
+            client.get(
+                "/auth/oidc/start?intent=enroll",
+                headers={"x-bookward-session": local_only_session},
+            ).status_code
+            == 400
+        )
+
+        # Mismatched session cannot redeem another session's enroll transaction.
+        mismatch_start = client.get(
+            "/auth/oidc/start?intent=enroll",
+            headers={"x-bookward-session": enroll_session},
+        )
+        assert mismatch_start.status_code == 200
+        mismatch_auth = parse_qs(urlparse(mismatch_start.json()["authorization_url"]).query)
+        assert mismatch_auth["prompt"] == ["login"]
+        assert mismatch_auth["max_age"] == ["600"]
+        mismatch_callback = client.get(
+            "/auth/oidc/callback",
+            params={"code": "unused-code", "state": mismatch_auth["state"][0]},
+            headers={
+                "x-bookward-session": sso_session,
+                "x-oidc-state": mismatch_start.json()["csrf"],
+            },
+        )
+        assert mismatch_callback.status_code == 400
+
+        # Unlinked subject cannot verify enrollment for this account.
+        wrong_sub_start = client.get(
+            "/auth/oidc/start?intent=enroll",
+            headers={"x-bookward-session": enroll_session},
+        )
+        wrong_sub_auth = parse_qs(urlparse(wrong_sub_start.json()["authorization_url"]).query)
+        token_specs["wrong-sub-code"] = {
+            "sub": "different-subject",
+            "nonce": wrong_sub_auth["nonce"][0],
+            "auth_time": int(time.time()),
+        }
+        wrong_sub_callback = client.get(
+            "/auth/oidc/callback",
+            params={"code": "wrong-sub-code", "state": wrong_sub_auth["state"][0]},
+            headers={
+                "x-bookward-session": enroll_session,
+                "x-oidc-state": wrong_sub_start.json()["csrf"],
+            },
+        )
+        assert wrong_sub_callback.status_code == 403
+
+        # Stale auth_time (> 10 minutes old) is rejected even during intent=enroll callback.
+        stale_auth_start = client.get(
+            "/auth/oidc/start?intent=enroll",
+            headers={"x-bookward-session": enroll_session},
+        )
+        stale_auth_query = parse_qs(urlparse(stale_auth_start.json()["authorization_url"]).query)
+        token_specs["stale-auth-code"] = {
+            "sub": "enroll-subject-1",
+            "nonce": stale_auth_query["nonce"][0],
+            "auth_time": int(time.time()) - 900,
+        }
+        stale_auth_callback = client.get(
+            "/auth/oidc/callback",
+            params={"code": "stale-auth-code", "state": stale_auth_query["state"][0]},
+            headers={
+                "x-bookward-session": enroll_session,
+                "x-oidc-state": stale_auth_start.json()["csrf"],
+            },
+        )
+        assert stale_auth_callback.status_code == 401
+
+        # Missing auth_time is also rejected during intent=enroll callback (mandatory freshness proof).
+        missing_auth_time_start = client.get(
+            "/auth/oidc/start?intent=enroll",
+            headers={"x-bookward-session": enroll_session},
+        )
+        missing_auth_time_query = parse_qs(
+            urlparse(missing_auth_time_start.json()["authorization_url"]).query
+        )
+        assert missing_auth_time_query["prompt"] == ["login"]
+        assert missing_auth_time_query["max_age"] == ["600"]
+        token_specs["missing-auth-time-code"] = {
+            "sub": "enroll-subject-1",
+            "nonce": missing_auth_time_query["nonce"][0],
+        }
+        missing_auth_time_callback = client.get(
+            "/auth/oidc/callback",
+            params={"code": "missing-auth-time-code", "state": missing_auth_time_query["state"][0]},
+            headers={
+                "x-bookward-session": enroll_session,
+                "x-oidc-state": missing_auth_time_start.json()["csrf"],
+            },
+        )
+        assert missing_auth_time_callback.status_code == 401
+        assert (
+            client.get("/auth/identities", headers={"x-bookward-session": enroll_session}).json()[
+                "enrollment_verified"
+            ]
+            is False
+        )
+
+        def confirm_enrollment(code_name: str) -> None:
+            start = client.get(
+                "/auth/oidc/start?intent=enroll",
+                headers={"x-bookward-session": enroll_session},
+            )
+            assert start.status_code == 200
+            auth_query = parse_qs(urlparse(start.json()["authorization_url"]).query)
+            assert auth_query["prompt"] == ["login"]
+            assert auth_query["max_age"] == ["600"]
+            token_specs[code_name] = {
+                "sub": "enroll-subject-1",
+                "nonce": auth_query["nonce"][0],
+                "auth_time": int(time.time()),
+            }
+            callback = client.get(
+                "/auth/oidc/callback",
+                params={"code": code_name, "state": auth_query["state"][0]},
+                headers={
+                    "x-bookward-session": enroll_session,
+                    "x-oidc-state": start.json()["csrf"],
+                },
+            )
+            assert callback.status_code == 200
+            assert callback.json()["enroll_verified"] is True
+
+        confirm_enrollment("enroll-code-1")
+        assert (
+            client.get("/auth/identities", headers={"x-bookward-session": enroll_session}).json()[
+                "enrollment_verified"
+            ]
+            is True
+        )
+        # Verification is scoped to the presenting session, not sibling sessions.
+        assert (
+            client.get("/auth/identities", headers={"x-bookward-session": sso_session}).json()[
+                "enrollment_verified"
+            ]
+            is False
+        )
+        assert (
+            client.post(
+                "/auth/password/change",
+                headers={"x-bookward-session": sso_session},
+                json={"username": "chosen-reader", "new_password": "chosen-reader-password-long"},
+            ).status_code
+            == 401
+        )
+
+        # Expired enrollment verification (> 10 minutes old) is rejected.
+        with profiles.auth_connect() as con:
+            con.execute(
+                "UPDATE auth_sessions SET enrollment_verified_at='2000-01-01T00:00:00+00:00' "
+                "WHERE account_id=?",
+                (sso_reader["id"],),
+            )
+        expired_attempt = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": enroll_session},
+            json={"username": "chosen-reader", "new_password": "chosen-reader-password-long"},
+        )
+        assert expired_attempt.status_code == 401
+
+        confirm_enrollment("enroll-code-2")
+
+        missing_username = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": enroll_session},
+            json={"new_password": "chosen-reader-password-long"},
+        )
+        assert missing_username.status_code == 400
+
+        reserved_prefix = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": enroll_session},
+            json={"username": "OIDC:spoofed", "new_password": "chosen-reader-password-long"},
+        )
+        assert reserved_prefix.status_code == 400
+
+        duplicate_username = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": enroll_session},
+            json={"username": "Taken-Name", "new_password": "chosen-reader-password-long"},
+        )
+        assert duplicate_username.status_code == 409
+
+        # Warm the personal API token cache before enrollment and verify commit drops the cached digest.
+        assert (
+            client.get(
+                "/api/v1/me", headers={"Authorization": f"Bearer {sso_api_token}"}
+            ).status_code
+            == 200
+        )
+        assert profiles.has_cached_api_token(sso_api_token) is True
+
+        enrolled = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": enroll_session},
+            json={"username": "chosen-reader", "new_password": "chosen-reader-password-long"},
+        )
+        assert enrolled.status_code == 200
+        assert enrolled.json()["username"] == "chosen-reader"
+        assert enrolled.json()["has_local_username"] is True
+        assert profiles.has_cached_api_token(sso_api_token) is False
+        rotated_session = enrolled.json()["session_token"]
+
+        # Enrolling local credentials bumps auth_version and revokes all prior sessions.
+        assert profiles.resolve_session(sso_session) is None
+        assert profiles.resolve_session(enroll_session) is None
+        assert client.get("/auth/me", headers={"x-bookward-session": sso_session}).status_code == 401
+        assert client.get("/auth/me", headers={"x-bookward-session": enroll_session}).status_code == 401
+        assert (
+            client.get("/auth/identities", headers={"x-bookward-session": rotated_session}).json()[
+                "enrollment_verified"
+            ]
+            is False
+        )
+
+        unlinked = client.delete(
+            f"/auth/identities/{identity_id}",
+            headers={"x-bookward-session": rotated_session},
+        )
+        assert unlinked.status_code == 200
+
+        local_login = client.post(
+            "/auth/login",
+            json={"username": "chosen-reader", "password": "chosen-reader-password-long"},
+        )
+        assert local_login.status_code == 200
+        assert local_login.json()["account"]["profile_id"] == sso_reader["profile_id"]
+
+        # Personal API tokens survive local credential enrollment and admin password resets
+        # while browser sessions are revoked (matching #281).
+        token_after_enroll = client.get(
+            "/api/v1/me", headers={"Authorization": f"Bearer {sso_api_token}"}
+        )
+        assert token_after_enroll.status_code == 200
+        assert token_after_enroll.json()["profile_id"] == sso_reader["profile_id"]
+        assert profiles.has_cached_api_token(sso_api_token) is True
+
+        admin_reset_after_enroll = client.post(
+            f"/admin/accounts/{sso_reader['id']}/password",
+            headers={"x-bookward-session": admin_session},
+            json={"password": "admin-reset-enrolled-password-long"},
+        )
+        assert admin_reset_after_enroll.status_code == 200
+        assert profiles.has_cached_api_token(sso_api_token) is False
+        assert client.get("/auth/me", headers={"x-bookward-session": rotated_session}).status_code == 401
+        token_after_reset = client.get(
+            "/api/v1/me", headers={"Authorization": f"Bearer {sso_api_token}"}
+        )
+        assert token_after_reset.status_code == 200
+        assert token_after_reset.json()["profile_id"] == sso_reader["profile_id"]
+        assert profiles.has_cached_api_token(sso_api_token) is True
+
+
+def test_legacy_oidc_prefixed_local_account_migrates_and_retains_login_and_reset(identity_store):
+    issuer = "https://identity.example"
+    surrogate_username = profiles.oidc_surrogate_username(issuer, "surrogate-subject")
+    legacy_password_hash = profiles.PASSWORD_HASHER.hash("legacy-local-password-123")
+    surrogate_password_hash = profiles.PASSWORD_HASHER.hash("unusable-surrogate-password-123")
+
+    for profile_id in ("b" * 32, "c" * 32, "d" * 32):
+        with profiles.auth_connect() as con:
+            con.execute("INSERT INTO profiles(id,display_name) VALUES(?,?)", (profile_id, profile_id))
+        with profile_scope(profile_id):
+            initialize(seed_demo=False)
+
+    # Simulate pre-migration accounts schema (before has_local_username existed) where a local
+    # account legitimately used an 'oidc:'-prefixed username alongside true OIDC surrogate rows.
+    with profiles.auth_connect() as con:
+        con.execute("ALTER TABLE accounts DROP COLUMN has_local_username")
+        con.execute(
+            """
+            INSERT INTO accounts(
+                id, profile_id, username, normalized_username, display_name, role, status, password_hash
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                "legacy-local-id",
+                "b" * 32,
+                "oidc:legacy-reader",
+                "oidc:legacy-reader",
+                "Legacy OIDC-Prefixed Local",
+                "user",
+                "active",
+                legacy_password_hash,
+            ),
+        )
+        con.execute(
+            "INSERT INTO oidc_identities(account_id, issuer, subject, email) VALUES (?,?,?,?)",
+            ("legacy-local-id", issuer, "linked-non-surrogate-sub", "legacy@example.test"),
+        )
+        con.execute(
+            """
+            INSERT INTO accounts(
+                id, profile_id, username, normalized_username, display_name, role, status, password_hash
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                "surrogate-id",
+                "c" * 32,
+                surrogate_username,
+                surrogate_username,
+                "Surrogate OIDC",
+                "user",
+                "active",
+                surrogate_password_hash,
+            ),
+        )
+        con.execute(
+            "INSERT INTO oidc_identities(account_id, issuer, subject, email) VALUES (?,?,?,?)",
+            ("surrogate-id", issuer, "surrogate-subject", "surrogate@example.test"),
+        )
+        con.execute(
+            """
+            INSERT INTO accounts(
+                id, profile_id, username, normalized_username, display_name, role, status, password_hash
+            ) VALUES (?,?,?,?,?,?,?,NULL)
+            """,
+            (
+                "passwordless-oidc-id",
+                "d" * 32,
+                "oidc:passwordless",
+                "oidc:passwordless",
+                "Passwordless OIDC",
+                "user",
+                "active",
+            ),
+        )
+
+    profiles.initialize_auth()
+
+    assert profiles.account_by_id("legacy-local-id")["has_local_username"] is True
+    assert profiles.account_by_id("surrogate-id")["has_local_username"] is False
+    assert profiles.account_by_id("passwordless-oidc-id")["has_local_username"] is False
+    assert profiles.authenticate_local(surrogate_username, "unusable-surrogate-password-123") is None
+
+    admin_session, _ = profiles.create_session(identity_store["id"])
+    with TestClient(app) as client:
+        # Existing local account with 'oidc:' prefix can still sign in locally.
+        login = client.post(
+            "/auth/login",
+            json={"username": "OIDC:Legacy-Reader", "password": "legacy-local-password-123"},
+        )
+        assert login.status_code == 200
+        assert login.json()["account"]["username"] == "oidc:legacy-reader"
+        assert login.json()["account"]["has_local_username"] is True
+        legacy_session = login.json()["session_token"]
+
+        # Self-service password change works without renaming the legacy username.
+        changed = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": legacy_session},
+            json={
+                "current_password": "legacy-local-password-123",
+                "new_password": "updated-legacy-password-456",
+            },
+        )
+        assert changed.status_code == 200
+        assert changed.json()["username"] == "oidc:legacy-reader"
+        assert changed.json()["has_local_username"] is True
+
+        # Admin password reset continues to work for legacy local accounts.
+        admin_reset = client.post(
+            "/admin/accounts/legacy-local-id/password",
+            headers={"x-bookward-session": admin_session},
+            json={"password": "admin-temporary-password-789"},
+        )
+        assert admin_reset.status_code == 200
+        assert profiles.account_by_id("legacy-local-id")["must_change_password"] is True
+
+        reset_login = client.post(
+            "/auth/login",
+            json={"username": "oidc:legacy-reader", "password": "admin-temporary-password-789"},
+        )
+        assert reset_login.status_code == 200
+        personal_update = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": reset_login.json()["session_token"]},
+            json={
+                "current_password": "admin-temporary-password-789",
+                "new_password": "final-legacy-password-999",
+            },
+        )
+        assert personal_update.status_code == 200
+        final_session = personal_update.json()["session_token"]
+
+        # Linked OIDC identity can be unlinked because local login is genuinely active.
+        identities = client.get(
+            "/auth/identities", headers={"x-bookward-session": final_session}
+        ).json()
+        assert identities["has_local_username"] is True
+        assert identities["password_enabled"] is True
+        unlink = client.delete(
+            f"/auth/identities/{identities['oidc_identities'][0]['id']}",
+            headers={"x-bookward-session": final_session},
+        )
+        assert unlink.status_code == 200
+
+
+def test_update_password_integrity_error_rolls_back_without_revoking_sessions(identity_store):
+    profiles.create_account("already-taken", "already-taken-password-long")
+    sso_reader = profiles.create_oidc_account(
+        "https://identity.example", "integrity-subject", "integrity@example.test", "Integrity Reader"
+    )
+    integrity_token = profiles.create_profile_api_token(
+        sso_reader["profile_id"], "Integrity Token"
+    )["token"]
+    assert profiles.authenticate_api_token(integrity_token) is not None
+    assert profiles.has_cached_api_token(integrity_token) is True
+    original_username = sso_reader["username"]
+    enroll_session, _ = profiles.create_session(sso_reader["id"])
+    sibling_session, _ = profiles.create_session(sso_reader["id"])
+    assert profiles.mark_session_enrollment_verified(enroll_session) is True
+
+    with pytest.raises(sqlite3.IntegrityError):
+        profiles.update_password(
+            sso_reader["id"], "candidate-password-long", username="Already-Taken"
+        )
+    assert profiles.has_cached_api_token(integrity_token) is True
+
+    with TestClient(app) as client:
+        conflict = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": enroll_session},
+            json={"username": "Already-Taken", "new_password": "candidate-password-long"},
+        )
+        assert conflict.status_code == 409
+        assert profiles.has_cached_api_token(integrity_token) is True
+
+        # Neither the account row nor active sessions were mutated or revoked on conflict.
+        unchanged = profiles.account_by_id(sso_reader["id"])
+        assert unchanged["username"] == original_username
+        assert unchanged["has_local_username"] is False
+        with profiles.auth_connect() as con:
+            raw = con.execute(
+                "SELECT password_hash, auth_version FROM accounts WHERE id=?",
+                (sso_reader["id"],),
+            ).fetchone()
+        assert raw["password_hash"] is None
+        assert raw["auth_version"] == 1
+        assert profiles.resolve_session(sibling_session) is not None
+        verified_session = profiles.resolve_session(enroll_session)
+        assert verified_session is not None
+        assert verified_session["enrollment_verified"] is True
+
+        # Retrying immediately with a unique username succeeds on the still-verified session.
+        retry = client.post(
+            "/auth/password/change",
+            headers={"x-bookward-session": enroll_session},
+            json={"username": "available-reader", "new_password": "candidate-password-long"},
+        )
+        assert retry.status_code == 200
+        assert retry.json()["username"] == "available-reader"
+        assert retry.json()["has_local_username"] is True
+        assert profiles.has_cached_api_token(integrity_token) is False
+        assert profiles.resolve_session(sibling_session) is None
+        assert profiles.resolve_session(enroll_session) is None
+
+
+def test_admin_password_reset_blocks_sso_only_accounts_and_rejects_reserved_usernames(identity_store):
+    sso_reader = profiles.create_oidc_account(
+        "https://identity.example", "admin-reset-subject", "sso-admin@example.test", "SSO Managed"
+    )
+    admin_session, _ = profiles.create_session(identity_store["id"])
+
+    with TestClient(app, headers={"x-bookward-session": admin_session}) as client:
+        reserved_create = client.post(
+            "/admin/accounts",
+            json={
+                "username": "oidc:manual",
+                "password": "temporary-password-123",
+                "display_name": "Reserved",
+                "role": "user",
+            },
+        )
+        assert reserved_create.status_code == 400
+
+        blocked_reset = client.post(
+            f"/admin/accounts/{sso_reader['id']}/password",
+            json={"password": "temporary-password-123"},
+        )
+        assert blocked_reset.status_code == 400
+
+    reloaded = profiles.account_by_id(sso_reader["id"])
+    assert reloaded["must_change_password"] is False
