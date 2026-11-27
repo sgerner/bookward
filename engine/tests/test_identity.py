@@ -628,6 +628,128 @@ def test_read_identity_matches_canonical_number_title_aliases(database):
     assert status == "rejected"
 
 
+def test_work_match_keys_collect_across_fields_and_reject_openlibrary_editions():
+    candidate = {
+        "title": "Different Title",
+        "author": "Different Author",
+        "openlibrary_work_id": "OL101W",
+        "quality_openlibrary_work_id": "/works/OL202W",
+        "quality_work_id": "gb-volume-999",
+        "quality_provider": "google_books",
+        "work_id": "/works/OL303W",
+        "source_url": "https://openlibrary.org/works/OL404W/Some_Book?edition=key%3A/books/OL999M",
+    }
+    keys = book_row_identity_match_keys(candidate)
+    assert ("work", "openlibrary", "OL101W") in keys
+    assert ("work", "openlibrary", "OL202W") in keys
+    assert ("work", "openlibrary", "OL303W") in keys
+    assert ("work", "openlibrary", "OL404W") in keys
+
+    edition_row = {
+        "title": "Edition Only",
+        "author": "Some Author",
+        "openlibrary_work_id": "/books/OL7353617M",
+        "quality_openlibrary_work_id": "OL7353617M",
+        "quality_work_id": "/books/OL7353617M",
+        "quality_provider": "openlibrary",
+        "work_id": "https://openlibrary.org/books/OL7353617M/Title",
+        "source_url": "https://openlibrary.org/books/OL7353617M/Title",
+    }
+    edition_work_keys = {
+        key for key in book_row_identity_match_keys(edition_row) if key[0] == "work"
+    }
+    assert edition_work_keys == set()
+
+
+def test_isbn_match_keys_gate_v6_unverified_quality_isbns_and_keep_pre_v6_legacy_dedupe(database):
+    read_keys = book_identity_match_index(
+        [{"title": "Read Book", "author": "Read Author", "isbn": "9780345538376"}]
+    )
+
+    v6_unverified = {
+        "title": "Unread Sequel",
+        "author": "Read Author",
+        "quality_status": "accepted",
+        "quality_audit_version": "candidate-quality-v6",
+        "quality_isbn13": "9780345538376",
+        "quality_isbn10": "0345538374",
+        "quality_isbn_verified": 0,
+    }
+    assert not (book_row_identity_match_keys(v6_unverified) & read_keys)
+
+    pending_requeued = {
+        **v6_unverified,
+        "quality_status": "pending",
+        "quality_audit_version": "candidate-quality-v4",
+    }
+    assert not (book_row_identity_match_keys(pending_requeued) & read_keys)
+
+    pre_v6_legacy = {
+        **v6_unverified,
+        "quality_status": "accepted",
+        "quality_audit_version": "candidate-quality-v4",
+    }
+    assert book_row_identity_match_keys(pre_v6_legacy) & read_keys
+
+    v6_verified = {
+        **v6_unverified,
+        "quality_isbn_verified": 1,
+    }
+    assert book_row_identity_match_keys(v6_verified) & read_keys
+
+    # 978 cross-format, 979 direct vs non-equivalent ISBN-10, and lowercase-x ISBN-10
+    isbn_979_keys = book_identity_match_index(
+        [{"title": "French Edition", "author": "Author", "isbn": "9791032305690"}]
+    )
+    assert book_row_identity_match_keys(
+        {"title": "Alt Title", "author": "Alt Author", "isbn13": "9791032305690"}
+    ) & isbn_979_keys
+    # 979 ISBN-13 sharing digits 4..12 with a 978/ISBN-10 stem must never collide
+    isbn_10_keys = book_identity_match_index(
+        [{"title": "978 Book", "author": "Author", "isbn": "0307474275"}]
+    )
+    assert not (
+        book_row_identity_match_keys(
+            {"title": "979 Book", "author": "Other", "isbn13": "9790307474277"}
+        )
+        & isbn_10_keys
+    )
+    # Lowercase-x ISBN-10 matches uppercase-X ISBN-10 and equivalent 978 ISBN-13
+    lowercase_x_keys = book_identity_match_index(
+        [{"title": "X Checksum Book", "author": "Author", "isbn": "043942089x"}]
+    )
+    assert book_row_identity_match_keys(
+        {"title": "Upper X", "author": "Other", "isbn10": "043942089X"}
+    ) & lowercase_x_keys
+    assert book_row_identity_match_keys(
+        {"title": "978 Equivalent", "author": "Other", "isbn13": "9780439420891"}
+    ) & lowercase_x_keys
+
+    # End-to-end DB check: pre-v6 accepted row with catalog-only ISBN stays hidden until v6 re-audit
+    with transaction() as con:
+        con.execute("UPDATE candidates SET status='rejected'")
+        con.execute(
+            "INSERT INTO reads(title,author,rating,isbn,source) VALUES(?,?,5,?,'goodreads_csv')",
+            ("Translated Read Title", "Translated Author", "9780307474278"),
+        )
+    legacy_cid = add_candidate("Original Edition Title", "Original Author", score=95)
+    v6_unverified_cid = add_candidate("Unread Companion Volume", "Original Author", score=94)
+    with transaction() as con:
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v4',"
+            "isbn13='9780307474278',isbn_verified=0 WHERE candidate_id=?",
+            (legacy_cid,),
+        )
+        con.execute(
+            "UPDATE candidate_quality SET quality_status='accepted',audit_version='candidate-quality-v6',"
+            "isbn13='9780307474278',isbn_verified=0 WHERE candidate_id=?",
+            (v6_unverified_cid,),
+        )
+    visible_ids = {item["id"] for item in recommendation_list(status="recommended", limit=None)}
+    assert legacy_cid not in visible_ids
+    assert v6_unverified_cid in visible_ids
+
+
 def test_serving_and_dedupe_match_apple_books_provider_id_when_work_id_empty(database):
     from afterword_engine.quality import _dedupe_and_hide
 

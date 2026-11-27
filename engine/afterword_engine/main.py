@@ -899,13 +899,16 @@ def _prepare_candidate_quality_recovery_job() -> tuple[str, float, str]:
 
 
 def _finish_candidate_quality_recovery_job(
-    profile_key: str, started: float
-) -> bool:
+    profile_key: str,
+    started: float,
+    quality: dict[str, Any],
+) -> tuple[bool, str | None]:
     after_ts = _recovery_clock()
     followup_deferred = False
+    followup_job_id = None
     if _has_due_quality_recovery():
         if (after_ts - started) < QUALITY_RECOVERY_CHAIN_BUDGET_SECONDS:
-            _enqueue_candidate_quality_followup()
+            followup_job_id = _enqueue_candidate_quality_followup()
         else:
             _set_quality_recovery_settings(
                 **{
@@ -927,8 +930,18 @@ def _finish_candidate_quality_recovery_job(
                 QUALITY_RETRY_QUARANTINED_BEFORE_KEY: "",
             }
         )
-    enqueue_job("read_work_identities", dedupe=True)
-    return followup_deferred
+    if quality.get("audited", 0) > 0:
+        enqueue_job("read_work_identities", dedupe=True)
+    pool_changed = bool(
+        quality.get("status_changed", 0) > 0
+        or quality.get("rejected", 0) > 0
+        or quality.get("deduped", 0) > 0
+        or quality.get("enriched", 0) > 0
+    )
+    should_score_inline = followup_job_id is None and quality.get("audited", 0) > 0
+    if not should_score_inline and pool_changed:
+        enqueue_job("score", dedupe=True)
+    return followup_deferred, followup_job_id
 
 
 def _load_source_job_context(
@@ -1076,17 +1089,21 @@ async def handle_job(kind: str):
             )
         else:
             quality = await audit_candidates(only_pending=True, limit=QUALITY_AUDIT_BATCH_SIZE)
-        followup_deferred = await asyncio.to_thread(
+        followup_deferred, followup_job_id = await asyncio.to_thread(
             _finish_candidate_quality_recovery_job,
             profile_key,
             started,
+            quality,
         )
-        scored = await score_all(
-            config.get("embedding_backend"),
-            config.get("embedding_model"),
-            config.get("embedding_url"),
-            config.get("embedding_api_key"),
-        )
+        if followup_job_id is None and quality.get("audited", 0) > 0:
+            scored = await score_all(
+                config.get("embedding_backend"),
+                config.get("embedding_model"),
+                config.get("embedding_url"),
+                config.get("embedding_api_key"),
+            )
+        else:
+            scored = 0
         return {**quality, "scored": scored, "followup_deferred": followup_deferred}
     if kind.startswith("source:"):
         try:
@@ -2554,11 +2571,10 @@ def _load_llm_rerank_inputs(connection, interaction_events: list[dict[str, Any]]
         if not batch:
             continue
         marks = ",".join("?" for _ in batch)
+        projection = _candidate_quality_identity_projection(connection)
         try:
             found = fetch(
-                "SELECT c.id,c.source_url,c.isbn13,c.isbn10,"
-                "q.work_id quality_work_id,q.provider quality_provider,"
-                "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+                f"SELECT c.id,c.source_url,c.isbn13,c.isbn10,{projection} "
                 "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
                 f"WHERE c.id IN ({marks})",
                 batch,
@@ -3530,6 +3546,50 @@ async def reading_history_scores(
         LOGGER.exception("Could not calculate current-profile reading history scores")
         raise
 
+def _candidate_quality_identity_projection(connection=None) -> str:
+    if connection is None:
+        return (
+            "q.openlibrary_work_id quality_openlibrary_work_id,"
+            "q.work_id quality_work_id,q.provider quality_provider,"
+            "q.provider_id AS quality_provider_id,"
+            "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
+            "COALESCE(q.isbn_verified,0) quality_isbn_verified,"
+            "q.quality_status quality_status,q.audit_version quality_audit_version"
+        )
+    available = {
+        str(col[1])
+        for col in connection.execute("PRAGMA table_info(candidate_quality)").fetchall()
+    }
+    ol_expr = (
+        "q.openlibrary_work_id"
+        if "openlibrary_work_id" in available
+        else "''"
+    )
+    provider_id_expr = (
+        "q.provider_id"
+        if "provider_id" in available
+        else "''"
+    )
+    verified_expr = (
+        "COALESCE(q.isbn_verified,0)"
+        if "isbn_verified" in available
+        else "0"
+    )
+    version_expr = (
+        "q.audit_version"
+        if "audit_version" in available
+        else "''"
+    )
+    return (
+        f"{ol_expr} quality_openlibrary_work_id,"
+        "q.work_id quality_work_id,q.provider quality_provider,"
+        f"{provider_id_expr} AS quality_provider_id,"
+        "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10,"
+        f"{verified_expr} quality_isbn_verified,"
+        f"q.quality_status quality_status,{version_expr} quality_audit_version"
+    )
+
+
 def _recommendation_identity_context(connection=None):
     fetch = (
         lambda sql, values=(): [dict(item) for item in connection.execute(sql, values).fetchall()]
@@ -3550,10 +3610,9 @@ def _recommendation_identity_context(connection=None):
         read_rows, read_metadata_rows
     )
     read_identity_index = ReadIdentityIndex.from_reads(read_identity_rows)
+    projection = _candidate_quality_identity_projection(connection)
     shortlist_rows = fetch(
-        "SELECT c.*,q.work_id quality_work_id,q.provider quality_provider,"
-        "q.provider_id AS quality_provider_id,"
-        "q.isbn13 quality_isbn13,q.isbn10 quality_isbn10 "
+        f"SELECT c.*,{projection} "
         "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
         "WHERE c.status IN ('saved','imported')"
     )
@@ -3616,13 +3675,10 @@ def _recommendation_rows(
         if is_decision_archive
         else " ORDER BY CASE c.status WHEN 'recommended' THEN 0 ELSE 1 END, c.score DESC, c.id DESC"
     )
+    projection = _candidate_quality_identity_projection(connection)
     query = (
-        "SELECT c.*,s.name source_name,COALESCE(s.enabled, 0) source_enabled,"
-        "q.metadata_confidence,q.quality_status,"
-        "q.work_id quality_work_id,"
-        "q.provider quality_provider,q.provider_id AS quality_provider_id,"
-        "q.isbn13 quality_isbn13,"
-        f"q.isbn10 quality_isbn10{decision_select} "
+        f"SELECT c.*,s.name source_name,COALESCE(s.enabled, 0) source_enabled,"
+        f"q.metadata_confidence,{projection}{decision_select} "
         "FROM candidates c "
         "LEFT JOIN sources s ON s.id=c.source_id "
         "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
@@ -4176,6 +4232,7 @@ def mark_recommendation_read(candidate_id: int, payload: MarkReadIn):
     with transaction() as con:
         candidate = con.execute(
             "SELECT c.id,c.title,c.author,c.source_url,"
+            "q.openlibrary_work_id quality_openlibrary_work_id,"
             "q.work_id quality_work_id,q.provider quality_provider,"
             "COALESCE(NULLIF(q.isbn13,''),NULLIF(c.isbn13,''),'') quality_isbn13,"
             "COALESCE(NULLIF(q.isbn10,''),NULLIF(c.isbn10,''),'') quality_isbn10 "
@@ -5390,15 +5447,12 @@ def digest_review(period: str = Query(min_length=8, max_length=8)):
         items: list[dict[str, Any]] = []
         if ids:
             placeholders = ",".join("?" for _ in ids)
+            projection = _candidate_quality_identity_projection(connection)
             candidate_rows = {
                 int(item["id"]): dict(item)
                 for item in connection.execute(
-                    "SELECT c.*,s.name source_name,COALESCE(s.enabled,1) source_enabled,"
-                    "q.metadata_confidence,q.quality_status,"
-                    "q.work_id quality_work_id,"
-                    "q.provider quality_provider,q.provider_id AS quality_provider_id,"
-                    "q.isbn13 quality_isbn13,"
-                    "q.isbn10 quality_isbn10 "
+                    f"SELECT c.*,s.name source_name,COALESCE(s.enabled,1) source_enabled,"
+                    f"q.metadata_confidence,{projection} "
                     "FROM candidates c "
                     "JOIN sources s ON s.id=c.source_id "
                     "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "

@@ -1613,6 +1613,309 @@ MIGRATIONS = [
           );
         """,
     ),
+    (
+        33,
+        """
+        ALTER TABLE candidate_quality ADD COLUMN openlibrary_work_id TEXT NOT NULL DEFAULT '';
+        ALTER TABLE candidate_quality ADD COLUMN isbn_verified INTEGER NOT NULL DEFAULT 0
+            CHECK(isbn_verified IN (0, 1));
+        CREATE INDEX IF NOT EXISTS idx_candidate_quality_openlibrary_work_id
+            ON candidate_quality(openlibrary_work_id);
+
+        UPDATE candidate_quality
+        SET openlibrary_work_id = CASE
+            WHEN INSTR(path_part, '/BOOKS/') > 0 THEN ''
+            WHEN INSTR(path_part, '/WORKS/') > 0 THEN (
+                SELECT CASE
+                    WHEN tok GLOB 'OL[0-9]*W'
+                         AND SUBSTR(tok, 3, LENGTH(tok) - 3) NOT GLOB '*[^0-9]*'
+                         AND (
+                             after_w = ''
+                             OR SUBSTR(after_w, 1, 1) IN ('/', '?', '#')
+                             OR (
+                                 SUBSTR(after_w, 1, 5) = '.JSON'
+                                 AND (LENGTH(after_w) = 5 OR SUBSTR(after_w, 6, 1) IN ('/', '?', '#'))
+                             )
+                         )
+                    THEN '/works/' || tok
+                    ELSE ''
+                END
+                FROM (
+                    SELECT
+                        CASE WHEN INSTR(tail, 'W') > 0 THEN SUBSTR(tail, 1, INSTR(tail, 'W')) ELSE '' END AS tok,
+                        CASE WHEN INSTR(tail, 'W') > 0 THEN SUBSTR(tail, INSTR(tail, 'W') + 1) ELSE '' END AS after_w
+                    FROM (
+                        SELECT SUBSTR(
+                            path_part,
+                            INSTR(path_part, '/WORKS/') + 7
+                        ) AS tail
+                    )
+                )
+            )
+            WHEN LOWER(TRIM(provider)) = 'openlibrary'
+                 AND path_part GLOB 'OL[0-9]*W'
+                 AND SUBSTR(path_part, 3, LENGTH(path_part) - 3) NOT GLOB '*[^0-9]*'
+            THEN '/works/' || path_part
+            ELSE ''
+        END
+        FROM (
+            SELECT
+                cq.candidate_id AS cid,
+                CASE
+                    WHEN INSTR(no_query, '#') > 0 THEN SUBSTR(no_query, 1, INSTR(no_query, '#') - 1)
+                    ELSE no_query
+                END AS path_part
+            FROM candidate_quality cq
+            JOIN (
+                SELECT
+                    candidate_id,
+                    CASE
+                        WHEN INSTR(UPPER(TRIM(work_id)), '?') > 0
+                        THEN SUBSTR(UPPER(TRIM(work_id)), 1, INSTR(UPPER(TRIM(work_id)), '?') - 1)
+                        ELSE UPPER(TRIM(work_id))
+                    END AS no_query
+                FROM candidate_quality
+                WHERE TRIM(work_id) != ''
+            ) stripped ON stripped.candidate_id = cq.candidate_id
+        ) parsed
+        WHERE candidate_quality.candidate_id = parsed.cid;
+
+        UPDATE candidate_quality
+        SET openlibrary_work_id = COALESCE((
+            SELECT CASE
+                WHEN INSTR(path_part, '/BOOKS/') > 0 THEN ''
+                WHEN tok GLOB 'OL[0-9]*W'
+                     AND SUBSTR(tok, 3, LENGTH(tok) - 3) NOT GLOB '*[^0-9]*'
+                     AND (
+                         after_w = ''
+                         OR SUBSTR(after_w, 1, 1) = '/'
+                         OR (
+                             SUBSTR(after_w, 1, 5) = '.JSON'
+                             AND (LENGTH(after_w) = 5 OR SUBSTR(after_w, 6, 1) = '/')
+                         )
+                     )
+                THEN '/works/' || tok
+                ELSE ''
+            END
+            FROM (
+                SELECT
+                    path_part,
+                    CASE WHEN INSTR(tail, 'W') > 0 THEN SUBSTR(tail, 1, INSTR(tail, 'W')) ELSE '' END AS tok,
+                    CASE WHEN INSTR(tail, 'W') > 0 THEN SUBSTR(tail, INSTR(tail, 'W') + 1) ELSE '' END AS after_w
+                FROM (
+                    SELECT
+                        path_part,
+                        CASE
+                            WHEN INSTR(path_part, '/WORKS/') > 0
+                            THEN SUBSTR(path_part, INSTR(path_part, '/WORKS/') + 7)
+                            ELSE ''
+                        END AS tail
+                    FROM (
+                        SELECT
+                            CASE
+                                WHEN INSTR(no_query, '#') > 0 THEN SUBSTR(no_query, 1, INSTR(no_query, '#') - 1)
+                                ELSE no_query
+                            END AS path_part
+                        FROM (
+                            SELECT
+                                CASE
+                                    WHEN INSTR(UPPER(TRIM(c.source_url)), '?') > 0
+                                    THEN SUBSTR(UPPER(TRIM(c.source_url)), 1, INSTR(UPPER(TRIM(c.source_url)), '?') - 1)
+                                    ELSE UPPER(TRIM(c.source_url))
+                                END AS no_query
+                            FROM candidates c
+                            WHERE c.id = candidate_quality.candidate_id
+                              AND INSTR(UPPER(COALESCE(c.source_url, '')), '/WORKS/') > 0
+                        )
+                    )
+                )
+            )
+        ), '')
+        WHERE openlibrary_work_id = ''
+          AND EXISTS (
+              SELECT 1 FROM candidates c
+              WHERE c.id = candidate_quality.candidate_id
+                AND INSTR(UPPER(COALESCE(c.source_url, '')), '/WORKS/') > 0
+          );
+
+        UPDATE candidate_quality
+        SET isbn_verified = 1
+        WHERE EXISTS (
+            SELECT 1
+            FROM (
+                SELECT
+                    c13,
+                    c10,
+                    q13,
+                    q10,
+                    CASE
+                        WHEN LENGTH(c13) = 13
+                             AND c13 NOT GLOB '*[^0-9]*'
+                             AND SUBSTR(c13, 1, 3) IN ('978', '979')
+                             AND ((10 - ((
+                                 CAST(SUBSTR(c13, 1, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(c13, 2, 1) AS INT)
+                                 + CAST(SUBSTR(c13, 3, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(c13, 4, 1) AS INT)
+                                 + CAST(SUBSTR(c13, 5, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(c13, 6, 1) AS INT)
+                                 + CAST(SUBSTR(c13, 7, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(c13, 8, 1) AS INT)
+                                 + CAST(SUBSTR(c13, 9, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(c13, 10, 1) AS INT)
+                                 + CAST(SUBSTR(c13, 11, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(c13, 12, 1) AS INT)
+                             ) % 10)) % 10) = CAST(SUBSTR(c13, 13, 1) AS INT)
+                        THEN 1 ELSE 0
+                    END AS c13_valid,
+                    CASE
+                        WHEN LENGTH(c10) = 10
+                             AND SUBSTR(c10, 1, 9) NOT GLOB '*[^0-9]*'
+                             AND SUBSTR(c10, 10, 1) GLOB '[0-9X]'
+                             AND ((11 - ((
+                                 10 * CAST(SUBSTR(c10, 1, 1) AS INT)
+                                 + 9 * CAST(SUBSTR(c10, 2, 1) AS INT)
+                                 + 8 * CAST(SUBSTR(c10, 3, 1) AS INT)
+                                 + 7 * CAST(SUBSTR(c10, 4, 1) AS INT)
+                                 + 6 * CAST(SUBSTR(c10, 5, 1) AS INT)
+                                 + 5 * CAST(SUBSTR(c10, 6, 1) AS INT)
+                                 + 4 * CAST(SUBSTR(c10, 7, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(c10, 8, 1) AS INT)
+                                 + 2 * CAST(SUBSTR(c10, 9, 1) AS INT)
+                             ) % 11)) % 11) = CASE WHEN SUBSTR(c10, 10, 1) = 'X' THEN 10 ELSE CAST(SUBSTR(c10, 10, 1) AS INT) END
+                        THEN 1 ELSE 0
+                    END AS c10_valid,
+                    CASE
+                        WHEN LENGTH(q13) = 13
+                             AND q13 NOT GLOB '*[^0-9]*'
+                             AND SUBSTR(q13, 1, 3) IN ('978', '979')
+                             AND ((10 - ((
+                                 CAST(SUBSTR(q13, 1, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(q13, 2, 1) AS INT)
+                                 + CAST(SUBSTR(q13, 3, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(q13, 4, 1) AS INT)
+                                 + CAST(SUBSTR(q13, 5, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(q13, 6, 1) AS INT)
+                                 + CAST(SUBSTR(q13, 7, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(q13, 8, 1) AS INT)
+                                 + CAST(SUBSTR(q13, 9, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(q13, 10, 1) AS INT)
+                                 + CAST(SUBSTR(q13, 11, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(q13, 12, 1) AS INT)
+                             ) % 10)) % 10) = CAST(SUBSTR(q13, 13, 1) AS INT)
+                        THEN 1 ELSE 0
+                    END AS q13_valid,
+                    CASE
+                        WHEN LENGTH(q10) = 10
+                             AND SUBSTR(q10, 1, 9) NOT GLOB '*[^0-9]*'
+                             AND SUBSTR(q10, 10, 1) GLOB '[0-9X]'
+                             AND ((11 - ((
+                                 10 * CAST(SUBSTR(q10, 1, 1) AS INT)
+                                 + 9 * CAST(SUBSTR(q10, 2, 1) AS INT)
+                                 + 8 * CAST(SUBSTR(q10, 3, 1) AS INT)
+                                 + 7 * CAST(SUBSTR(q10, 4, 1) AS INT)
+                                 + 6 * CAST(SUBSTR(q10, 5, 1) AS INT)
+                                 + 5 * CAST(SUBSTR(q10, 6, 1) AS INT)
+                                 + 4 * CAST(SUBSTR(q10, 7, 1) AS INT)
+                                 + 3 * CAST(SUBSTR(q10, 8, 1) AS INT)
+                                 + 2 * CAST(SUBSTR(q10, 9, 1) AS INT)
+                             ) % 11)) % 11) = CASE WHEN SUBSTR(q10, 10, 1) = 'X' THEN 10 ELSE CAST(SUBSTR(q10, 10, 1) AS INT) END
+                        THEN 1 ELSE 0
+                    END AS q10_valid
+                FROM (
+                    SELECT
+                        REPLACE(REPLACE(UPPER(TRIM(COALESCE(c.isbn13, ''))), '-', ''), ' ', '') AS c13,
+                        REPLACE(REPLACE(UPPER(TRIM(COALESCE(c.isbn10, ''))), '-', ''), ' ', '') AS c10,
+                        REPLACE(REPLACE(UPPER(TRIM(COALESCE(candidate_quality.isbn13, ''))), '-', ''), ' ', '') AS q13,
+                        REPLACE(REPLACE(UPPER(TRIM(COALESCE(candidate_quality.isbn10, ''))), '-', ''), ' ', '') AS q10
+                    FROM candidates c
+                    WHERE c.id = candidate_quality.candidate_id
+                )
+            ) norm
+            WHERE (norm.c13_valid = 1 AND norm.q13_valid = 1 AND norm.q13 = norm.c13)
+               OR (norm.c10_valid = 1 AND norm.q10_valid = 1 AND norm.q10 = norm.c10)
+               OR (
+                   norm.c13_valid = 1
+                   AND norm.q10_valid = 1
+                   AND SUBSTR(norm.c13, 1, 3) = '978'
+                   AND SUBSTR(norm.c13, 4, 9) = SUBSTR(norm.q10, 1, 9)
+               )
+               OR (
+                   norm.c10_valid = 1
+                   AND norm.q13_valid = 1
+                   AND SUBSTR(norm.q13, 1, 3) = '978'
+                   AND SUBSTR(norm.q13, 4, 9) = SUBSTR(norm.c10, 1, 9)
+               )
+        );
+
+        CREATE TEMP TABLE _migration_33_requeue AS
+        SELECT c.id AS candidate_id
+        FROM candidates c
+        JOIN candidate_quality q ON q.candidate_id = c.id
+        WHERE c.status = 'rejected'
+          AND TRIM(COALESCE(c.isbn13, '')) = ''
+          AND TRIM(COALESCE(c.isbn10, '')) = ''
+          AND q.quality_status = 'rejected'
+          AND (TRIM(COALESCE(q.isbn13, '')) != '' OR TRIM(COALESCE(q.isbn10, '')) != '')
+          AND json_valid(q.flags_json)
+          AND EXISTS (
+              SELECT 1 FROM json_each(q.flags_json)
+              WHERE value IN ('read_overlap', 'duplicate_identity')
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM json_each(q.flags_json)
+              WHERE value IN (
+                  'missing_title',
+                  'noise_title',
+                  'missing_author',
+                  'unknown_author',
+                  'title_equals_author',
+                  'title_contains_url',
+                  'shortlisted_overlap'
+              )
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM feedback f
+              WHERE f.candidate_id = c.id
+                AND f.undone_at IS NULL
+                AND f.action IN ('reject', 'maybe_later')
+                AND f.id = (
+                    SELECT MAX(f2.id) FROM feedback f2
+                    WHERE f2.candidate_id = c.id
+                      AND f2.undone_at IS NULL
+                )
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM recommendation_events e
+              WHERE e.candidate_id = c.id
+                AND e.event_type IN ('reject', 'maybe_later')
+                AND e.id = (
+                    SELECT MAX(e2.id) FROM recommendation_events e2
+                    WHERE e2.candidate_id = c.id
+                )
+          );
+
+        UPDATE candidates
+        SET status = 'new', updated_at = CURRENT_TIMESTAMP
+        WHERE id IN (SELECT candidate_id FROM _migration_33_requeue);
+
+        UPDATE candidate_quality
+        SET quality_status = 'pending',
+            flags_json = COALESCE(
+                (
+                    SELECT json_group_array(value)
+                    FROM json_each(candidate_quality.flags_json)
+                    WHERE value NOT IN ('read_overlap', 'duplicate_identity')
+                ),
+                '[]'
+            ),
+            isbn_verified = 0,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE candidate_id IN (SELECT candidate_id FROM _migration_33_requeue);
+
+        DROP TABLE _migration_33_requeue;
+        """,
+    ),
 ]
 
 # Digest settings are stored in the same encrypted key/value store as the
@@ -2270,20 +2573,40 @@ def _backfill_source_isbns(con):
             continue
         next_isbn13 = candidate["isbn13"] or isbn13
         next_isbn10 = candidate["isbn10"] or isbn10
-        con.execute(
-            "UPDATE candidates SET isbn13=?,isbn10=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (next_isbn13, next_isbn10, candidate["id"]),
-        )
+        if next_isbn13 != candidate["isbn13"] or next_isbn10 != candidate["isbn10"]:
+            con.execute(
+                "UPDATE candidates SET isbn13=?,isbn10=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (next_isbn13, next_isbn10, candidate["id"]),
+            )
         # Do not overwrite a provider identifier that was already recorded for
-        # an accepted or ambiguous match. Blank ledger fields are safe to fill
-        # for pending/quarantined rows and let the next audit use source proof.
+        # an accepted or ambiguous match, or mix an unverified catalog ISBN with
+        # a different source ISBN. Blank or matching ledger fields are safe to
+        # fill/verify for pending/quarantined rows and let the next audit use
+        # source proof.
         con.execute(
             """UPDATE candidate_quality SET
                 isbn13=CASE WHEN isbn13='' THEN ? ELSE isbn13 END,
                 isbn10=CASE WHEN isbn10='' THEN ? ELSE isbn10 END,
+                isbn_verified=1,
                 updated_at=CURRENT_TIMESTAMP
-            WHERE candidate_id=? AND quality_status IN ('pending','quarantine')""",
-            (next_isbn13, next_isbn10, candidate["id"]),
+            WHERE candidate_id=?
+              AND quality_status IN ('pending','quarantine')
+              AND (isbn13='' OR isbn13=?)
+              AND (isbn10='' OR UPPER(isbn10)=UPPER(?))
+              AND (
+                  (isbn13='' AND ? != '')
+                  OR (isbn10='' AND ? != '')
+                  OR isbn_verified=0
+              )""",
+            (
+                next_isbn13,
+                next_isbn10,
+                candidate["id"],
+                next_isbn13,
+                next_isbn10,
+                next_isbn13,
+                next_isbn10,
+            ),
         )
 
 def read_restore_epoch(con: sqlite3.Connection) -> int:
@@ -2746,13 +3069,35 @@ def purge_demo_reads(con: sqlite3.Connection) -> int:
         and event_row["candidate_id"] is not None
     }
 
+    available_quality_cols = {
+        str(col[1])
+        for col in con.execute("PRAGMA table_info(candidate_quality)").fetchall()
+    }
+    ol_expr = (
+        "q.openlibrary_work_id"
+        if "openlibrary_work_id" in available_quality_cols
+        else "''"
+    )
+    verified_expr = (
+        "COALESCE(q.isbn_verified, 0)"
+        if "isbn_verified" in available_quality_cols
+        else "0"
+    )
+    version_expr = (
+        "COALESCE(q.audit_version, '')"
+        if "audit_version" in available_quality_cols
+        else "''"
+    )
     read_candidates = [
         dict(item)
         for item in con.execute(
-            "SELECT c.*, q.work_id quality_work_id, q.provider quality_provider, "
+            f"SELECT c.*, {ol_expr} AS quality_openlibrary_work_id, "
+            "q.work_id quality_work_id, q.provider quality_provider, "
             "q.provider_id AS quality_provider_id, "
             "q.isbn13 quality_isbn13, q.isbn10 quality_isbn10, "
+            f"{verified_expr} AS quality_isbn_verified, "
             "COALESCE(q.quality_status, 'pending') AS quality_status, "
+            f"{version_expr} AS quality_audit_version, "
             "COALESCE(s.enabled, 0) AS source_enabled "
             "FROM candidates c "
             "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "

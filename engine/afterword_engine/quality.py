@@ -53,10 +53,12 @@ from .http_bounds import JSON_CONTENT_TYPES, stream_response_async
 from .identity import (
     ReadIdentityIndex,
     _AUTHOR_SUFFIXES,
+    _OPEN_LIBRARY_EDITION,
     _title_without_format_suffix,
     book_author_identity_key,
     book_identity,
     book_identity_match_index,
+    book_openlibrary_work_id,
     book_row_identity_match_keys,
     canonical_part,
 )
@@ -65,7 +67,7 @@ from .jobs import current_job_stop_requested, update_job_progress
 
 
 LOGGER = logging.getLogger(__name__)
-QUALITY_VERSION = "candidate-quality-v5"
+QUALITY_VERSION = "candidate-quality-v6"
 _NON_CATALOG_PROVIDERS = frozenset({"source", "penguinrandomhouse"})
 _POLLUTION_FLAGS = frozenset(
     {
@@ -845,6 +847,9 @@ def _select_best_provider_match(
             evidence, verified = _isbn_identifier_evidence(isbn, identifiers)
             fetch_trace["identifier_evidence"] = evidence
             fetch_trace["identifier_verified"] = verified
+            best["isbn_verified"] = bool(isbn and verified)
+        else:
+            best["isbn_verified"] = False
         best["metadata_provenance"]["fetch_trace"] = [fetch_trace]
     else:
         fetch_trace["status"] = "no_match"
@@ -933,6 +938,12 @@ async def _open_library_match(
         _parsed_release_date, release_date_kind, release_date_source_field = _openlibrary_publication_date(doc)
         release_date = _text(doc.get(release_date_source_field), 32) if release_date_kind else ""
         provider_id = str(doc.get("key") or "")
+        canonical_work_id = book_openlibrary_work_id({"openlibrary_work_id": provider_id})
+        work_id = (
+            ""
+            if _OPEN_LIBRARY_EDITION.search(provider_id)
+            else (canonical_work_id or (provider_id if provider_id.startswith("/works/") else ""))
+        )
         genres = _catalog_genres(doc.get("subject"), limit=METADATA_GENRE_LIMIT)
         source_payload = {
             "key": provider_id,
@@ -949,7 +960,7 @@ async def _open_library_match(
         match = _provider_match(
             provider="openlibrary",
             provider_id=provider_id,
-            work_id=provider_id,
+            work_id=work_id,
             title=title,
             author=author,
             catalog_title=str(doc.get("title") or ""),
@@ -969,6 +980,7 @@ async def _open_library_match(
             identifier_evidence=doc_evidence,
             identifier_verified=doc_verified,
         )
+        match["openlibrary_work_id"] = canonical_work_id
         candidates.append(match)
     return _select_best_provider_match(
         candidates,
@@ -1084,7 +1096,7 @@ async def _google_books_match(
         match = _provider_match(
             provider="google_books",
             provider_id=provider_id,
-            work_id=provider_id,
+            work_id="",
             title=title,
             author=author,
             catalog_title=str(info.get("title") or ""),
@@ -1103,6 +1115,7 @@ async def _google_books_match(
             identifier_evidence=doc_evidence,
             identifier_verified=doc_verified,
         )
+        match["openlibrary_work_id"] = ""
         candidates.append(match)
     return _select_best_provider_match(
         candidates,
@@ -1230,6 +1243,7 @@ async def _apple_books_match(
             genres=genres,
             source_payload=source_payload,
         )
+        match["openlibrary_work_id"] = ""
         candidates.append(match)
     return _select_best_provider_match(
         candidates,
@@ -1480,30 +1494,31 @@ async def resolve_catalog_match(
                 bool(prior.get("identifier_verified")),
             ) if prior else None
             if prior is None or rank > prior_rank:
-                merged = dict(match)
-                if prior and prior.get("identifier_verified") and not merged.get("identifier_verified"):
-                    merged["identifier_verified"] = True
-                    merged["identifier_evidence"] = "matched"
-                by_record[record_key] = merged
-            elif prior and match.get("identifier_verified") and not prior.get("identifier_verified"):
-                prior = dict(prior)
-                prior["identifier_verified"] = True
-                prior["identifier_evidence"] = "matched"
-                by_record[record_key] = prior
+                chosen = dict(match)
+                other = prior
+            else:
+                chosen = dict(prior)
+                other = match
+            if other and other.get("identifier_verified") and not chosen.get("identifier_verified"):
+                chosen["identifier_verified"] = True
+                chosen["identifier_evidence"] = "matched"
+            if other and other.get("isbn_verified") and not chosen.get("isbn_verified"):
+                chosen["isbn13"], chosen["isbn10"] = isbn_parts(
+                    other.get("isbn13", ""),
+                    other.get("isbn10", ""),
+                    chosen.get("isbn13", ""),
+                    chosen.get("isbn10", ""),
+                )
+                chosen["isbn_verified"] = True
+            by_record[record_key] = chosen
         records = list(by_record.values())
         verified_records = [record for record in records if accepted(record)]
-        identity_record = max(
-            verified_records or records,
-            key=lambda record: (
-                accepted(record),
-                bool(record.get("identifier_verified")),
-                record.get("identifier_evidence") != "mismatch",
-                record.get("quality_score", 0),
-            ),
-        )
         metadata_records = verified_records or []
         if not metadata_records:
-            identity_record = dict(identity_record)
+            identity_record = dict(max(records, key=lambda record: record["quality_score"]))
+            identity_record["work_id"] = ""
+            identity_record["openlibrary_work_id"] = ""
+            identity_record["isbn_verified"] = False
             identity_record["metadata_provenance"] = {
                 "fetched_at": _utc_now(),
                 "normalization_version": METADATA_NORMALIZATION_VERSION,
@@ -1517,9 +1532,73 @@ async def resolve_catalog_match(
                 identity_record["pollution_flags"] = sorted(detected_pollution)
             return identity_record
 
+        identity_record = max(
+            verified_records,
+            key=lambda record: (
+                accepted(record),
+                bool(record.get("identifier_verified")),
+                record.get("identifier_evidence") != "mismatch",
+                record.get("quality_score", 0),
+                bool(record.get("isbn_verified")),
+            ),
+        )
         has_isbn_verified = bool(
             query_isbn and any(record.get("identifier_verified") for record in metadata_records)
         )
+        openlibrary_records = [
+            record
+            for record in verified_records
+            if record.get("provider") == "openlibrary"
+            and not (has_isbn_verified and record.get("identifier_evidence") == "mismatch")
+            and book_openlibrary_work_id(
+                {
+                    "openlibrary_work_id": record.get("openlibrary_work_id")
+                    or record.get("work_id")
+                    or record.get("provider_id")
+                }
+            )
+        ]
+        best_openlibrary_record = max(
+            openlibrary_records,
+            key=lambda record: (
+                bool(record.get("isbn_verified")),
+                record.get("quality_score", 0),
+                record.get("release_date_source_field") in {"first_publish_year", "first_publish_date"},
+            ),
+            default=None,
+        )
+        openlibrary_work_id = (
+            book_openlibrary_work_id(
+                {
+                    "openlibrary_work_id": best_openlibrary_record.get("openlibrary_work_id")
+                    or best_openlibrary_record.get("work_id")
+                    or best_openlibrary_record.get("provider_id")
+                }
+            )
+            if best_openlibrary_record
+            else ""
+        )
+        verified_isbn_record = max(
+            (record for record in verified_records if record.get("isbn_verified")),
+            key=lambda record: record.get("quality_score", 0),
+            default=None,
+        )
+        if verified_isbn_record is not None:
+            resolved_isbn13, resolved_isbn10 = isbn_parts(
+                source_isbn13,
+                source_isbn10,
+                verified_isbn_record.get("isbn13", ""),
+                verified_isbn_record.get("isbn10", ""),
+            )
+            isbn_verified = True
+        else:
+            resolved_isbn13, resolved_isbn10 = isbn_parts(
+                source_isbn13,
+                source_isbn10,
+                identity_record.get("isbn13", ""),
+                identity_record.get("isbn10", ""),
+            )
+            isbn_verified = bool(source_isbn13 or source_isbn10)
         description_records = [record for record in metadata_records if record.get("description")]
         description_record = max(
             description_records,
@@ -1608,6 +1687,10 @@ async def resolve_catalog_match(
         if primary_unavailable and result.get("provider") == "apple_books":
             result["primary_provider_unavailable"] = True
         result.update({
+            "openlibrary_work_id": openlibrary_work_id,
+            "isbn13": resolved_isbn13,
+            "isbn10": resolved_isbn10,
+            "isbn_verified": isbn_verified,
             "description": description,
             "description_kind": description_record.get("description_kind", "") if description_record else "",
             "description_source_field": description_record.get("description_source_field", "") if description_record else "",
@@ -1729,7 +1812,15 @@ async def _audit_one(
         [candidate.get("isbn13"), candidate.get("isbn10"), candidate.get("isbn")],
         candidate.get("source_url", ""),
     )
-    source_identifiers = {"isbn13": source_isbn13, "isbn10": source_isbn10}
+    source_work_id = book_openlibrary_work_id(
+        {"source_url": candidate.get("source_url", "")}
+    )
+    source_identifiers = {
+        "isbn13": source_isbn13,
+        "isbn10": source_isbn10,
+        "isbn_verified": int(bool(source_isbn13 or source_isbn10)),
+        "openlibrary_work_id": source_work_id,
+    }
     if any(flag in flags for flag in ("missing_title", "noise_title", "missing_author", "unknown_author", "title_equals_author", "title_contains_url")):
         return {
             "candidate_id": int(candidate["id"]),
@@ -1804,14 +1895,28 @@ async def _audit_one(
             accepted_flags.append("catalog_provider_unavailable")
             if provider_rate_limited:
                 accepted_flags.append("catalog_provider_rate_limited")
+        match_isbn10 = str(match.get("isbn10") or "")
+        final_isbn13 = source_isbn13 or str(match.get("isbn13") or "")
+        final_isbn10 = source_isbn10 or (
+            match_isbn10
+            if match_isbn10 and (not final_isbn13 or canonical_isbn(match_isbn10) == final_isbn13)
+            else ""
+        )
+        isbn_verified = int(
+            bool(source_isbn13 or source_isbn10 or match.get("isbn_verified"))
+        )
+        openlibrary_work_id = str(match.get("openlibrary_work_id") or "") or source_work_id
         return {
             "candidate_id": int(candidate["id"]),
             "quality_status": "accepted",
             "quality_score": match["quality_score"],
             **match,
             "flags": sorted(set(accepted_flags)),
-            "isbn13": source_isbn13 or match.get("isbn13", ""),
-            "isbn10": source_isbn10 or match.get("isbn10", ""),
+            "work_id": str(match.get("work_id") or ""),
+            "openlibrary_work_id": openlibrary_work_id,
+            "isbn13": final_isbn13,
+            "isbn10": final_isbn10,
+            "isbn_verified": isbn_verified,
         }
 
     if not match or provider_failed_transiently:
@@ -1901,10 +2006,30 @@ async def _audit_one(
                     or candidate.get("work_id")
                     or ""
                 ).strip(),
+                "openlibrary_work_id": book_openlibrary_work_id(
+                    {
+                        "openlibrary_work_id": candidate.get("_existing_openlibrary_work_id")
+                        or candidate.get("openlibrary_work_id")
+                        or "",
+                        "quality_provider": existing_provider,
+                        "quality_work_id": candidate.get("_existing_work_id")
+                        or candidate.get("work_id")
+                        or "",
+                        "source_url": candidate.get("source_url", ""),
+                    }
+                ),
                 "isbn13": source_isbn13
                 or str(candidate.get("_existing_quality_isbn13") or "").strip(),
                 "isbn10": source_isbn10
                 or str(candidate.get("_existing_quality_isbn10") or "").strip(),
+                "isbn_verified": int(
+                    bool(
+                        source_isbn13
+                        or source_isbn10
+                        or candidate.get("_existing_isbn_verified")
+                        or candidate.get("isbn_verified")
+                    )
+                ),
                 "title_match": float(existing_title_match or 0.0),
                 "author_match": float(existing_author_match or 0.0),
                 "metadata_provenance": match.get("metadata_provenance", {}),
@@ -2023,6 +2148,8 @@ def candidate_quality_audit_eligibility(
         "OR q.audit_version='legacy-pending-audit-v1' "
         "OR (q.quality_status IN ('accepted','quarantine') "
         "AND COALESCE(q.audit_version,'')!=? "
+        "AND ("
+        "(COALESCE(q.audit_version,'')!='candidate-quality-v5' "
         "AND (COALESCE(c.isbn13,'')!='' OR COALESCE(c.isbn10,'')!='' "
         "OR COALESCE(q.isbn13,'')!='' OR COALESCE(q.isbn10,'')!='' "
         "OR LOWER(COALESCE(c.source_url,'')) LIKE '%amazon.%' "
@@ -2031,6 +2158,16 @@ def candidate_quality_audit_eligibility(
         "OR EXISTS(SELECT 1 FROM metadata_field_provenance mfp "
         "WHERE mfp.entity_type='candidate' AND mfp.entity_id=c.id "
         "AND mfp.provider NOT IN ('source','penguinrandomhouse')))))) "
+        "OR (COALESCE(q.audit_version,'')='candidate-quality-v5' "
+        "AND ((COALESCE(q.isbn_verified,0)=0 "
+        "AND (COALESCE(c.isbn13,'')!='' OR COALESCE(c.isbn10,'')!='' "
+        "OR COALESCE(q.isbn13,'')!='' OR COALESCE(q.isbn10,'')!='' "
+        "OR LOWER(COALESCE(c.source_url,'')) LIKE '%amazon.%')) "
+        "OR (q.quality_status='accepted' AND COALESCE(q.openlibrary_work_id,'')='' AND ("
+        "COALESCE(q.provider,'')!='' OR COALESCE(q.metadata_provider,'')!='' "
+        "OR EXISTS(SELECT 1 FROM metadata_field_provenance mfp "
+        "WHERE mfp.entity_type='candidate' AND mfp.entity_id=c.id "
+        "AND mfp.provider NOT IN ('source','penguinrandomhouse')))))))) "
         "OR (q.quality_status IN ('accepted','quarantine') "
         "AND (q.flags_json LIKE '%catalog_provider_unavailable%' "
         "OR (q.quality_status='accepted' AND q.flags_json LIKE '%catalog_primary_unavailable%')) "
@@ -2102,15 +2239,33 @@ def _due_audit_reason(
     if legacy_apple_without_work_id:
         return "legacy_apple_work_id"
     if status in {"accepted", "quarantine"} and audit_version != QUALITY_VERSION:
-        if valid_isbn:
-            return "prior_version_isbn"
-        if corrupt_isbn_only:
-            return None
         has_catalog_attribution = bool(
             str(candidate.get("q_provider") or "").strip()
             or str(candidate.get("q_metadata_provider") or "").strip()
             or candidate.get("has_catalog_provenance")
         )
+        if audit_version == "candidate-quality-v5":
+            if valid_isbn and not bool(candidate.get("q_isbn_verified")):
+                return "prior_version_isbn"
+            if corrupt_isbn_only:
+                return None
+            if (
+                status == "accepted"
+                and has_catalog_attribution
+                and not str(candidate.get("q_openlibrary_work_id") or "").strip()
+            ):
+                return "prior_version_catalog"
+            if has_outage_flag and (
+                outage_due or (status == "quarantine" and include_quarantined and quarantine_due)
+            ):
+                return "outage_retry"
+            if status == "quarantine" and quarantine_due:
+                return "quarantine_retry"
+            return None
+        if valid_isbn:
+            return "prior_version_isbn"
+        if corrupt_isbn_only:
+            return None
         if status == "accepted" and has_catalog_attribution:
             return "prior_version_catalog"
         if status == "quarantine" and has_outage_flag and outage_due:
@@ -2144,7 +2299,9 @@ def _due_candidate_quality_page_rows(
         "SELECT c.id,c.isbn13 AS c_isbn13,c.isbn10 AS c_isbn10,c.source_url,"
         "q.quality_status,q.audit_version,q.flags_json,"
         "q.isbn13 AS q_isbn13,q.isbn10 AS q_isbn10,"
+        "COALESCE(q.isbn_verified,0) AS q_isbn_verified,"
         "q.provider AS q_provider,q.provider_id AS q_provider_id,q.work_id AS q_work_id,"
+        "COALESCE(q.openlibrary_work_id,'') AS q_openlibrary_work_id,"
         "q.audited_at AS q_audited_at,q.metadata_provider AS q_metadata_provider,"
         "CASE WHEN julianday(COALESCE(q.audited_at,q.updated_at))<=julianday(?) THEN 1 ELSE 0 END AS outage_due,"
         "CASE WHEN julianday(COALESCE(q.audited_at,q.updated_at))<=julianday(?) THEN 1 ELSE 0 END AS quarantine_due,"
@@ -2222,8 +2379,10 @@ _AUDIT_CANDIDATE_SELECT = (
     "q.provider AS _existing_provider,"
     "q.provider_id AS _existing_provider_id,"
     "q.work_id AS _existing_work_id,"
+    "q.openlibrary_work_id AS _existing_openlibrary_work_id,"
     "q.isbn13 AS _existing_quality_isbn13,"
     "q.isbn10 AS _existing_quality_isbn10,"
+    "COALESCE(q.isbn_verified,0) AS _existing_isbn_verified,"
     "q.title_match AS _existing_title_match,"
     "q.author_match AS _existing_author_match,"
     "q.audit_version AS _existing_audit_version,"
@@ -2367,7 +2526,9 @@ def candidate_quality_audit_remaining(
         "SELECT c.id,c.isbn13 AS c_isbn13,c.isbn10 AS c_isbn10,c.source_url,"
         "q.quality_status,q.audit_version,q.flags_json,"
         "q.isbn13 AS q_isbn13,q.isbn10 AS q_isbn10,"
+        "COALESCE(q.isbn_verified,0) AS q_isbn_verified,"
         "q.provider AS q_provider,q.provider_id AS q_provider_id,q.work_id AS q_work_id,"
+        "COALESCE(q.openlibrary_work_id,'') AS q_openlibrary_work_id,"
         "q.audited_at AS q_audited_at,q.metadata_provider AS q_metadata_provider,"
         "CASE WHEN julianday(COALESCE(q.audited_at,q.updated_at))<=julianday(?) THEN 1 ELSE 0 END AS outage_due,"
         "CASE WHEN julianday(COALESCE(q.audited_at,q.updated_at))<=julianday(?) THEN 1 ELSE 0 END AS quarantine_due,"
@@ -2819,16 +2980,20 @@ def _store_result(
         con.execute(
             """UPDATE candidate_quality SET
                 flags_json=?,
+                openlibrary_work_id=CASE WHEN openlibrary_work_id!='' THEN openlibrary_work_id ELSE ? END,
                 isbn13=CASE WHEN isbn13!='' THEN isbn13 ELSE ? END,
                 isbn10=CASE WHEN isbn10!='' THEN isbn10 ELSE ? END,
+                isbn_verified=CASE WHEN isbn_verified=1 THEN 1 ELSE ? END,
                 audit_version=?,
                 audited_at=?,
                 updated_at=CURRENT_TIMESTAMP
             WHERE candidate_id=?""",
             (
                 json.dumps(flags, separators=(",", ":")),
+                str(result.get("openlibrary_work_id", "")),
                 str(result.get("isbn13", "")),
                 str(result.get("isbn10", "")),
+                int(bool(result.get("isbn_verified"))),
                 QUALITY_VERSION,
                 audited_at,
                 candidate_id,
@@ -2846,9 +3011,10 @@ def _store_result(
         con.execute(
             """INSERT INTO candidate_quality(
                 candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
-                work_id,isbn13,isbn10,title_match,author_match,audit_version,metadata_provider,
-                metadata_provider_id,metadata_retry_status,audited_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                work_id,openlibrary_work_id,isbn13,isbn10,isbn_verified,title_match,author_match,
+                audit_version,metadata_provider,metadata_provider_id,metadata_retry_status,
+                audited_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
             ON CONFLICT(candidate_id) DO UPDATE SET
                 quality_status=excluded.quality_status,
                 quality_score=excluded.quality_score,
@@ -2856,8 +3022,10 @@ def _store_result(
                 provider=excluded.provider,
                 provider_id=excluded.provider_id,
                 work_id=excluded.work_id,
+                openlibrary_work_id=excluded.openlibrary_work_id,
                 isbn13=excluded.isbn13,
                 isbn10=excluded.isbn10,
+                isbn_verified=excluded.isbn_verified,
                 title_match=excluded.title_match,
                 author_match=excluded.author_match,
                 audit_version=excluded.audit_version,
@@ -2874,8 +3042,10 @@ def _store_result(
                 str(result.get("provider", "")),
                 str(result.get("provider_id", "")),
                 str(result.get("work_id", "")),
+                str(result.get("openlibrary_work_id", "")),
                 str(result.get("isbn13", "")),
                 str(result.get("isbn10", "")),
+                int(bool(result.get("isbn_verified"))),
                 float(result.get("title_match", 0) or 0),
                 float(result.get("author_match", 0) or 0),
                 QUALITY_VERSION,
@@ -2970,9 +3140,10 @@ def _store_result(
     con.execute(
         """INSERT INTO candidate_quality(
             candidate_id,quality_status,quality_score,flags_json,provider,provider_id,
-            work_id,isbn13,isbn10,title_match,author_match,audit_version,metadata_provider,
-            metadata_provider_id,metadata_retry_status,audited_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+            work_id,openlibrary_work_id,isbn13,isbn10,isbn_verified,title_match,author_match,
+            audit_version,metadata_provider,metadata_provider_id,metadata_retry_status,
+            audited_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
         ON CONFLICT(candidate_id) DO UPDATE SET
             quality_status=excluded.quality_status,
             quality_score=excluded.quality_score,
@@ -2980,8 +3151,21 @@ def _store_result(
             provider=excluded.provider,
             provider_id=excluded.provider_id,
             work_id=excluded.work_id,
+            openlibrary_work_id=CASE
+                WHEN excluded.openlibrary_work_id!='' THEN excluded.openlibrary_work_id
+                WHEN ?=1 OR excluded.flags_json LIKE '%catalog_provider_unavailable%' THEN candidate_quality.openlibrary_work_id
+                ELSE ''
+            END,
             isbn13=CASE WHEN excluded.isbn13!='' OR ?=0 THEN excluded.isbn13 ELSE candidate_quality.isbn13 END,
             isbn10=CASE WHEN excluded.isbn10!='' OR ?=0 THEN excluded.isbn10 ELSE candidate_quality.isbn10 END,
+            isbn_verified=CASE
+                WHEN excluded.isbn_verified=1 THEN 1
+                WHEN ?=1 AND (
+                    (excluded.isbn13='' AND candidate_quality.isbn13!='')
+                    OR (excluded.isbn10='' AND candidate_quality.isbn10!='')
+                ) THEN candidate_quality.isbn_verified
+                ELSE excluded.isbn_verified
+            END,
             title_match=excluded.title_match,
             author_match=excluded.author_match,
             audit_version=excluded.audit_version,
@@ -2998,8 +3182,10 @@ def _store_result(
             str(result.get("provider", "")),
             str(result.get("provider_id", "")),
             str(result.get("work_id", "")),
+            str(result.get("openlibrary_work_id", "")),
             str(result.get("isbn13", "")),
             str(result.get("isbn10", "")),
+            int(bool(result.get("isbn_verified"))),
             float(result.get("title_match", 0) or 0),
             float(result.get("author_match", 0) or 0),
             QUALITY_VERSION,
@@ -3007,6 +3193,8 @@ def _store_result(
             metadata_provider_id,
             "",
             audited_at,
+            is_transient_outage,
+            is_transient_outage,
             is_transient_outage,
             is_transient_outage,
         ),
@@ -3106,10 +3294,14 @@ def _dedupe_and_hide(con) -> int:
         changed += len(ids)
 
     active = con.execute(
-        """SELECT c.id,c.title,c.author,c.isbn13,c.isbn10,
+        """SELECT c.id,c.title,c.author,c.isbn13,c.isbn10,c.source_url,
+        q.openlibrary_work_id AS quality_openlibrary_work_id,
         q.work_id AS quality_work_id,q.provider AS quality_provider,
         q.provider_id AS quality_provider_id,
-        q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10
+        q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10,
+        COALESCE(q.isbn_verified,0) AS quality_isbn_verified,
+        q.quality_status AS quality_status,
+        q.audit_version AS quality_audit_version
         FROM candidates c
         JOIN candidate_quality q ON q.candidate_id=c.id
         WHERE c.status IN ('new','recommended')"""
@@ -3135,10 +3327,14 @@ def _dedupe_and_hide(con) -> int:
 
     shortlisted_keys = book_identity_match_index(
         con.execute(
-            """SELECT c.title,c.author,c.isbn13,c.isbn10,
+            """SELECT c.title,c.author,c.isbn13,c.isbn10,c.source_url,
+            q.openlibrary_work_id AS quality_openlibrary_work_id,
             q.work_id AS quality_work_id,q.provider AS quality_provider,
             q.provider_id AS quality_provider_id,
-            q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10
+            q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10,
+            COALESCE(q.isbn_verified,0) AS quality_isbn_verified,
+            q.quality_status AS quality_status,
+            q.audit_version AS quality_audit_version
             FROM candidates c
             LEFT JOIN candidate_quality q ON q.candidate_id=c.id
             WHERE c.status IN ('saved','imported')"""
@@ -3153,11 +3349,16 @@ def _dedupe_and_hide(con) -> int:
 
     accepted = con.execute(
         """SELECT c.id,c.title,c.author,c.description,c.cover_url,c.score,
-        c.isbn13,c.isbn10,
+        c.isbn13,c.isbn10,c.source_url,
         CASE WHEN s.enabled=1 THEN 1 ELSE 0 END AS source_enabled,
-        q.quality_score,q.work_id AS quality_work_id,
+        q.quality_score,
+        q.openlibrary_work_id AS quality_openlibrary_work_id,
+        q.work_id AS quality_work_id,
         q.provider AS quality_provider,q.provider_id AS quality_provider_id,
-        q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10
+        q.isbn13 AS quality_isbn13,q.isbn10 AS quality_isbn10,
+        COALESCE(q.isbn_verified,0) AS quality_isbn_verified,
+        q.quality_status AS quality_status,
+        q.audit_version AS quality_audit_version
         FROM candidates c
         JOIN candidate_quality q ON q.candidate_id=c.id
         JOIN sources s ON s.id=c.source_id

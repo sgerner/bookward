@@ -617,6 +617,27 @@ def _impression_sort_key(impression) -> tuple[datetime, int]:
     return (parsed, int(impression["id"]))
 
 
+def _candidate_quality_attribution_projection(con) -> str:
+    available_quality_cols = {
+        str(col[1])
+        for col in con.execute("PRAGMA table_info(candidate_quality)").fetchall()
+    }
+    ol_expr = "q.openlibrary_work_id" if "openlibrary_work_id" in available_quality_cols else "''"
+    provider_id_expr = "q.provider_id" if "provider_id" in available_quality_cols else "''"
+    verified_expr = "COALESCE(q.isbn_verified,0)" if "isbn_verified" in available_quality_cols else "0"
+    version_expr = "q.audit_version" if "audit_version" in available_quality_cols else "''"
+    return (
+        f"CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN {ol_expr} ELSE '' END AS quality_openlibrary_work_id,"
+        "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.work_id ELSE '' END AS quality_work_id,"
+        "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.provider ELSE '' END AS quality_provider,"
+        f"CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN {provider_id_expr} ELSE '' END AS quality_provider_id,"
+        "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.isbn13 ELSE '' END AS quality_isbn13,"
+        "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.isbn10 ELSE '' END AS quality_isbn10,"
+        f"CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN {verified_expr} ELSE 0 END AS quality_isbn_verified,"
+        f"q.quality_status quality_status,{version_expr} quality_audit_version"
+    )
+
+
 def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
     from .ingestion import read_identity_rows_with_current_verified_work_ids
 
@@ -636,15 +657,12 @@ def _attribute_read_outcomes_in_connection(con) -> dict[str, int]:
         read_metadata_rows = []
     reads = read_identity_rows_with_current_verified_work_ids(raw_reads, read_metadata_rows)
 
+    quality_projection = _candidate_quality_attribution_projection(con)
     candidates = [
         dict(item)
         for item in con.execute(
             "SELECT c.id,c.title,c.author,c.source_url,c.status,c.score,c.isbn13,c.isbn10,"
-            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.work_id ELSE '' END AS quality_work_id,"
-            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.provider ELSE '' END AS quality_provider,"
-            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.provider_id ELSE '' END AS quality_provider_id,"
-            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.isbn13 ELSE '' END AS quality_isbn13,"
-            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.isbn10 ELSE '' END AS quality_isbn10 "
+            f"{quality_projection} "
             "FROM candidates c "
             "LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "ORDER BY c.id"
@@ -1183,13 +1201,10 @@ def reconcile_read_outcomes_in_connection(
     if candidate_id is None:
         target_identity = book_identity(read_row.get("title", ""), read_row.get("author", ""))
         read_exact, read_prefix = book_row_exact_and_prefix_match_keys(read_row)
+        quality_projection = _candidate_quality_attribution_projection(con)
         for item in con.execute(
             "SELECT c.id,c.title,c.author,c.source_url,c.isbn13,c.isbn10,"
-            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.work_id ELSE '' END AS quality_work_id,"
-            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.provider ELSE '' END AS quality_provider,"
-            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.provider_id ELSE '' END AS quality_provider_id,"
-            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.isbn13 ELSE '' END AS quality_isbn13,"
-            "CASE WHEN COALESCE(q.quality_status,'')!='quarantine' THEN q.isbn10 ELSE '' END AS quality_isbn10 "
+            f"{quality_projection} "
             "FROM candidates c LEFT JOIN candidate_quality q ON q.candidate_id=c.id "
             "ORDER BY c.id ASC"
         ).fetchall():
