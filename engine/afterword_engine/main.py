@@ -933,11 +933,13 @@ def _finish_candidate_quality_recovery_job(
     if quality.get("audited", 0) > 0:
         enqueue_job("read_work_identities", dedupe=True)
     pool_changed = bool(
-        quality.get("rejected", 0) > 0
+        quality.get("status_changed", 0) > 0
+        or quality.get("rejected", 0) > 0
         or quality.get("deduped", 0) > 0
         or quality.get("enriched", 0) > 0
     )
-    if not (followup_job_id is None and quality.get("audited", 0) > 0) and pool_changed:
+    should_score_inline = followup_job_id is None and quality.get("audited", 0) > 0
+    if not should_score_inline and pool_changed:
         enqueue_job("score", dedupe=True)
     return followup_deferred, followup_job_id
 

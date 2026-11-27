@@ -1874,17 +1874,26 @@ MIGRATIONS = [
                   'shortlisted_overlap'
               )
           )
-          AND COALESCE(
-              (
-                  SELECT f.action
-                  FROM feedback f
-                  WHERE f.candidate_id = c.id
-                    AND f.undone_at IS NULL
-                  ORDER BY f.id DESC
-                  LIMIT 1
-              ),
-              ''
-          ) != 'reject';
+          AND NOT EXISTS (
+              SELECT 1 FROM feedback f
+              WHERE f.candidate_id = c.id
+                AND f.undone_at IS NULL
+                AND f.action IN ('reject', 'maybe_later')
+                AND f.id = (
+                    SELECT MAX(f2.id) FROM feedback f2
+                    WHERE f2.candidate_id = c.id
+                      AND f2.undone_at IS NULL
+                )
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM recommendation_events e
+              WHERE e.candidate_id = c.id
+                AND e.event_type IN ('reject', 'maybe_later')
+                AND e.id = (
+                    SELECT MAX(e2.id) FROM recommendation_events e2
+                    WHERE e2.candidate_id = c.id
+                )
+          );
 
         UPDATE candidates
         SET status = 'new', updated_at = CURRENT_TIMESTAMP

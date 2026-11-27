@@ -219,37 +219,34 @@ def _claim_profile_job(
                 ):
                     _reap_abandoned_jobs()
                     last_reaped_at[profile_id] = current
-                cooldown = max(0.0, float(QUALITY_RECOVERY_COOLDOWN_SECONDS))
-                recovery_throttled = bool(
-                    cooldown > 0
-                    and last_quality_recovery_at is not None
-                    and current - last_quality_recovery_at < cooldown
+                job = row(
+                    "SELECT * FROM jobs WHERE status='queued' "
+                    "ORDER BY CASE WHEN kind='candidate_quality_recovery' THEN 1 ELSE 0 END, "
+                    "created_at LIMIT 1"
                 )
-                if not recovery_throttled and cooldown > 0:
-                    cutoff = (
-                        datetime.now(timezone.utc) - timedelta(seconds=cooldown)
-                    ).isoformat()
-                    recovery_throttled = bool(
-                        row(
-                            "SELECT 1 FROM jobs WHERE kind='candidate_quality_recovery' "
-                            "AND status='complete' AND finished_at IS NOT NULL "
-                            "AND julianday(finished_at) > julianday(?) LIMIT 1",
-                            (cutoff,),
-                        )
-                    )
-                if recovery_throttled:
-                    job = row(
-                        "SELECT * FROM jobs WHERE status='queued' "
-                        "AND kind!='candidate_quality_recovery' ORDER BY created_at LIMIT 1"
-                    )
-                else:
-                    job = row(
-                        "SELECT * FROM jobs WHERE status='queued' "
-                        "ORDER BY CASE WHEN kind='candidate_quality_recovery' THEN 1 ELSE 0 END, "
-                        "created_at LIMIT 1"
-                    )
                 if not job:
                     return ("idle", None, None, None)
+                if job["kind"] == "candidate_quality_recovery":
+                    cooldown = max(0.0, float(QUALITY_RECOVERY_COOLDOWN_SECONDS))
+                    recovery_throttled = bool(
+                        cooldown > 0
+                        and last_quality_recovery_at is not None
+                        and current - last_quality_recovery_at < cooldown
+                    )
+                    if not recovery_throttled and cooldown > 0:
+                        cutoff = (
+                            datetime.now(timezone.utc) - timedelta(seconds=cooldown)
+                        ).isoformat()
+                        recovery_throttled = bool(
+                            row(
+                                "SELECT 1 FROM jobs WHERE kind='candidate_quality_recovery' "
+                                "AND status='complete' AND finished_at IS NOT NULL "
+                                "AND julianday(finished_at) > julianday(?) LIMIT 1",
+                                (cutoff,),
+                            )
+                        )
+                    if recovery_throttled:
+                        return ("idle", None, None, None)
                 lease_token = uuid.uuid4().hex
                 claimed_at = now()
                 with transaction() as con:
@@ -266,30 +263,32 @@ def _claim_profile_job(
 
 def _complete_claimed_job(
     profile_id: str, job_id: str, lease_token: str, epoch: int, result
-) -> None:
+) -> bool:
     from .tenancy import profile_scope
 
     with profile_scope(profile_id), bind_restore_epoch(epoch), transaction() as con:
-        con.execute(
+        updated = con.execute(
             "UPDATE jobs SET status='complete',progress=1,result=?,error=NULL,"
             "finished_at=?,heartbeat_at=NULL,lease_token=NULL "
             "WHERE id=? AND status='running' AND lease_token=?",
             (json.dumps(result), now(), job_id, lease_token),
-        )
+        ).rowcount
+    return bool(updated)
 
 
 def _fail_claimed_job(
     profile_id: str, job_id: str, lease_token: str, epoch: int, error_message: str
-) -> None:
+) -> bool:
     from .tenancy import profile_scope
 
     with profile_scope(profile_id), bind_restore_epoch(epoch), transaction() as con:
-        con.execute(
+        updated = con.execute(
             "UPDATE jobs SET status='failed',error=?,finished_at=?,"
             "heartbeat_at=NULL,lease_token=NULL "
             "WHERE id=? AND status='running' AND lease_token=?",
             (error_message, now(), job_id, lease_token),
-        )
+        ).rowcount
+    return bool(updated)
 
 
 def _requeue_aborted_job(
@@ -426,7 +425,7 @@ async def worker_loop(handler, stop):
                             should_record_recovery_cooldown = False
                             try:
                                 result = await handler_task
-                                await asyncio.to_thread(
+                                completed = await asyncio.to_thread(
                                     _complete_claimed_job,
                                     profile_id,
                                     job["id"],
@@ -436,7 +435,7 @@ async def worker_loop(handler, stop):
                                 )
                                 if job_aborted.is_set():
                                     reset_profile_ready(profile_id)
-                                else:
+                                elif completed:
                                     should_record_recovery_cooldown = True
                             except asyncio.CancelledError:
                                 outer = asyncio.current_task()
@@ -479,10 +478,8 @@ async def worker_loop(handler, stop):
                             except Exception as exc:
                                 if job_aborted.is_set():
                                     reset_profile_ready(profile_id)
-                                else:
-                                    should_record_recovery_cooldown = True
                                 try:
-                                    await asyncio.to_thread(
+                                    failed = await asyncio.to_thread(
                                         _fail_claimed_job,
                                         profile_id,
                                         job["id"],
@@ -490,6 +487,8 @@ async def worker_loop(handler, stop):
                                         epoch,
                                         safe_error_message(exc, limit=2000),
                                     )
+                                    if failed and not job_aborted.is_set():
+                                        should_record_recovery_cooldown = True
                                 except ProfileDeletedError:
                                     raise
                                 except RestoreEpochError:

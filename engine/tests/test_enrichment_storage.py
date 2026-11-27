@@ -1916,6 +1916,68 @@ def test_migration_33_decouples_work_ids_verifies_source_isbns_and_requeues_only
         "INSERT INTO feedback(candidate_id,action,undone_at) VALUES(?,'reject','2026-02-01T00:00:00+00:00')",
         (undone_reject,),
     )
+    con.execute(
+        "INSERT INTO recommendation_events(event_key,candidate_id,event_type,source) "
+        "VALUES('feedback:undone-reject',?,'reject','ui')",
+        (undone_reject,),
+    )
+    con.execute(
+        "INSERT INTO recommendation_events(event_key,candidate_id,event_type,source) "
+        "VALUES('undo-feedback:undone-reject',?,'restore','ui_undo')",
+        (undone_reject,),
+    )
+    user_maybe_later_feedback = insert_legacy(
+        "User Deferred Via Feedback",
+        status="rejected",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["read_overlap"]',
+    )
+    con.execute(
+        "INSERT INTO feedback(candidate_id,action) VALUES(?,'maybe_later')",
+        (user_maybe_later_feedback,),
+    )
+    event_only_rejected = insert_legacy(
+        "Event Only Rejected",
+        status="rejected",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["read_overlap"]',
+    )
+    con.execute(
+        "INSERT INTO recommendation_events(event_key,candidate_id,event_type,source) "
+        "VALUES('event-only:reject-1',?,'reject','ui')",
+        (event_only_rejected,),
+    )
+    event_only_maybe_later = insert_legacy(
+        "Event Only Maybe Later",
+        status="rejected",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["duplicate_identity"]',
+    )
+    con.execute(
+        "INSERT INTO recommendation_events(event_key,candidate_id,event_type,source) "
+        "VALUES('event-only:maybe-later-1',?,'maybe_later','ui')",
+        (event_only_maybe_later,),
+    )
+    event_reject_then_restored = insert_legacy(
+        "Event Reject Then Restored",
+        status="rejected",
+        q_status="rejected",
+        q_isbn13="9780345538376",
+        flags='["read_overlap"]',
+    )
+    con.execute(
+        "INSERT INTO recommendation_events(event_key,candidate_id,event_type,source) "
+        "VALUES('event-only:reject-2',?,'reject','ui')",
+        (event_reject_then_restored,),
+    )
+    con.execute(
+        "INSERT INTO recommendation_events(event_key,candidate_id,event_type,source) "
+        "VALUES('event-only:restore-2',?,'restore','ui')",
+        (event_reject_then_restored,),
+    )
     saved_row = insert_legacy("Saved Shortlist Book", status="saved", q_isbn13="9780345538376")
     imported_row = insert_legacy("Imported Book", status="imported", q_isbn13="9780345538376")
     read_row = insert_legacy("Completed Read Book", status="read", q_isbn13="9780345538376")
@@ -2009,7 +2071,7 @@ def test_migration_33_decouples_work_ids_verifies_source_isbns_and_requeues_only
         "short_description",
     ]
 
-    for cid in (requeued_dup, reject_then_restored, undone_reject):
+    for cid in (requeued_dup, reject_then_restored, undone_reject, event_reject_then_restored):
         assert row("SELECT status FROM candidates WHERE id=?", (cid,)) == {"status": "new"}
         assert row(
             "SELECT quality_status,isbn13,isbn_verified,flags_json FROM candidate_quality WHERE candidate_id=?",
@@ -2040,6 +2102,9 @@ def test_migration_33_decouples_work_ids_verifies_source_isbns_and_requeues_only
         no_quality_isbn_overlap,
         source_isbn_overlap,
         user_rejected,
+        user_maybe_later_feedback,
+        event_only_rejected,
+        event_only_maybe_later,
     ):
         assert row("SELECT status FROM candidates WHERE id=?", (still_rejected_cid,)) == {
             "status": "rejected"
@@ -2607,3 +2672,147 @@ def test_reconcile_read_outcomes_projects_decoupled_work_id_and_ignores_unverifi
         "SELECT candidate_id FROM recommendation_events WHERE event_key=?",
         (f"read:{work_read_id:08d}",),
     ) == {"candidate_id": gb_work_cid}
+
+
+def test_candidate_quality_recovery_skips_inline_score_when_followup_enqueued_and_runs_off_loop(
+    database, monkeypatch
+):
+    import threading
+
+    with transaction() as con:
+        con.execute("DELETE FROM jobs")
+
+    finish_threads: list[int] = []
+    score_calls: list[bool] = []
+    due_states = iter([True, True, False])
+    original_finish = engine_main._finish_candidate_quality_recovery_job
+
+    def wrapped_finish(profile_key, started, quality):
+        finish_threads.append(threading.get_ident())
+        return original_finish(profile_key, started, quality)
+
+    async def fake_audit(*, only_pending=False, limit=None, **_kwargs):
+        assert only_pending is True
+        return {
+            "audited": 5,
+            "accepted": 5,
+            "quarantine": 0,
+            "rejected": 0,
+            "deduped": 0,
+            "enriched": 0,
+            "status_changed": 2,
+        }
+
+    async def fake_score_all(*_args, **_kwargs):
+        score_calls.append(True)
+        return 7
+
+    monkeypatch.setattr(engine_main, "audit_candidates", fake_audit)
+    monkeypatch.setattr(engine_main, "score_all", fake_score_all)
+    monkeypatch.setattr(
+        engine_main, "_has_due_quality_recovery", lambda: next(due_states)
+    )
+    monkeypatch.setattr(
+        engine_main, "_finish_candidate_quality_recovery_job", wrapped_finish
+    )
+
+    async def run_passes():
+        loop_tid = threading.get_ident()
+        first = await handle_job("candidate_quality_recovery")
+        second = await handle_job("candidate_quality_recovery")
+        return loop_tid, first, second
+
+    loop_tid, first, second = asyncio.run(run_passes())
+
+    assert len(finish_threads) == 2
+    assert all(tid != loop_tid for tid in finish_threads)
+    # First pass enqueued a follow-up recovery job -> skipped inline score_all, queued deduplicated score & read_work_identities
+    assert first["scored"] == 0
+    assert first["followup_deferred"] is False
+    # Final pass had no follow-up recovery job -> ran score_all inline
+    assert second["scored"] == 7
+    assert second["followup_deferred"] is False
+    assert score_calls == [True]
+    queued_kinds = {
+        item["kind"]
+        for item in rows("SELECT kind FROM jobs WHERE status='queued'")
+    }
+    assert {"candidate_quality_recovery", "read_work_identities", "score"}.issubset(
+        queued_kinds
+    )
+
+
+def test_aborted_quality_recovery_job_requeues_without_triggering_cooldown(
+    tmp_path, monkeypatch
+):
+    import threading
+    from afterword_engine import jobs as jobs_module
+    from afterword_engine import profiles
+    from afterword_engine.database import database_lock
+    from afterword_engine.tenancy import profile_scope
+
+    monkeypatch.setattr(settings, "db", str(tmp_path / "abort-cooldown.db"))
+    monkeypatch.setattr(settings, "backup_dir", "")
+    monkeypatch.setattr(jobs_module, "QUALITY_RECOVERY_COOLDOWN_SECONDS", 60)
+    monkeypatch.delenv("AFTERWORD_SECRET_KEY", raising=False)
+
+    profiles.initialize_auth()
+    profiles.create_first_admin("owner", "owner-password-with-enough-length")
+
+    with profile_scope("legacy"):
+        initialize(seed_demo=False)
+        with transaction() as con:
+            con.execute("DELETE FROM jobs")
+        recovery_job_id = jobs_module.enqueue_job("candidate_quality_recovery")
+
+    first_started = threading.Event()
+    second_completed = threading.Event()
+    attempts = 0
+
+    async def handler(kind: str):
+        nonlocal attempts
+        assert kind == "candidate_quality_recovery"
+        attempts += 1
+        if attempts == 1:
+            first_started.set()
+            await asyncio.sleep(10.0)
+        return {"audited": 1}
+
+    async def drive_worker():
+        stop = asyncio.Event()
+        worker = asyncio.create_task(jobs_module.worker_loop(handler, stop))
+        try:
+            assert await asyncio.to_thread(first_started.wait, 5.0)
+
+            def quiesce_profile_briefly():
+                with profile_scope("legacy"), database_lock().quiesce():
+                    pass
+
+            # Quiescing the profile lock cancels and requeues attempt 1
+            await asyncio.to_thread(quiesce_profile_briefly)
+
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                with profile_scope("legacy"):
+                    job_row = row(
+                        "SELECT status,attempts FROM jobs WHERE id=?",
+                        (recovery_job_id,),
+                    )
+                if job_row and job_row["status"] == "complete":
+                    second_completed.set()
+                    break
+                await asyncio.sleep(0.05)
+            assert second_completed.is_set()
+        finally:
+            stop.set()
+            await worker
+
+    import time
+
+    asyncio.run(drive_worker())
+    with profile_scope("legacy"):
+        final_job = row(
+            "SELECT status,attempts FROM jobs WHERE id=?", (recovery_job_id,)
+        )
+    assert final_job == {"status": "complete", "attempts": 1}
+    assert attempts == 2
