@@ -1037,7 +1037,14 @@ def test_ssrf_validation_redirect_rejection_and_host_credential_isolation(
         def send(self, request, *, stream: bool = False, **kwargs):
             assert stream is True
             headers = request.get("headers") or {}
-            seen_requests.append((request["url"], headers.get("Authorization", "")))
+            seen_requests.append(
+                (
+                    request["url"],
+                    headers.get("Authorization", ""),
+                    headers.get("Host", ""),
+                    (request.get("extensions") or {}).get("sni_hostname", ""),
+                )
+            )
 
             class RedirectResp:
                 status_code = 307
@@ -1060,7 +1067,9 @@ def test_ssrf_validation_redirect_rejection_and_host_credential_isolation(
     )
     assert fallback_diag == {"applied": False, "reason": "fallback"}
     assert len(seen_requests) == 1
-    assert seen_requests[0][0] == "https://custom-llm.example.com/v1/chat/completions"
+    assert seen_requests[0][0] == "https://93.184.216.34/v1/chat/completions"
+    assert seen_requests[0][2] == "custom-llm.example.com"
+    assert seen_requests[0][3] == "custom-llm.example.com"
 
 
 def test_prompt_injection_guardrail_and_hostile_description_delta_clamp(monkeypatch) -> None:
@@ -1448,7 +1457,7 @@ def test_rerank_with_llm_sync_caches_clamps_timeout_and_disables_redirects(monke
     assert [c["id"] for c in r1] == [2, 1]
     assert calls[0]["timeout"] == 25.0
     assert calls[0]["follow_redirects"] is False
-    assert calls[0]["kwargs"].get("trust_env") is not False
+    assert calls[0]["kwargs"].get("trust_env") is False
 
     r2, d2 = rerank_with_llm_sync(
         reads,
@@ -3231,3 +3240,350 @@ def test_query_urls_and_cached_slate_decision_evidence_replay_zero_drift(
         assert replayed["verification"]["matches_archived"] is True
         assert replayed["verification"]["max_score_drift"] == 0.0
         assert [item["id"] for item in replayed["pools"]["served"]] == [c2, c1]
+
+
+def test_rerank_with_llm_sync_blocks_dns_rebinding_and_ignores_env_proxies(
+    monkeypatch,
+) -> None:
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+    import httpx
+    import afterword_engine.llm_reranker as reranker_module
+    from afterword_engine.config import settings
+
+    reranker_module.clear_llm_rerank_state(clear_all=True)
+    real_httpx_client = httpx.Client
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8888")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:8888")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:8888")
+    monkeypatch.setenv("NO_PROXY", "")
+
+    reads = [{"title": "Dune", "author": "Frank Herbert", "rating": 5.0}]
+    candidates = [
+        {"id": 1, "title": "First", "author": "Author A", "score": 82.0},
+        {"id": 2, "title": "Second", "author": "Author B", "score": 81.2},
+    ]
+
+    # 1. Validation resolves to a public IP first, then DNS rebinds to private/metadata IPs
+    #    (169.254.169.254 and 127.0.0.1) before rerank_with_llm_sync runs.
+    for private_ip in ("169.254.169.254", "127.0.0.1"):
+        dns_answers = [
+            "93.184.216.34",
+            private_ip,
+        ]
+        dns_calls = 0
+
+        def rebinding_after_validate(host: str, port: int, *args, **kwargs):
+            nonlocal dns_calls
+            ip = dns_answers[min(dns_calls, len(dns_answers) - 1)]
+            dns_calls += 1
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 443))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", rebinding_after_validate)
+        connected_ips: list[str] = []
+
+        class GuardedClient:
+            def __init__(self, *args, **kwargs) -> None:
+                assert kwargs.get("trust_env") is False
+                assert kwargs.get("follow_redirects") is False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+            def build_request(self, method: str, url: str, **kwargs):
+                return {"method": method, "url": str(url), **kwargs}
+
+            def send(self, request, *, stream: bool = False, **kwargs):
+                host = urlparse(request["url"]).hostname or ""
+                connected_ips.append(host)
+                raise AssertionError(f"Unexpected outbound request to {request['url']}")
+
+        monkeypatch.setattr(reranker_module.httpx, "Client", GuardedClient)
+
+        validated = reranker_module.validate_llm_api_url(
+            "https://rebind.example.test/v1"
+        )
+        assert validated == "https://rebind.example.test/v1/chat/completions"
+
+        reranked, diag = reranker_module.rerank_with_llm_sync(
+            reads,
+            candidates,
+            profile_id=f"rebind-post-validate-{private_ip}",
+            api_url="https://rebind.example.test/v1",
+            api_key="sk-rebind-secret",
+            model="gpt-4o-mini",
+        )
+        assert diag == {"applied": False, "reason": "fallback"}
+        assert [c["id"] for c in reranked] == [1, 2]
+        assert connected_ips == []
+        assert private_ip not in connected_ips
+        assert "sk-rebind-secret" not in reranker_module.last_rerank_error()
+
+    # 2. Connect-time DNS rebinding inside rerank_with_llm_sync: the initial target check
+    #    resolves to a public IP (93.184.216.34), and every subsequent DNS lookup returns
+    #    169.254.169.254 / 127.0.0.1. Because the request pins 93.184.216.34 with Host + SNI
+    #    and sets trust_env=False, httpx never re-resolves the hostname or connects to the private IP,
+    #    and a redirect hop after rebinding is blocked before connecting.
+    connect_rebind_ips = ["93.184.216.34", "169.254.169.254", "127.0.0.1"]
+    connect_dns_idx = 0
+
+    def rebinding_at_connect(host: str, port: int, *args, **kwargs):
+        nonlocal connect_dns_idx
+        try:
+            ipaddress.ip_address(host)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, port or 443))]
+        except ValueError:
+            ip = connect_rebind_ips[min(connect_dns_idx, len(connect_rebind_ips) - 1)]
+            connect_dns_idx += 1
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_at_connect)
+
+    observed_client_kwargs: list[dict] = []
+    connected_endpoints: list[tuple[str, str, str, str]] = []
+
+    def transport_handler(request: httpx.Request) -> httpx.Response:
+        # Simulate connect-time resolution if a non-IP hostname ever reached transport.
+        connect_host = request.url.host or ""
+        resolved_at_connect = socket.getaddrinfo(connect_host, request.url.port or 443)[0][4][0]
+        assert resolved_at_connect not in {"169.254.169.254", "127.0.0.1"}
+        connected_endpoints.append(
+            (
+                str(request.url),
+                resolved_at_connect,
+                request.headers.get("Host", ""),
+                str(request.extensions.get("sni_hostname", "")),
+            )
+        )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"adjustments": [{"id": 2, "delta": 1.0, "reason": "Pinned match"}]}
+                            )
+                        }
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    def client_factory(*args, **kwargs):
+        observed_client_kwargs.append(dict(kwargs))
+        probe_client = real_httpx_client(*args, **kwargs)
+        try:
+            # Verify real httpx.Client ignores HTTPS_PROXY/HTTP_PROXY when trust_env=False.
+            assert probe_client._mounts == {}
+        finally:
+            probe_client.close()
+        return real_httpx_client(
+            *args,
+            transport=httpx.MockTransport(transport_handler),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(reranker_module.httpx, "Client", client_factory)
+
+    reranked_pinned, diag_pinned = reranker_module.rerank_with_llm_sync(
+        reads,
+        candidates,
+        profile_id="rebind-connect-pinned",
+        api_url="https://rebind.example.test:8443/v1",
+        api_key="sk-pinned-secret",
+        model="gpt-4o-mini",
+    )
+    assert diag_pinned["applied"] is True
+    assert [c["id"] for c in reranked_pinned] == [2, 1]
+    assert observed_client_kwargs == [
+        {"timeout": 25.0, "follow_redirects": False, "trust_env": False}
+    ]
+    assert connected_endpoints == [
+        (
+            "https://93.184.216.34:8443/v1/chat/completions",
+            "93.184.216.34",
+            "rebind.example.test:8443",
+            "rebind.example.test",
+        )
+    ]
+
+    # 3. Redirect-hop rebinding: initial hop resolves to a public IP and returns 307,
+    #    while the redirect hop resolves to 169.254.169.254 and is blocked without connecting.
+    redirect_dns_idx = 0
+
+    def rebinding_on_redirect(host: str, port: int, *args, **kwargs):
+        nonlocal redirect_dns_idx
+        ip = "93.184.216.34" if redirect_dns_idx == 0 else "169.254.169.254"
+        redirect_dns_idx += 1
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_on_redirect)
+    redirect_hop_urls: list[str] = []
+
+    def redirect_rebind_handler(request: httpx.Request) -> httpx.Response:
+        redirect_hop_urls.append(str(request.url))
+        assert request.url.host == "93.184.216.34"
+        return httpx.Response(
+            307,
+            headers={"location": "https://rebind.example.test:8443/v2/chat/completions"},
+            request=request,
+        )
+
+    monkeypatch.setattr(
+        reranker_module.httpx,
+        "Client",
+        lambda *args, **kwargs: real_httpx_client(
+            *args,
+            transport=httpx.MockTransport(redirect_rebind_handler),
+            **kwargs,
+        ),
+    )
+
+    _, diag_rebind_hop = reranker_module.rerank_with_llm_sync(
+        reads,
+        candidates,
+        profile_id="rebind-redirect-hop",
+        api_url="https://rebind.example.test:8443/v1",
+        api_key="sk-pinned-secret",
+        model="gpt-4o-mini",
+    )
+    assert diag_rebind_hop == {"applied": False, "reason": "fallback"}
+    assert redirect_hop_urls == ["https://93.184.216.34:8443/v1/chat/completions"]
+
+
+def test_rerank_with_llm_sync_pins_same_origin_307_redirect_hops(monkeypatch) -> None:
+    import socket
+    import httpx
+    import afterword_engine.llm_reranker as reranker_module
+    from afterword_engine.config import settings
+
+    reranker_module.clear_llm_rerank_state(clear_all=True)
+    monkeypatch.setattr(settings, "llm_rerank_allowed_hosts", "")
+
+    hop_ips = ["93.184.216.34", "93.184.216.35", "93.184.216.36", "127.0.0.1"]
+    dns_idx = 0
+
+    def rotating_public_dns(host: str, port: int, *args, **kwargs):
+        nonlocal dns_idx
+        assert host == "llm.example.test"
+        ip = hop_ips[min(dns_idx, len(hop_ips) - 1)]
+        dns_idx += 1
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rotating_public_dns)
+
+    prepared_targets: list[str] = []
+    original_prepare = reranker_module._prepare_llm_request_target
+
+    def spy_prepare(url: str, *args, **kwargs):
+        prepared_targets.append(url)
+        return original_prepare(url, *args, **kwargs)
+
+    monkeypatch.setattr(reranker_module, "_prepare_llm_request_target", spy_prepare)
+
+    real_httpx_client = httpx.Client
+    seen_hops: list[dict] = []
+
+    def redirect_chain_handler(request: httpx.Request) -> httpx.Response:
+        hop_num = len(seen_hops)
+        seen_hops.append(
+            {
+                "url": str(request.url),
+                "host_header": request.headers.get("Host", ""),
+                "sni_hostname": request.extensions.get("sni_hostname"),
+                "auth": request.headers.get("Authorization", ""),
+            }
+        )
+        if hop_num == 0:
+            return httpx.Response(
+                307,
+                headers={"location": "/router/sub/step1"},
+                request=request,
+            )
+        if hop_num == 1:
+            # Relative Location without leading slash verifies redirect resolution against current_url.
+            return httpx.Response(
+                307,
+                headers={"location": "completions?api-version=2024-08-01"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"adjustments": [{"id": 2, "delta": 1.05, "reason": "Redirected match"}]}
+                            )
+                        }
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    client_init_kwargs: list[dict] = []
+
+    def client_factory(*args, **kwargs):
+        client_init_kwargs.append(dict(kwargs))
+        return real_httpx_client(
+            *args,
+            transport=httpx.MockTransport(redirect_chain_handler),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(reranker_module.httpx, "Client", client_factory)
+
+    reads = [{"title": "Dune", "author": "Frank Herbert", "rating": 5.0}]
+    candidates = [
+        {"id": 1, "title": "First", "author": "Author A", "score": 82.0},
+        {"id": 2, "title": "Second", "author": "Author B", "score": 81.2},
+    ]
+
+    reranked, diag = reranker_module.rerank_with_llm_sync(
+        reads,
+        candidates,
+        profile_id="pinned-307-chain",
+        api_url="https://llm.example.test:8443/v1",
+        api_key="sk-redirect-secret",
+        model="gpt-4o-mini",
+    )
+    assert diag["applied"] is True
+    assert diag["cached"] is False
+    assert [c["id"] for c in reranked] == [2, 1]
+    assert client_init_kwargs == [
+        {"timeout": 25.0, "follow_redirects": False, "trust_env": False}
+    ]
+    assert prepared_targets == [
+        "https://llm.example.test:8443/v1",
+        "https://llm.example.test:8443/router/sub/step1",
+        "https://llm.example.test:8443/router/sub/completions?api-version=2024-08-01",
+    ]
+    assert seen_hops == [
+        {
+            "url": "https://93.184.216.34:8443/v1/chat/completions",
+            "host_header": "llm.example.test:8443",
+            "sni_hostname": "llm.example.test",
+            "auth": "Bearer sk-redirect-secret",
+        },
+        {
+            "url": "https://93.184.216.35:8443/router/sub/step1",
+            "host_header": "llm.example.test:8443",
+            "sni_hostname": "llm.example.test",
+            "auth": "Bearer sk-redirect-secret",
+        },
+        {
+            "url": "https://93.184.216.36:8443/router/sub/completions?api-version=2024-08-01",
+            "host_header": "llm.example.test:8443",
+            "sni_hostname": "llm.example.test",
+            "auth": "Bearer sk-redirect-secret",
+        },
+    ]

@@ -221,13 +221,13 @@ def resolve_llm_rerank_credentials(
     return effective_url, (settings.llm_rerank_api_key or "").strip()
 
 
-def validate_llm_api_url(
+def _validate_llm_url_structure(
     url: str,
     allowed_hosts: set[str] | None = None,
     *,
     has_api_key: bool = True,
-) -> str:
-    """Validate an LLM endpoint URL against SSRF and HTTPS guards and normalize its chat path."""
+    normalize_chat_path: bool = True,
+) -> tuple[str, str, str, set[str]]:
     cleaned = str(url or "").strip()
     if not cleaned:
         raise ValueError("LLM API URL is required")
@@ -248,18 +248,38 @@ def validate_llm_api_url(
         raise ValueError(
             "LLM API URL must use HTTPS when an API key is configured unless the host is allowlisted"
         )
-    if requested_host not in hosts:
-        validate_public_url(
-            cleaned,
-            allow_http=(parsed.scheme == "http" and not has_api_key),
+    if normalize_chat_path:
+        normalized = _normalize_chat_url(cleaned)
+    else:
+        parts = urlsplit(cleaned)
+        normalized = urlunsplit(
+            (parts.scheme, parts.netloc, parts.path or "/", parts.query, "")
         )
-    normalized = _normalize_chat_url(cleaned)
     norm_parsed = urlparse(normalized)
     norm_path = norm_parsed.path or "/"
     if ".." in norm_path.split("/") or not _SAFE_LLM_PATH_RE.fullmatch(norm_path):
         raise ValueError("LLM API URL contains an invalid path")
     if norm_parsed.query and not _SAFE_LLM_QUERY_RE.fullmatch(norm_parsed.query):
         raise ValueError("LLM API URL contains invalid query characters")
+    return cleaned, normalized, requested_host, hosts
+
+
+def validate_llm_api_url(
+    url: str,
+    allowed_hosts: set[str] | None = None,
+    *,
+    has_api_key: bool = True,
+) -> str:
+    """Validate an LLM endpoint URL against SSRF and HTTPS guards and normalize its chat path."""
+    cleaned, normalized, requested_host, hosts = _validate_llm_url_structure(
+        url, allowed_hosts=allowed_hosts, has_api_key=has_api_key
+    )
+    parsed = urlparse(cleaned)
+    if requested_host not in hosts:
+        validate_public_url(
+            cleaned,
+            allow_http=(parsed.scheme == "http" and not has_api_key),
+        )
     return normalized
 
 
@@ -268,10 +288,14 @@ def _prepare_llm_request_target(
     allowed_hosts: set[str] | None = None,
     *,
     has_api_key: bool = True,
+    normalize_chat_path: bool = True,
 ) -> tuple[str, dict[str, str], dict[str, str] | None]:
     """Validate and pin an outbound LLM endpoint URL against SSRF, cleartext credential use, and DNS rebinding."""
-    normalized = validate_llm_api_url(
-        url, allowed_hosts=allowed_hosts, has_api_key=has_api_key
+    _cleaned, normalized, requested_host, hosts = _validate_llm_url_structure(
+        url,
+        allowed_hosts=allowed_hosts,
+        has_api_key=has_api_key,
+        normalize_chat_path=normalize_chat_path,
     )
     parsed = urlparse(normalized)
     if parsed.scheme == "https":
@@ -300,11 +324,6 @@ def _prepare_llm_request_target(
         raise ValueError("LLM API URL contains invalid query characters")
     query_suffix = f"?{raw_query}" if raw_query else ""
 
-    requested_host = (parsed.hostname or "").lower().rstrip(".")
-    if not requested_host:
-        raise ValueError("LLM API URL must include a hostname")
-
-    hosts = llm_rerank_allowed_hosts() if allowed_hosts is None else allowed_hosts
     matched_allowed: str | None = None
     for allowed_host in hosts:
         if allowed_host and requested_host == allowed_host:
@@ -1250,6 +1269,7 @@ def _validate_redirect_target(
     allowed_hosts: set[str] | None = None,
     *,
     has_api_key: bool = True,
+    resolve_dns: bool = True,
 ) -> str:
     if not location:
         raise ValueError("LLM endpoint returned a redirect without a Location header")
@@ -1267,8 +1287,51 @@ def _validate_redirect_target(
         raise ValueError(
             "Method-changing redirects are not allowed for LLM POST requests"
         )
-    validate_llm_api_url(target, allowed_hosts=allowed_hosts, has_api_key=has_api_key)
-    return target
+    _cleaned, normalized, requested_host, hosts = _validate_llm_url_structure(
+        target,
+        allowed_hosts=allowed_hosts,
+        has_api_key=has_api_key,
+        normalize_chat_path=False,
+    )
+    if resolve_dns and requested_host not in hosts:
+        validate_public_url(
+            normalized,
+            allow_http=(parsed.scheme == "http" and not has_api_key),
+        )
+    return normalized
+
+
+def _build_llm_post_request(
+    client: httpx.Client,
+    target_url: str,
+    *,
+    headers: dict[str, str],
+    json_body: dict[str, Any],
+    extensions: dict[str, str] | None,
+) -> Any:
+    request_kwargs: dict[str, Any] = {
+        "headers": headers,
+        "json": json_body,
+    }
+    if extensions:
+        try:
+            return client.build_request(
+                "POST",
+                target_url,
+                extensions=extensions,
+                **request_kwargs,
+            )
+        except TypeError:
+            return client.build_request(
+                "POST",
+                target_url,
+                **request_kwargs,
+            )
+    return client.build_request(
+        "POST",
+        target_url,
+        **request_kwargs,
+    )
 
 
 def _apply_parsed_payload(
@@ -1408,30 +1471,13 @@ def probe_llm_reranker(
             follow_redirects=False,
             trust_env=False,
         ) as client:
-            request_kwargs: dict[str, Any] = {
-                "headers": request_headers,
-                "json": request_json,
-            }
-            if extensions:
-                try:
-                    request = client.build_request(
-                        "POST",
-                        target_url,
-                        extensions=extensions,
-                        **request_kwargs,
-                    )
-                except TypeError:
-                    request = client.build_request(
-                        "POST",
-                        target_url,
-                        **request_kwargs,
-                    )
-            else:
-                request = client.build_request(
-                    "POST",
-                    target_url,
-                    **request_kwargs,
-                )
+            request = _build_llm_post_request(
+                client,
+                target_url,
+                headers=request_headers,
+                json_body=request_json,
+                extensions=extensions,
+            )
             response = client.send(request, stream=True)
             try:
                 parsed = _extract_response_content(response)
@@ -1564,9 +1610,10 @@ def rerank_with_llm_sync(
         if not key or not resolved_url or not chosen_model or len(safe_candidates) < 2:
             return safe_candidates, {"applied": False, "reason": "not_configured"}
 
-        url = validate_llm_api_url(
+        target_url, host_headers, extensions = _prepare_llm_request_target(
             resolved_url, allowed_hosts=allowed_hosts, has_api_key=bool(key)
         )
+        url = _normalize_chat_url(resolved_url)
 
         messages, _payload, evidence_count = _build_rerank_prompt_data(
             reads,
@@ -1619,24 +1666,40 @@ def rerank_with_llm_sync(
         }
 
         current_url = url
-        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
             parsed: dict[str, Any] | None = None
             for _hop in range(MAX_SAME_ORIGIN_REDIRECTS + 1):
-                request = client.build_request(
-                    "POST",
-                    current_url,
-                    headers=headers,
-                    json=request_body,
+                request = _build_llm_post_request(
+                    client,
+                    target_url,
+                    headers={**headers, **host_headers},
+                    json_body=request_body,
+                    extensions=extensions,
                 )
                 response = client.send(request, stream=True)
                 try:
                     if 300 <= int(getattr(response, "status_code", 200)) < 400:
                         current_url = _validate_redirect_target(
-                            url,
+                            current_url,
                             int(response.status_code),
                             response.headers.get("location", "").strip(),
                             allowed_hosts=allowed_hosts,
                             has_api_key=bool(key),
+                            resolve_dns=False,
+                        )
+                        if _hop >= MAX_SAME_ORIGIN_REDIRECTS:
+                            raise ValueError("Too many redirects from LLM endpoint")
+                        target_url, host_headers, extensions = (
+                            _prepare_llm_request_target(
+                                current_url,
+                                allowed_hosts=allowed_hosts,
+                                has_api_key=bool(key),
+                                normalize_chat_path=False,
+                            )
                         )
                         continue
                     parsed = _extract_response_content(response)
